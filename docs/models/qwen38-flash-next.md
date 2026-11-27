@@ -77,8 +77,8 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   whole. `export.json` holds the run's settings: the pack, the documents file, the window rows, the context, the prompt chunk,
   the CPU share, the expert cache's slots and the rotation's base.
 - **Restart:** the same command continues after the documents of the closed shards. A setting that differs from `export.json`
-  is refused with its name and the stored value; when `--prefill auto` settles on another chunk, pass the stored one as
-  `--prefill N`.
+  is refused with its name and the stored value; when `--prefill auto` settles on another chunk or the expert cache on
+  another size (both follow the free VRAM), pass the stored ones as `--prefill N` and `--expert-cache N`.
 - **Check:** at its end the run reads its first document once more and reports whether the rows, cells and selections are
   the same as the first time. It then reads every closed shard back through the shard reader: each sequence's tokens
   against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
