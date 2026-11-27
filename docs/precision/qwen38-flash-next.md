@@ -32,7 +32,8 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Hyper-connections | int8 copy, one fp16 scale per 32 inputs (`hc8`); the hc read takes fp32 activations | fp32 sums; the up product uses fp16 hi/lo mma |
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
 | Output head | Q8_0 (NVFP4 pack) or Q6_K (IQ3_S pack) | two-stage in verify, see [head](#two-stage-verify-head) |
-| Drafter | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
+| Drafter (MTP) | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
+| Drafter (block) | its Q8_0 projections rounded to NVFP4 planes at load, feature projection and convolutions Q8_0, selector BF16 | bf16 activations on tensor cores; the head's own kernel over every vocabulary row; proposes only |
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
 
@@ -173,6 +174,12 @@ at any width, and a rejected row leaves no trace.
   seeded sampled reply can differ between window widths.
 - **Logit bias** is applied on every verified row, and a draft is accepted only if it equals the biased pick. A -100 bias never yields
   the token. A biased request accepts fewer drafts.
+- **Block drafter:** the same rule holds by construction: its drafts fill a window's later rows and the target checks each one.
+  It adds one kernel after each of five layers to every window (the mean of the residual's streams, read only by the
+  drafter), which writes nothing a window reads. The figures above are the MTP's. With the block drafter the comparison
+  (`--spec 0` against the default, tiers pinned, tokens and logit rows) is not measured yet; the GPU test
+  `draft_identity_test` runs it (configure with `-DBASALT_DRAFT_IDENTITY_MODEL=PACK.basalt`). Its drafts are its best
+  path for sampled requests too.
 
 ## Request grammar
 

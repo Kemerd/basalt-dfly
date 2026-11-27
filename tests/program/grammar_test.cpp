@@ -1,6 +1,6 @@
 // tests/program/grammar_test.cpp - GBNF parse, accept/reject, UTF-8 across tokens, clone/rewind, lazy triggers, the
-// vocabulary mask against a token-by-token check, and the forced continuation and its draft tokens against their
-// definitions. Ends with a timing line for allows() and fill_mask().
+// vocabulary mask against a token-by-token check, the forced continuation and its draft tokens against their
+// definitions, and the draft tokens that spell given bytes. Ends with a timing line for allows() and fill_mask().
 #include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/grammar.hpp"
 #include "basalt/program/grammar/schema.hpp"
@@ -869,6 +869,40 @@ static bool load_vocab(const char* path, std::vector<std::string>& out) {
     return !out.empty();
 }
 
+static std::vector<int32_t> spelled(const Vocab& voc, std::string_view bytes, size_t max_tokens) {
+    std::vector<int32_t> out = {-7};           // replaced, not appended to
+    voc.spell(bytes, max_tokens, out);
+    return out;
+}
+
+// Vocab::spell: the longest entry at each step, the bounds, and the same drafts a grammar of those bytes forces.
+static void test_spell() {
+    const Vocab voc = draft_vocab();
+    CHECK(spelled(voc, "{\"name\": \"", 8) == ids_of(voc, {"{\"", "name", "\": \""}));
+    CHECK(spelled(voc, "{\"name\": \"", 2) == ids_of(voc, {"{\"", "name"}));
+    CHECK(spelled(voc, "{\"name\": \"", 0).empty() && spelled(voc, "", 8).empty());
+    // no entry runs past the bytes: `na` (of two ids the higher), then nothing for `m` alone
+    CHECK(spelled(voc, "nam", 8) == ids_of(voc, {"na"}));
+    // a step without an entry ends the drafts there
+    CHECK(spelled(voc, "{\"q\": 1}", 8) == ids_of(voc, {"{\""}) && spelled(voc, "q", 8).empty());
+    // the brace has an end token of the same bytes: never the one drafted
+    CHECK(spelled(voc, "}", 8) == ids_of(voc, {"}"}));
+    // bytes that stop inside a character are spelled as far as an entry goes
+    CHECK(spelled(voc, "\xC3\xA9\xE4\xB8", 8) == ids_of(voc, {"\xC3\xA9", "\xE4\xB8"}));
+    CHECK(spelled(Vocab({}, {}), "name", 8).empty());
+    // the same walk as forced_tokens: a grammar of one literal forces what the literal spells
+    for (const char* text : {"{\"name\": \"x", "<function=f>\n<parameter=text>\n", "name,count:12", "\n</parameter>"}) {
+        std::string gbnf = "root ::= \"";
+        for (const char* c = text; *c; ++c) {
+            if (*c == '\n') gbnf += "\\n";
+            else if (*c == '"' || *c == '\\') (gbnf += '\\') += *c;
+            else gbnf += *c;
+        }
+        gbnf += "\" [a-z]";
+        for (size_t n = 0; n <= 6; ++n) CHECK(spelled(voc, text, n) == drafts(GrammarState(parse(gbnf)), voc, n));
+    }
+}
+
 static void bench() {
     std::vector<std::string> tokens;
     const char* vpath = std::getenv("BASALT_GRAMMAR_VOCAB");
@@ -933,6 +967,7 @@ int main() {
     test_partial_utf8();
     test_forced();
     test_forced_tokens();
+    test_spell();
     if (std::getenv("BASALT_GRAMMAR_BENCH")) bench();
     if (g_fail) { std::printf("grammar_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_test: ok\n");

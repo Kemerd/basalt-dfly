@@ -158,8 +158,11 @@ int QfnRuntime::init_verify() {
     for (const auto& xpe : xpeers)
         if (xpe->valid()) ver.add_peer(xpe.get());
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
+    // the block drafter reads each window's rows after its target layers: the windows keep their stream means
+    if (block.on()) ver.keep_stream_means(block.target_layers());
     if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
-        (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err))) {
+        (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err)) ||
+        (block.on() && !block.bind(&native_head, ver, err))) {
         basalt::log::error("basalt serve", "%s", err.c_str());
         return 1;
     }
@@ -216,7 +219,7 @@ int QfnRuntime::capture_windows() {
                      (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);
     }
     S = o.spec;
-    S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+    S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the drafter's windows; suffixes go up to S
     if (mtp_on && (pipe_want || S_mtp < S)) mtp.set_max_drafts((pipe_on ? basalt::core::kMtpChainMax : S_mtp) - 1);
     if (mtp_on && !mtp.prewarm(err)) {
         basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
@@ -240,7 +243,7 @@ int QfnRuntime::capture_windows() {
 
     rounds = 0;
     sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-    policy.emplace(S, 0.03, false);   // MTP or lookup window, learned over the whole process
+    policy.emplace(S, 0.03, false);   // the drafter's window or a lookup's, learned over the whole process
     // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images and videos.  The
     // file is one or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt
     // order, one per picture and one per two-frame video group; each record's rows go to its run of <|image_pad|> or

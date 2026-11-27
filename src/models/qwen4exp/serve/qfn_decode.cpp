@@ -51,6 +51,8 @@ void QfnRequest::decode_state_begin() {
     drafts = std::vector<int32_t>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0);
     dprob = std::vector<float>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0.0f);
     sbuf = std::vector<int32_t>((size_t) runtime_.S, 0);
+    n_block = 0;
+    kept_rows = 0;
     if (runtime_.o.suffix_draft > 0 && (!in_slot || solo_req))
         runtime_.sfx->sync(ids32.data(), ids32.size());
     sfx_windows = 0;
@@ -109,6 +111,9 @@ void QfnRequest::decode_stats_begin() {
 }
 
 inline int QfnRequest::draft_window() {
+    // a block's drafts each state a chance: the window with the most expected tokens for its cost, within the cap
+    if (runtime_.block.on())
+        return std::min(runtime_.policy->window(dprob.data(), std::min(n_block, runtime_.S_mtp - 1)), runtime_.S_mtp);
     int T = 1;
         if (held.on) T = held.T;
         else
@@ -120,7 +125,13 @@ inline void QfnRequest::lookup_window(int& T, bool& from_sfx, int& sfx_match) {
         if (runtime_.o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
             const int k = runtime_.sfx->propose(runtime_.S - 1, sbuf.data());
             sfx_match = runtime_.sfx->last_match();
-            if (k > 0 && sbuf[0] == drafts[0]) {
+            if (runtime_.block.on()) {   // against the block's own window, priced from its chances
+                if (k > 0 && n_block > 0 && sbuf[0] == drafts[0]) {
+                    const basalt::spec::DraftPolicy::Pick pk =
+                        runtime_.policy->choose_window(dprob.data(), std::min(n_block, runtime_.S_mtp - 1), k, sfx_match);
+                    if (pk.lookup) { T = pk.t; from_sfx = true; }
+                }
+            } else if (k > 0 && sbuf[0] == drafts[0]) {
                 const basalt::spec::DraftPolicy::Pick pk = runtime_.policy->choose(T, k, sfx_match);
                 if (pk.lookup) { T = pk.t; from_sfx = true; }
             }
@@ -390,13 +401,39 @@ inline bool QfnRequest::after_accept(int T, int& a, int e0, bool from_sfx, bool 
 
 inline void QfnRequest::note_draft_probs(bool from_sfx) {
     wprob_n = std::min(runtime_.S_mtp, 16);
+    if (runtime_.block.on())
+        for (int i = 0; i < basalt::spec::DraftPolicy::kMaxT; ++i) wchance[i] = i < n_block ? dprob[(size_t) i] : 0.0f;
     if (draft_log != nullptr)
         for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
+}
+
+// The block drafter's round.  The rows the window kept become context whatever follows (forced prompt rows and a
+// reply's last window too: the next request goes on from them).  A block is then drafted behind the last kept row; the
+// commit and the tokens go out while it runs.
+template <class After>
+inline bool QfnRequest::draft_block(bool will_draft, After& after_launch) {
+    BlockDraft& block = runtime_.block;
+    n_block = 0;
+    if (kept_rows < 1 || kept_rows > (int) outv.size()) {
+        runtime_.err = "block drafter: a window that kept " + std::to_string(kept_rows) + " rows";
+        return false;
+    }
+    if (!block.window_rows(kept_rows, p, runtime_.err)) return false;
+    // a quality gate forces every window: nothing would read the drafts
+    if (!will_draft || ppl != nullptr) return block.settle(runtime_.err);   // the rows are read before the next window writes them
+    if (!block.draft_launch(outv[(size_t) kept_rows - 1], p + kept_rows, runtime_.err)) return false;
+    after_launch();
+    const int most = std::min({runtime_.S_mtp - 1, (int) drafts.size(), (int) dprob.size()});
+    return block.draft_read(drafts.data(), dprob.data(), most, n_block, runtime_.err);
 }
 
 template <class After>
 inline bool QfnRequest::draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch) {
     basalt::core::decode_gaps().mark(5);
+    if (runtime_.block.on()) {
+        draft_failed = false;
+        return draft_block(will_draft, after_launch);
+    }
     if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
     runtime_.mtp.set_cum_th(cum_adapt.th());
     bool drafted = true;

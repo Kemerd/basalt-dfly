@@ -542,6 +542,11 @@ int QfnRuntime::init_conversations() {
         basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
                                ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
     };
+    // the block drafter's context of a chunk's rows: taken as each of its target layers ends, on the prompt path's stream
+    if (block.on())
+        sp.on_layer_rows = [&](int64_t layer, int64_t p0, int64_t T, const float* R_rows, std::string& e) -> bool {
+            return block.prompt_rows(layer, p0, T, R_rows, g.hc, main_cs, e);
+        };
     sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
         std::vector<int32_t> nxt((size_t) T);
         for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];

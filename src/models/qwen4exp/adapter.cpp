@@ -60,9 +60,8 @@ public:
         core::ModelFile file;
         std::string err;
         if (o.model.empty() || !file.open(o.model, err)) return 0;
-        core::ModelSources srcs;
-        core::model_sources(file, srcs);
-        return !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty() ? 8 : 0;
+        const DraftRun run{o.serve, o.batch, o.gpus.mode == program::GpuMode::Split, false};
+        return choose_draft_source(draft_pack(file), run) != DraftSource::None ? 8 : 0;
     }
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
         return qwen4exp::finish_flags(static_cast<Options&>(o));
@@ -72,5 +71,14 @@ public:
 }  // namespace
 
 std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(); }
+
+DraftPack draft_pack(const core::ModelFile& file) {
+    core::ModelSources srcs;
+    core::model_sources(file, srcs);
+    DraftPack pack;
+    pack.mtp = !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty();
+    pack.block = file.find(kBlockDrafterSection) != nullptr;
+    return pack;
+}
 
 }  // namespace basalt::models::qwen4exp

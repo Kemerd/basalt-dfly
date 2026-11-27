@@ -30,9 +30,11 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             srcs.hc8.empty()) {
             return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");
         }
-        // (a teacher export runs no drafter)
-        if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty() && o.dfly2_export.empty())
-            o.mtp = o.model;
+        // the drafter this run's windows are filled by, of those the pack carries: decided here, once (a teacher export
+        // runs none)
+        const DraftRun draft_run{o.serve, o.batch, o.gpus.mode == basalt::program::GpuMode::Split, !o.dfly2_export.empty()};
+        o.draft_source = choose_draft_source(draft_pack(model_file), draft_run);
+        if (o.draft_source == DraftSource::Mtp) o.mtp = o.model;
         // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
         uint64_t prof_bytes = 0;
         if (!o.expert_profile.empty()) {

@@ -68,11 +68,17 @@ public:
     bool after_accept(int T, int& a, int e0, bool from_sfx, bool held_run, bool paired, bool& hold);
     void note_draft_probs(bool from_sfx);
     void stamp_before_commit() { basalt::core::decode_events().stamp(9); }
-    bool commit(int keep, std::string& e, int phase) { return cv->commit(keep, e, phase); }
+    bool commit(int keep, std::string& e, int phase) {
+        if (phase == 2) kept_rows = keep;   // the rows this window adds to the state: the block drafter's next context
+        return cv->commit(keep, e, phase);
+    }
     void on_token(int32_t tok) { if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok); }
     void count_round() { ++runtime_.rounds; }
     template <class After>
     bool draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch);
+    /// draft_next with the block drafter: the kept rows' context, then a block behind the last of them.
+    template <class After>
+    bool draft_block(bool will_draft, After& after_launch);
     bool draft_fatal() const { return draft_failed; }
     void window_timing(int T, int a, bool from_sfx, Clock::time_point round0, Clock::time_point tw0,
                        Clock::time_point tw1, Clock::time_point tw2);
@@ -81,8 +87,14 @@ public:
         basalt::core::decode_gaps().mark(16);
     }
     void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
-        runtime_.policy->observe(from_sfx, T, a, sfx_match,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+        // a block's window was picked from its drafts' stated chances: the policy learns what such chances are worth
+        // (a quality gate's windows are forced, not drafted)
+        if (runtime_.block.on() && !from_sfx) {
+            if (ppl == nullptr) runtime_.policy->observe_window(wchance, T, a, ms);
+            return;
+        }
+        runtime_.policy->observe(from_sfx, T, a, sfx_match, ms);
     }
     void mark_loop_end() { basalt::core::decode_gaps().mark(17); }
     void shed_low() { runtime_.shed_if_low(); }
@@ -133,6 +145,11 @@ private:
     int64_t relaxed_kept{};
     std::vector<int32_t> drafts{};
     std::vector<float> dprob{};
+    // the block drafter: the drafts its last block gave (their chances in dprob), the rows the last window kept, and the
+    // chances of the drafts the running window checks (dprob is the next block's by the time the policy observes)
+    int n_block{};
+    int kept_rows{};
+    float wchance[basalt::spec::DraftPolicy::kMaxT]{};
     basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
     std::vector<int32_t> sbuf{};
     int64_t sfx_windows{};

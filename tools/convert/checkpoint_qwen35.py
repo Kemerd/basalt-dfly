@@ -38,6 +38,7 @@ import time
 import numpy as np
 
 import checkpoint as C
+import dflash
 import model_sections as S
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -414,11 +415,6 @@ def fp4q_rows(x: np.ndarray, gs: np.float32):
 
 
 def _job(args):
-    if args[0] == "slice":   # BF16 rows [row0, row0 + rows), columns [c0, c0 + ne0) of a [.][width] matrix, as Q8_0
-        _, path, off, width, c0, ne0, row0, rows = args
-        mm = np.memmap(path, dtype="<u2", mode="r", offset=off + row0 * width * 2, shape=(rows, width))
-        x = S._bf16_to_f32(np.ascontiguousarray(mm[:, c0:c0 + ne0])).reshape(-1)
-        return S.q8_0(x) if np.isfinite(x).all() else "a non-finite value"
     if args[0] in ("fp4c", "fp4s"):   # code rows as stored (value 2i in the low nibble of byte i); scale rows into their
         # tiles (rows in 128s); both with rows / columns in the GGUF head order (whole 128-value heads move)
         op, path, off, ne0, ne1, row0, rows, kind, first = args
@@ -627,110 +623,6 @@ def text_vocab(kv: dict, out: pathlib.Path) -> None:
     w.write(out)
 
 
-
-# ------------------------------------------------------------------ the block drafter (DFlash 2)
-DRAFTER_LAYER = {
-    "input_layernorm.weight": ("attn_norm.weight", "F32"),
-    "post_attention_layernorm.weight": ("post_attention_norm.weight", "F32"),
-    "self_attn.q_proj.weight": ("attn_q.weight", "Q8"), "self_attn.k_proj.weight": ("attn_k.weight", "Q8"),
-    "self_attn.v_proj.weight": ("attn_v.weight", "Q8"), "self_attn.o_proj.weight": ("attn_output.weight", "Q8"),
-    "self_attn.q_norm.weight": ("attn_q_norm.weight", "F32"), "self_attn.k_norm.weight": ("attn_k_norm.weight", "F32"),
-    "mlp.gate_proj.weight": ("ffn_gate.weight", "Q8"), "mlp.up_proj.weight": ("ffn_up.weight", "Q8"),
-    "mlp.down_proj.weight": ("ffn_down.weight", "Q8"),
-    "attention_conv.base_kernel": ("attn_conv.base", "F32"), "attention_conv.kernel_projection.weight": ("attn_conv.weight", "Q8"),
-    "mlp_conv.base_kernel": ("ffn_conv.base", "F32"), "mlp_conv.kernel_projection.weight": ("ffn_conv.weight", "Q8"),
-}
-DRAFTER_GLOBAL = {
-    "hidden_norm.weight": ("hidden_norm.weight", "F32"), "norm.weight": ("norm.weight", "F32"),
-    "candidate_selector.hidden_projection.weight": ("selector.hidden.weight", "BF16"),
-    "candidate_selector.predecessor_codebook": ("selector.pred", "BF16"),
-    "candidate_selector.successor_codebook": ("selector.succ", "BF16"),
-}
-
-
-class Drafter:
-    """A DFlash 2 block drafter (z-lab's DFlash2DraftModel safetensors) as `dflash.*` tensors: projections Q8_0 from
-    BF16, norms (plain RMS weights, no offset) and the convolutions' base kernels F32, the selector BF16."""
-
-    def __init__(self, d, ck: C.Checkpoint):
-        self.dir = pathlib.Path(d)
-        self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
-        if self.config.get("architectures") != ["DFlash2DraftModel"]:
-            raise S.ConvertError(f"{self.dir}: not a DFlash2DraftModel")
-        dc = self.config["dflash_config"]
-        if int(self.config["hidden_size"]) != int(ck.text["hidden_size"]) or int(self.config["vocab_size"]) != int(ck.text["vocab_size"]):
-            raise S.ConvertError(f"{self.dir}: the drafter's width or vocabulary differs from the model's")
-        if any(t >= int(ck.text["num_hidden_layers"]) for t in dc["target_layer_ids"]):
-            raise S.ConvertError(f"{self.dir}: a target layer past the model's layers")
-        if self.config.get("is_causal") is not False or set(self.config.get("layer_types", [])) != {"sliding_attention"}:
-            raise S.ConvertError(f"{self.dir}: only the non-causal sliding-window drafter is converted")
-        self.files, self.t = sorted(self.dir.glob("*.safetensors")), {}
-        for f in self.files:
-            head, base = S.read_safetensors_header(f)
-            for k, v in sorted(((k, v) for k, v in head.items() if k != "__metadata__"), key=lambda kv: kv[1]["data_offsets"][0]):
-                a_, b_ = v["data_offsets"]
-                self.t[k] = (f, base + a_, v["dtype"], list(v["shape"]), b_ - a_)
-        self.tensors, self.slices = {}, {}
-        H = int(self.config["hidden_size"])
-        for k, (f, off, dt, shape, n) in self.t.items():
-            if k == "fc.weight":   # one [H][H] block per target layer, so the features project as each layer ends
-                if shape != [H, H * len(dc["target_layer_ids"])]:
-                    raise S.ConvertError(f"{self.dir}: fc.weight is {shape}")
-                for j in range(len(dc["target_layer_ids"])):
-                    name = f"dflash.fc.{j}.weight"
-                    self.tensors[name] = Tensor(name, "Q8", k, "id", [H, H])
-                    self.slices[name] = (j * H, shape[1])
-                continue
-            m = re.fullmatch(r"layers\.(\d+)\.(.+)", k)
-            rule = DRAFTER_LAYER.get(m.group(2)) if m else DRAFTER_GLOBAL.get(k)
-            if rule is None:
-                raise S.ConvertError(f"{self.dir}: drafter tensor {k} has no counterpart")
-            if dt != "BF16":
-                raise S.ConvertError(f"{k} is {dt}, expected BF16")
-            name = "dflash." + (f"blk.{m.group(1)}.{rule[0]}" if m else rule[0])
-            self.tensors[name] = Tensor(name, rule[1], k, "id", list(reversed(shape)))
-
-    def kv(self) -> dict:
-        c, dc = self.config, self.config["dflash_config"]
-        A = ARCH + ".dflash."
-        return {A + "block_count": int(c["num_hidden_layers"]), A + "block_size": int(dc["block_size"]),
-                A + "mask_token_id": int(dc["mask_token_id"]), A + "target_layers": [int(x) for x in dc["target_layer_ids"]],
-                A + "conv_kernel": int(dc["conv_kernel_size"]), A + "conv_group": int(dc["conv_group_size"]),
-                A + "selector_rank": int(dc["selector_rank"]), A + "selector_top_k": int(dc["selector_top_k"]),
-                A + "sliding_window": int(c["sliding_window"]), A + "attention.head_count": int(c["num_attention_heads"]),
-                A + "attention.head_count_kv": int(c["num_key_value_heads"]), A + "attention.key_length": int(c["head_dim"]),
-                A + "feed_forward_length": int(c["intermediate_size"]),
-                A + "rope.freq_base": C.f32(c["rope_parameters"]["rope_theta"]), A + "attention.layer_norm_rms_epsilon": C.f32(c["rms_norm_eps"])}
-
-    def values(self, name) -> np.ndarray:
-        f, off, dt, shape, n = self.t[self.tensors[name].src]
-        u = np.fromfile(f, dtype="<u2", count=n // 2, offset=off)
-        return S._bf16_to_f32(u).reshape(shape)
-
-    def float_bytes(self, name) -> bytes:
-        t = self.tensors[name]
-        x = self.values(name)
-        if t.type_name == "F32":
-            return np.ascontiguousarray(x, dtype="<f4").tobytes()
-        f, off, dt, shape, n = self.t[t.src]
-        return np.fromfile(f, dtype=np.uint8, count=n, offset=off).tobytes()
-
-    def chunks(self, name, pool, depth: int = 64):
-        t = self.tensors[name]
-        f, off, dt, shape, n = self.t[t.src]
-        ne0, ne1 = t.ne
-        step = max(1, ROWS_PER_JOB // ne0)
-        if name in self.slices:
-            c0, width = self.slices[name]
-            jobs = (("slice", str(f), off, width, c0, ne0, r, min(step, ne1 - r)) for r in range(0, ne1, step))
-        else:
-            jobs = (("q8", str(f), off, "BF16", None, ne0, ne1, r, min(step, ne1 - r), None, 0) for r in range(0, ne1, step))
-        for b in S.bounded_imap(pool, _job, jobs, depth):
-            if isinstance(b, str):
-                raise S.ConvertError(f"{name}: {b}")
-            yield b
-
-
 # ------------------------------------------------------------------ the pack
 LICENSE = {"apache-2.0": "Apache License 2.0"}
 
@@ -752,7 +644,8 @@ def build(a, Job, fingerprint, die) -> None:
         base = (bm if isinstance(bm, str) else bm[0]) if bm else "Qwen3.5"
         name = a.name or base.split("/")[-1] + " NVFP4"
         kv = model_kv(ck, name)
-        drafter = Drafter(a.drafter, ck) if getattr(a, "drafter", None) else None
+        drafter = dflash.Drafter(a.drafter, ARCH, int(ck.text["hidden_size"]), int(ck.text["vocab_size"]),
+                                 int(ck.text["num_hidden_layers"])) if getattr(a, "drafter", None) else None
         if drafter:
             kv.update(drafter.kv())
     except S.ConvertError as e:
@@ -812,9 +705,7 @@ def build(a, Job, fingerprint, die) -> None:
                 "license": {"name": LICENSE.get(lic, lic)},
                 "vision": {"projector": "qwen3vl_merger", "source": "the checkpoint's BF16 vision tower"},
                 "mtp": {"layers": int(ck.text.get("mtp_num_hidden_layers", 0)), "source": "the checkpoint's BF16 mtp.*, Q8_0"},
-                **({"dflash": {"source": pathlib.Path(a.drafter).name, "files": [source_entry(p) for p in drafter.files],
-                               "form": "projections Q8_0 from BF16, norms and conv base kernels F32, selector BF16"}}
-                   if drafter else {}),
+                **({"dflash": drafter.record(source_entry)} if drafter else {}),
                 "checkpoint": {
                     "dir": pathlib.Path(a.checkpoint).name,
                     "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),

@@ -54,10 +54,28 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
 
 ## Drafting
 
-On when the pack has the MTP drafter. `--spec N` sets the window (default 8: the last accepted token plus up to 7 drafts).
+On when the pack has a drafter. `--spec N` sets the window (default 8: the last accepted token plus up to 7 drafts).
 `--spec 0` turns it off. `--suffix-draft` (default 3) also fills a window from an earlier repeat in the context. Output is exactly
 plain decoding's ([precision](../precision/qwen38-flash-next.md#drafting-does-not-change-output)). Structured output drafts best
 and prose least.
+
+A pack has the MTP drafter and may also carry a DFlash 2 block drafter ([attach it](../model-file.md#flash-next-block-drafter)).
+A run drafts with one of them, chosen once at start. No flag selects it: the start line `block drafter: ...` and the word
+`drafter=block`, `drafter=mtp` or `drafter=none` on the engine's `INFO` line say which.
+
+- **Block drafter:** used when the pack has it, the run is `basalt serve` with one request at a time (`--parallel` 1, the
+  default), and every layer is on one card (one card, or `gpu-mode peer`). Each round it takes the kept rows after layers
+  5, 15, 25, 35 and 45 as context, keeps the last 2,048 positions, and drafts 7 tokens in one pass against the model's own
+  embedding and head. Every draft states its chance; the window is as long as those chances pay for.
+- **MTP:** used otherwise: a pack without the block drafter, `--parallel` above 1, `gpu-mode split`, and `basalt generate`.
+- **Memory:** its weights (the pack's `dflash` section, 726 MiB) and its working memory (the context, a prompt's rows and
+  the passes' scratch), all on the main card and held before the expert cache is sized. The start line gives both
+  figures. The MTP layer is not loaded beside it.
+- **Context after a restore:** a conversation restored from RAM or disk starts with no drafter context; it fills as the turn
+  is read and generated. A turn that continues or rewinds the live conversation keeps what still applies.
+- **Long prompts with `gpu-mode peer`:** a part read as a pipeline over the cards gives context from its last chunk only.
+- **Not measured yet:** its speed, its acceptance and its cost per round on this model, and it has not yet run on a GPU.
+  Compare with the MTP on the same pack by benchmarking it with the drafter attached and again after `--roll-back`.
 
 ## Teacher export
 

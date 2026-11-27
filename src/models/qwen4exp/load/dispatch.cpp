@@ -47,6 +47,7 @@ int dispatch(Context& context) {
     auto& grammar_vocab = *context.grammar_vocab;
     auto& native_head = *context.native_head;
     auto& mtp_head = *context.mtp_head;
+    auto& block = *context.block;
     auto& src = *context.src;
     auto& arena_src = *context.arena_src;
     auto& srcp = *context.srcp;
@@ -186,6 +187,7 @@ int dispatch(Context& context) {
             .grammar_vocab = grammar_vocab,
             .native_head = native_head,
             .mtp_head = mtp_head,
+            .block = block,
             .src = src,
             .srcp = srcp,
             .xcache = xcache,

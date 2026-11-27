@@ -169,6 +169,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/prefill.cpp
   src/models/qwen4exp/load/decode.cpp
   src/models/qwen4exp/serve/batch.cpp
+  src/models/qwen4exp/serve/block_draft.cpp
   src/models/qwen4exp/serve/qfn_commands.cpp
   src/models/qwen4exp/serve/qfn_restore.cpp
   src/models/qwen4exp/serve/qfn_image.cpp
@@ -198,7 +199,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/qfn_run.cpp)
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec dflash window_gemm ${_gpu_runtime_target})
 if(BUILD_TESTING)
   # which --kv formats run with batch slots, and the refusal for the rest (host only)
   add_executable(qwen4exp_kv_batch_test tests/models/qwen4exp/cli/kv_batch_test.cpp)
@@ -210,6 +211,11 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_dfly2_flags_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_dfly2_flags_test PRIVATE model warnings)
   basalt_cpu_test(NAME qwen4exp_dfly2_flags_test COMMAND qwen4exp_dfly2_flags_test)
+  # which of a pack's drafters a run drafts with, and where each runs (host only)
+  add_executable(qwen4exp_draft_source_test tests/models/qwen4exp/draft_source_test.cpp)
+  target_include_directories(qwen4exp_draft_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(qwen4exp_draft_source_test PRIVATE warnings)
+  basalt_cpu_test(NAME qwen4exp_draft_source_test COMMAND qwen4exp_draft_source_test)
   # the teacher export's writer: pieces in, shards out, a restart, the settings file and the documents file (host only)
   add_executable(qwen4exp_dfly2_shard_queue_test tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp
                  src/models/qwen4exp/load/dfly2_shard_queue.cpp src/models/qwen4exp/load/dfly2_docs.cpp
@@ -222,15 +228,20 @@ endif()
 endif()
 
 # What the DFly2 drafters of the models share (src/dfly2). record.cpp needs no device: a CPU test lists it as a source
-# and links `core` alone.
-if(BASALT_MODEL_HY4FLASH OR BASALT_MODEL_DEEPSEEK41)
-add_library(dfly2 STATIC src/dfly2/record.cpp)
-target_include_directories(dfly2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(dfly2 PUBLIC core)
+# and links `core` alone. The device steps (ops.cpp, kernels.cu) are chains of the shared kernels.
+if(BASALT_MODEL_HY4FLASH OR BASALT_MODEL_DEEPSEEK41 OR BASALT_MODEL_QWEN4EXP)
+add_library(dfly2 STATIC src/dfly2/record.cpp src/dfly2/ops.cpp src/dfly2/kernels.cu)
+target_include_directories(dfly2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dfly2 PUBLIC kernels core ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(dfly2_record_test tests/dfly2/record_test.cpp src/dfly2/record.cpp)
   target_link_libraries(dfly2_record_test PRIVATE core)
   basalt_cpu_test(NAME dfly2_record_test COMMAND dfly2_record_test)
+  # the shared device steps against a CPU double reference (GPU, synthetic, no model)
+  add_executable(dfly2_ops_parity tests/dfly2/ops_parity.cpp)
+  target_include_directories(dfly2_ops_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(dfly2_ops_parity PRIVATE dfly2 kernels core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dfly2_ops_parity COMMAND dfly2_ops_parity)
 endif()
 endif()
 if(BUILD_TESTING)
@@ -385,16 +396,41 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
+if(BASALT_MODEL_QWEN35 OR BASALT_MODEL_QWEN4EXP)
+# What the DFlash 2 block drafters of the models share (src/dflash): the drafter's shape and tensors, and its context and
+# draft passes on the window gemm. meta.cpp and seq.cpp need no device: a CPU test lists one as a source.
+add_library(dflash STATIC src/dflash/meta.cpp src/dflash/seq.cpp src/dflash/forms.cpp src/dflash/context.cpp src/dflash/draft.cpp)
+target_include_directories(dflash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dflash PUBLIC artifact kernels window_gemm core warnings ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # a sequence's context range: what a rewind keeps of a ring that wrapped, and its buffers' order (host only)
+  add_executable(dflash_seq_test tests/dflash/seq_test.cpp src/dflash/seq.cpp)
+  target_link_libraries(dflash_seq_test PRIVATE artifact)
+  basalt_cpu_test(NAME dflash_seq_test COMMAND dflash_seq_test)
+  # the drafter's shape from a pack's metadata, the shapes it refuses, and its tensors' pack names and sizes (host only)
+  add_executable(dflash_meta_test tests/dflash/meta_test.cpp src/dflash/meta.cpp)
+  target_link_libraries(dflash_meta_test PRIVATE artifact)
+  basalt_cpu_test(NAME dflash_meta_test COMMAND dflash_meta_test)
+endif()
+endif()
+
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model dflash kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
 if(BUILD_TESTING)
+  # the dense stack's block drafter on seeded inputs at the 27B drafter's shape, no pack: prints the hashes of its
+  # features, context rings and drafts, which a change that must not move a bit leaves as they are (GPU)
+  add_executable(dense_block_drafter_hash tests/dense/block_drafter_hash.cpp)
+  target_include_directories(dense_block_drafter_hash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_gpu_include_directories})
+  target_link_libraries(dense_block_drafter_hash PRIVATE dense ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dense_block_drafter_hash COMMAND dense_block_drafter_hash)
+  set_tests_properties(dense_block_drafter_hash PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # the session's running state through the shared checkpoint transfer and back (a 27B pack: argument or
   # BASALT_QWEN35_PACK; skipped without one)
   add_executable(qwen35_checkpoint_round_trip tests/models/qwen35/checkpoint_round_trip.cpp)
@@ -1023,6 +1059,16 @@ if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
 endif()
 
+# a Flash-Next pack's drafter changes no token and no logit row: `--serve` with the drafter against `--spec 0` over new,
+# continued, rewound, chunked and long prompts (configure with -DBASALT_DRAFT_IDENTITY_MODEL=/path/to/model.basalt and
+# -DBASALT_DRAFT_IDENTITY_ARGS=<engine args>: a fixed tier, `--expert-cache;N`, and `--drafter;block` to require that drafter)
+if(BASALT_MODEL_QWEN4EXP AND BASALT_DRAFT_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME draft_identity_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/draft_identity_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_DRAFT_IDENTITY_MODEL} ${BASALT_DRAFT_IDENTITY_ARGS})
+  set_tests_properties(draft_identity_test PROPERTIES TIMEOUT 1800)
+endif()
+
 # a batch slot stopped by its client holds what the client saw, so the conversation continues without a re-read (same model
 # variable as above)
 if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
@@ -1531,6 +1577,12 @@ add_executable(cvec_parity tests/models/qwen4exp/kernels/cvec_parity.cpp)
 target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
+# the stream mean with and without the pending write, bitwise against the fused read's folded write and the streams'
+# sum, against gr_write and a double reference (GPU, synthetic, no model; --bench adds timings)
+add_executable(stream_mean_parity tests/models/qwen4exp/kernels/stream_mean_parity.cpp)
+target_include_directories(stream_mean_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(stream_mean_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME stream_mean_parity COMMAND stream_mean_parity)
 
 # The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
 # `--bench` adds previous/new timings on engine-like shapes.
@@ -1801,9 +1853,15 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests.
 # speculation components that need no GPU.
-add_library(spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(spec STATIC src/spec/suffix_drafter.cpp src/spec/scope_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
 target_include_directories(spec PUBLIC include)
 if(BUILD_TESTING)
+  # the C and C++ scope index and its proposals, spelled as tokens by the grammar library's vocabulary (CPU only)
+  add_executable(scope_drafter_test tests/spec/scope_drafter_test.cpp)
+  target_link_libraries(scope_drafter_test PRIVATE spec grammar warnings)
+  basalt_embed_manifest(scope_drafter_test)
+  basalt_cpu_test(NAME scope_drafter_test COMMAND scope_drafter_test)
+  set_tests_properties(scope_drafter_test PROPERTIES TIMEOUT 120)
   add_executable(suffix_drafter_test tests/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE spec)
   basalt_cpu_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)

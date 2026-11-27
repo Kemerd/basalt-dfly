@@ -5,6 +5,8 @@
     layouts (`experts`, `mtp/experts`: each expert's slice of the role), or meta.tensors (`gguf` and the own sections);
   * its type, shape and size as the pack records them, and its bytes by SHA-256 against the source's;
   * nothing in the pack's indexes that the source lacks; the section and tensor alignments;
+  * a block drafter attached as the `dflash` section (not the GGUF's): its tensors' places and sizes within the section;
+  * a Flash-Next DFly2 drafter (the `dfly` section, not the GGUF's): its tensors' places and sizes within the section;
   * the tokenizer and metadata the engine reads (vocabulary size, chat template, license, tensor table).
 Writes nothing; returns True when everything agrees. Needs numpy.
 """
@@ -25,6 +27,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import arch as A  # noqa: E402
+import dflash  # noqa: E402
+import dfly_qwen4exp_attach  # noqa: E402
 import model_sections as S  # noqa: E402
 from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile  # noqa: E402
 
@@ -164,7 +168,13 @@ def verify(pack: str, first_gguf, workers: int = 16) -> bool:
                     continue           # served from `gguf`; meta.tensors places it
                 place(name, (pre + "dense", int(r[3]), int(r[4]), r[2]))
     for name, e in meta["tensors"].items():
-        place(name, (e.get("section", "gguf"), e["offset"], e["bytes"], e))
+        if e.get("section") != dflash.SECTION:
+            place(name, (e.get("section", "gguf"), e["offset"], e["bytes"], e))
+    # an attached drafter's tensors are not the GGUF's: each kind is checked against its own section
+    for msg in dflash.section_problems(meta, m.section(dflash.SECTION)[1] if dflash.SECTION in m.sections else None):
+        bad(msg)
+    for msg in dfly_qwen4exp_attach.section_problems(meta, m.section("dfly")[1] if "dfly" in m.sections else None):
+        bad(msg)
     missing = [n for n in src.where if n not in where]
     if missing:
         bad(f"{len(missing)} source tensors are nowhere in the pack: {missing[:6]}")

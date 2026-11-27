@@ -375,6 +375,13 @@ public:
     /// qsa_selection_width(pos0 + t + 1) valid and ascending, until the next `run`. nullptr: no such kept layer.
     const int32_t* selection(int k) const;
     int64_t selection_cap() const { return cap_; }
+    /// Before init, on a verifier that runs every layer: after each of these layers (ascending) the window keeps the
+    /// mean over the residual's streams of every row, the layer's output as a reader outside the hyper-connection takes
+    /// it (stream_means()).  One more kernel per listed layer in every window's graph; none without a list.
+    void keep_stream_means(const std::vector<int>& layers) { mean_layers_ = layers; }
+    /// Kept layer number `k`'s rows (device): max_t rows of n_embd floats, row t of the last window's token t, until
+    /// the next `run`. nullptr: no such kept layer.
+    const float* stream_means(int k) const;
     /// The last window's first position and its rows (0 before the first run).
     int64_t last_pos0() const { return last_pos0_; }
     int last_rows() const { return last_t_; }
@@ -659,6 +666,10 @@ private:
     int32_t* sel_keep_ = nullptr;                             // per kept layer: max_t rows of cap_ ids
     /// Where `layer`'s top-k writes its ids: its kept buffer, or the buffer the other QSA layers share.
     int32_t* sel_at(int64_t layer) const;
+    std::vector<int> mean_layers_;                            // keep_stream_means
+    float* mean_keep_ = nullptr;                              // per kept layer: max_t rows of n_embd
+    /// Where `layer`'s stream mean goes; null for a layer that keeps none.
+    float* mean_at(int64_t layer) const;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block

@@ -5,16 +5,16 @@
 A fork of [Basalt](https://github.com/jesdga95/basalt) for one job: faster drafting. A small drafter guesses the next few tokens,
 the big model checks them in one pass, and the output stays exactly what plain decoding gives. This fork is about better guesses.
 
-Nothing below is measured yet. Numbers get posted when they exist.
+No speed numbers yet. They get posted when they exist.
 
 | Work | What it is | Status |
 | --- | --- | --- |
-| DFlash 2 on Qwen3.8-Flash-Next | Run the released `incoai/Qwen3.8-Flash-Next-DFlash2` drafter in place of the built-in MTP layer. No training. | Design reviewed; being built on `main` |
+| DFlash 2 on Qwen3.8-Flash-Next | Run the released `incoai/Qwen3.8-Flash-Next-DFlash2` drafter in place of the built-in MTP layer. No training. | On `main`: the converter that attaches the drafter to a pack, the block drafter as shared code, the kernels Flash-Next needs, and the draft loop for `basalt serve` without `--parallel` ([drafting](docs/models/qwen38-flash-next.md#drafting)). Built, CPU tests pass, not yet run on a GPU: output identity, acceptance and speed are unmeasured. `--parallel` slots and `gpu-mode split` still draft with the MTP |
 | DFly2 on DeepSeek-V4.1-Flash | Tencent's drafter that reads the target's own cache and index picks, against today's DSpark. | Designed and reviewed; the first part of the shared `dfly2` module is on `main`. The rest waits for a DeepSeek pack to test on |
-| DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Trainer being written on `dfly2-trainer`; the export and runtime are being designed |
-| Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | First part on `grammar-drafts`: the grammar reports the tokens it forces. Not wired into serving yet |
+| DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Trainer on `main` (`tools/dfly2-train`, [how to run it](docs/dfly2-training.md)); CPU tests pass, not yet run on a GPU. Also on `main`, built but not yet run: the teacher export (`--dfly2-export`), the pack attach (`--dfly` with `--into`) and the runtime's first parts. The draft loop and a trained drafter are still to come |
+| Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | First part on `main`: the grammar reports the tokens it forces. Not wired into serving yet |
 | Draft tries | Offer the runner-up guess where the drafter is unsure and let the target pick a branch. Pays on prose, not on code. | Idea; needs a measurement first |
-| Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | Idea |
+| Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | First part on `main` (`spec::ScopeDrafter`): the index of the declarations in the conversation and what it proposes. Not wired into serving. Offline, on 91 header and source pairs, it adds 0.3 points of correctly drafted tokens over suffix lookup alone (33.3% to 33.6%), so on its own it is not worth a serving path; it waits for draft tries |
 
 Header-aware drafting needs the header in the conversation before the source file. The engine cannot reorder what a model writes, so
 that part is a prompt rule: tell the model to write declarations first.

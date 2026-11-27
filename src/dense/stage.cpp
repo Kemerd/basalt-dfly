@@ -205,7 +205,7 @@ std::vector<Region> cell_regions(const Model& m, const SessionState& main, const
 // the stage's chunks whose drafter features the context ring still holds at the end of a read: at most this many
 int ring_tails(const BlockDrafter* bd) {
     if (!bd || !bd->present) return 0;
-    const int64_t cap = (int64_t) bd->window + 256;   // a session's ring (SessionState::dctx_cap)
+    const int64_t cap = dflash::ring_cells(*bd);   // a session's ring
     return (int) ((cap + kChunk - 1) / kChunk) + 1;
 }
 
@@ -446,7 +446,7 @@ bool prompt_split_read(Stage& L, Model& m, SessionState& st, const int32_t* toke
     const bool read_last = block && !ltaps.empty() && bd.target_layers[(size_t) ltaps.back()] == g.n_layers - 1;
     std::vector<int> tap_layers;
     for (int j : ltaps) tap_layers.push_back(bd.target_layers[(size_t) j]);
-    const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
+    const int64_t cap = block ? st.seq.cap : 0, b0 = pos + n;
     const int chunks = (n + T - 1) / T;
     const int t_last = n - (chunks - 1) * T;
     // The chunks the stage reads: the main card keeps the last one, and with it the one before when the last is a part of a chunk, so
@@ -733,7 +733,7 @@ bool split_read(Model& m, SessionState& st, const int32_t* tokens, int n, int64_
     const SplitHand& h = L.split_hand;
     const bool taps = block && !h.taps.empty();
     const bool read_last = taps && h.taps.back() == g.n_layers - 1;
-    const int64_t cap = block ? st.dctx_cap : 0, b0 = pos + n;
+    const int64_t cap = block ? st.seq.cap : 0, b0 = pos + n;
     const int chunks = (n + T - 1) / T;
     const int t_last = n - (chunks - 1) * T;
     // the bounds of a whole chunk and of the last one, then the positions, page-locked so that every upload is queued

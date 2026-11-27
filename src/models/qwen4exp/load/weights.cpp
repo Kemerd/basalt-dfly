@@ -35,18 +35,19 @@ int weights(Context& context) {
             return 1;
         }
     }
-    uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
+    uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0, block_bytes = 0;
     std::set<std::string> index_names;
     for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
     const bool planned =
         basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err) &&
         basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
         (o.mtp.empty() || o.spec < 2 ||
-         basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
+         basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err)) &&
+        (o.draft_source != DraftSource::Block || serve::BlockDraft::plan_bytes(o.native_shards, block_bytes, err));
     if (planned) {
         // a layer split loads each stage's layers (the dense bytes partition) and the drafter's own copy of the head
         const bool draft_head = multi_gpu && !o.mtp.empty() && o.spec >= 2;
-        cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + (draft_head ? head_bytes : 0) + mtp_bytes +
+        cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + (draft_head ? head_bytes : 0) + mtp_bytes + block_bytes +
                             basalt::core::Verifier::hc8_plan_bytes(
                                 [&](const std::string& n) { return index_names.count(n) > 0; }, g);
         model_bytes = cuda0_fixed_bytes + expert_total_bytes;

@@ -11,7 +11,7 @@ namespace {
 // through its map instead of a copy; the leading rows of these three are screened through a 2-bit copy
 bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML_Q8_0; }
 bool draft_rows_mapped(int head_type) { return head_type == 14 || head_type == GGML_Q8_0; }
-bool draft_proxy(int head_type) { return head_type == 13 || head_type == 14 || head_type == GGML_Q8_0; }
+bool draft_proxy(int head_type) { return NativeHead::has_draft_top1(head_type); }
 }  // namespace
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {

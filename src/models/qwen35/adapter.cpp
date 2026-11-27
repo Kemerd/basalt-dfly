@@ -28,29 +28,10 @@
 namespace basalt::models::qwen35 {
 namespace {
 
-// the pack's DFlash 2 block drafter's shape (qwen35.dflash.* metadata)
-bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
-    const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
-    const auto f = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (float) v->num() : 0.0f; };
-    d.block = u("block_size");
-    d.mask_id = u("mask_token_id");
-    d.conv_group = u("conv_group");
-    d.rank = u("selector_rank");
-    d.top_k = u("selector_top_k");
-    d.window = u("sliding_window");
-    d.n_head = u("attention.head_count");
-    d.n_kv = u("attention.head_count_kv");
-    d.head_dim = u("attention.key_length");
-    d.theta = f("rope.freq_base");
-    d.eps = f("attention.layer_norm_rms_epsilon");
-    if (const MetaValue* t = gg.get("qwen35.dflash.target_layers"))
-        for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
-    if (d.block < 2 || d.block > 8 || d.target_layers.empty() || u("conv_kernel") != 2 || d.n_kv <= 0 ||
-        (d.head_dim != 128 && d.head_dim != 256) || d.top_k > 20 || H % d.conv_group) {
-        err = "qwen35: the pack's block drafter has a shape the engine does not run";
-        return false;
-    }
-    for (int l = 0; l < u("block_count"); ++l) d.layers.emplace_back();
+// the pack's DFlash 2 block drafter's shape (qwen35.dflash.* metadata), its layers counted and still without weights
+bool block_meta(const GgufFile& gg, dflash::BlockDrafter& d, int H, std::string& err) {
+    if (!dflash::read_meta(gg.metadata(), "qwen35", H, d, err)) return false;
+    d.layers.assign((size_t) d.n_layers, {});
     d.present = true;
     return true;
 }
@@ -95,7 +76,7 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
 
 // What a two-card split divides (dense::split_spec) from the pack's bytes per layer, with each card's room: what CUDA device 0
 // and `peer` have free now, less the reserve and a margin.
-model::SplitSpec plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
+model::SplitSpec plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dflash::BlockDrafter& bd, int peer,
                            int reserve_mib) {
     std::vector<uint64_t> layer((size_t) g.n_layers, 0);
     uint64_t main_weights = 0;
@@ -195,7 +176,7 @@ private:
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
-        dense::BlockDrafter bd_meta;
+        dflash::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
         if (req.gpus.cards.size() > 1 && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         plan_file_ = plan_.file(path);
@@ -330,7 +311,7 @@ private:
 
     // Where the layers go with a second card: split mode cuts them by the shares (SplitHooks); peer mode keeps every layer on the
     // main card, refused when they do not fit there, and gives the second card the last layers of a long prompt (PeerHooks).
-    bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
+    bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dflash::BlockDrafter& bd,
                     const model::LoadRequest& req, std::string& err) {
         gg_ = &gg;
         geo_ = &g;
@@ -356,7 +337,7 @@ private:
             err = "gpu-mode peer: " + req.gpus.cards[1].label + " would read nothing: K/V streaming (--kv-resident) keeps part of the cache in RAM";
             return false;
         }
-        if (dense::prompt_split_main_bytes(g, dense::BlockDrafter{}, o.max_context) == 0) {
+        if (dense::prompt_split_main_bytes(g, dflash::BlockDrafter{}, o.max_context) == 0) {
             err = "gpu-mode peer: " + req.gpus.cards[1].label + " would read nothing: a context of " + std::to_string((long long) o.max_context) +
                   " holds no prompt that a second card would read; raise --max-context";
             return false;
@@ -462,44 +443,18 @@ private:
     }
 
     // the pack's DFlash 2 block drafter (dflash.* tensors, qwen35.dflash.* metadata)
-    bool block_drafter(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& err) {
-        if (!block_meta(gg, d, H, err)) return false;
-        d.layers.clear();
-        d.present = false;
-        const auto u = [&](const char* k) { const MetaValue* v = gg.get(std::string("qwen35.dflash.") + k); return v ? (int) v->u : 0; };
-        const int layers = u("block_count"), ff = u("feed_forward_length");
-        const int AQ = d.n_head * d.head_dim, KV = d.n_kv * d.head_dim, conv = 2 * 2 * (H / d.conv_group);
-        for (size_t j = 0; j < d.target_layers.size(); ++j) {
-            d.fc.emplace_back();
-            if (!linear(gg, "dflash.fc." + std::to_string(j), H, H, d.fc.back(), err)) return false;
-        }
-        d.hidden_norm = floats(gg, "dflash.hidden_norm.weight", H, err);
-        d.norm = floats(gg, "dflash.norm.weight", H, err);
-        if (!d.hidden_norm || !d.norm) return false;
-        for (int l = 0; l < layers; ++l) {
-            const std::string p = "dflash.blk." + std::to_string(l) + ".";
-            dense::BlockDrafter::Layer L;
-            L.attn_norm = floats(gg, p + "attn_norm.weight", H, err);
-            L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err);
-            L.q_norm = floats(gg, p + "attn_q_norm.weight", d.head_dim, err);
-            L.k_norm = floats(gg, p + "attn_k_norm.weight", d.head_dim, err);
-            L.base_a = floats(gg, p + "attn_conv.base", 4 * (int64_t) H, err);
-            L.base_f = floats(gg, p + "ffn_conv.base", 4 * (int64_t) H, err);
-            if (!L.attn_norm || !L.ffn_norm || !L.q_norm || !L.k_norm || !L.base_a || !L.base_f ||
-                !linear(gg, p + "attn_q", AQ, H, L.q, err) || !linear(gg, p + "attn_k", KV, H, L.k, err) ||
-                !linear(gg, p + "attn_v", KV, H, L.v, err) || !linear(gg, p + "attn_output", H, AQ, L.o, err) ||
-                !linear(gg, p + "ffn_gate", ff, H, L.gate, err) || !linear(gg, p + "ffn_up", ff, H, L.up, err) ||
-                !linear(gg, p + "ffn_down", H, ff, L.down, err) || !linear(gg, p + "attn_conv", conv, H, L.conv_a, err) ||
-                !linear(gg, p + "ffn_conv", conv, H, L.conv_f, err))
-                return false;
-            d.layers.push_back(L);
-        }
-        d.sel_h = bf16(gg, "dflash.selector.hidden.weight", (int64_t) d.rank * H, err);
-        d.pred = bf16(gg, "dflash.selector.pred", (int64_t) d.rank * desc_.n_vocab, err);
-        d.succ = bf16(gg, "dflash.selector.succ", (int64_t) d.rank * desc_.n_vocab, err);
-        if (!d.sel_h || !d.pred || !d.succ) return false;
-        d.present = true;
-        return true;
+    bool block_drafter(const GgufFile& gg, dflash::BlockDrafter& d, int H, std::string& err) {
+        if (!dflash::read_meta(gg.metadata(), "qwen35", H, d, err)) return false;
+        // each tensor through this model's own readers, which carve it from the card's block and queue its read
+        dflash::Loaders load;
+        load.floats = [&](const std::string& name, int64_t elems) { return floats(gg, name, elems, err); };
+        load.bf16 = [&](const std::string& name, int64_t elems) { return bf16(gg, name, elems, err); };
+        load.linear = [&](const std::string& base, int64_t rows, int64_t cols, model::Linear& l) {
+            return linear(gg, base, rows, cols, l, err);
+        };
+        if (dflash::read_weights(d, desc_.n_vocab, load)) return true;
+        if (err.empty()) err = "qwen35: the pack's block drafter did not load";
+        return false;
     }
 
     const uint16_t* bf16(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
@@ -598,7 +553,7 @@ private:
 
     // `<base>.weight` (Q8_0, NVFP4_PLANES or F8_E4M3, rows x cols) and, for the last two, its tensor scale `<base>.scale`
     // (F32 [1]; the F8 head's may be F32 [rows], a scale per row)
-    bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err) {
+    bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, model::Linear& l, std::string& err) {
         auto it = tensors_.find(base + ".weight");
         if (it == tensors_.end()) {
             err = "qwen35: the pack has no " + base + ".weight";
@@ -652,7 +607,7 @@ private:
     const GgufFile* gg_ = nullptr;
     const dense::Geometry* geo_ = nullptr;
     const dense::Options* opt_ = nullptr;
-    const dense::BlockDrafter* bd_ = nullptr;
+    const dflash::BlockDrafter* bd_ = nullptr;
     const model::LoadRequest* req_ = nullptr;
 };
 

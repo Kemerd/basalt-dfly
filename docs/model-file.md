@@ -1,7 +1,7 @@
 # `.basalt` model file
 
-One file holds everything the engine, the server and the vision sidecar load: weights, tokenizer and chat template, MTP or DSpark
-drafter, 8-bit hyper-connection copies, vision projector, and the GGUF metadata with default sampling. Flags and the expert profile are
+One file holds everything the engine, the server and the vision sidecar load: weights, tokenizer and chat template, MTP, DSpark
+or block drafter, 8-bit hyper-connection copies, vision projector, and the GGUF metadata with default sampling. Flags and the expert profile are
 not in it.
 
 - **Layout:** a 64 KiB header (magic `BASALTMF`, version 2, up to 511 named sections with offset, size and SHA-256), then sections aligned
@@ -102,6 +102,33 @@ hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir 
 python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4-local \
     --out Qwen3.8-FN-FP4-Local.basalt --name "Qwen3.8-Flash-Next FP4-Local"
 ```
+
+## Flash-Next block drafter
+
+`--drafter` with `--into` adds a DFlash 2 block drafter
+([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)) to a Flash-Next pack that exists, as `--dspark` does: no other section
+moves, the MTP sections stay, and `--roll-back` restores the pack bit for bit. The runs that draft with it: [drafting](models/qwen38-flash-next.md#drafting).
+
+```sh
+python3 tools/convert/convert.py --drafter Qwen3.8-Flash-Next-DFlash2 --into PACK.basalt --undo-dir DIR
+```
+
+- `dflash` (761,018,368 bytes): the drafter's tensors under the [27B pack](#qwen38-27b-pack)'s names and forms, each 4096 aligned.
+  `meta.tensors` lists them with `"section": "dflash"`, `gguf_kv` has its shape as `qwen4exp.dflash.*`, `meta.dflash` its source files.
+
+## Flash-Next DFly2 drafter
+
+`--dfly` with `--into` adds a DFly2 drafter to a Flash-Next pack that exists, as `--dspark` does (`--roll-back` restores the pack
+bit for bit). The input is a `tools/dfly2-train` checkpoint: FP32 safetensors whose metadata states its shape and its pack.
+
+```sh
+python3 tools/convert/convert.py --dfly drafter.safetensors --into PACK.basalt --undo-dir DIR
+```
+
+- `dfly`: the checkpoint's tensors under their own names, each rounded to BF16 (nearest even) and 64-byte aligned. `meta.dfly2`:
+  `format` `dfly2-qwen4exp`, the settings every DFly2 drafter has, this drafter's shape, `step`, `source` and `tensors`.
+- Refused: a tensor set, width, head count, vocabulary, target layer, selection width, block or mask token that does not fit the
+  pack; with `--force` a rotary base or a recorded pack size or `meta` digest that is not this pack's is attached anyway.
 
 ## Qwen3.8-27B pack
 

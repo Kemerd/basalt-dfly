@@ -28,6 +28,19 @@ public:
     /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
     static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+    /// Rows [0, n) of the head rows at `w` (weights(), or a copy of a run of its rows on the stream's device) against
+    /// T q8_1 columns of the head's input width: T rows of n logits in `y`, each the bits of the whole head's.  The
+    /// kernel is the one the head's type and T select; launches only.  Throws std::invalid_argument on an unloaded
+    /// head, a null buffer or a count out of range, and whatever the kernel throws.
+    void score_rows(const void* w, const void* x_q8_1, float* y, int n, int T, void* stream) const;
+    /// Whether a head of this ggml type has the two-stage argmax of draft_top1.
+    static bool has_draft_top1(int type) { return type == 13 || type == 14 || type == 8; }
+    /// One q8_1 column's argmax over the head rows `map` names and its probability, by the 2-bit copy `proxy` of those
+    /// rows (rows near the best are scored exactly from `rows`), with the kernel of the head's type. `rows_by_map`:
+    /// `rows` is the whole head and the copy's row r is its row map[r]; a Q5_K head has no such form, its `rows` are
+    /// the copy's rows in order. False: this type has none (nothing launched).
+    bool draft_top1(const void* proxy, const void* rows, const void* x_q8_1, int n_rows, int64_t n_cap, const int32_t* map,
+                    int* out_id, float* out_prob, void* scratch, void* stream, bool rows_by_map) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
