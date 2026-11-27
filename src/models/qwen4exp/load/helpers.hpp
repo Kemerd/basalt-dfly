@@ -37,6 +37,32 @@ bool for_each_index_name(const basalt::core::FileRange& index, const std::functi
 int argmax(const std::vector<float>& v);
 double pcie_frac_for_gbps(double gbps, double base);
 
+struct Context;
+
+/// Expert-cache slots lent to the prompt path, each with its entry of the residency table: (entry, slot).
+using LentSlots = std::vector<std::pair<int32_t, int32_t>>;
+
+/// Lends the cache's last `k` slots (0 < k <= its slots): lists in `lent` the residency entries that name one, marks
+/// them not resident and uploads the table. `borrow` and `borrow_bytes` get the region the slots span, for
+/// Prefill::init or Prefill::relayout.
+void lend_cache_tail(Context& context, int64_t k, LentSlots& lent, void*& borrow, uint64_t& borrow_bytes);
+
+/// Readies `prefill` for a prompt of `rows` tokens: settles `o.prefill_chunk` (an auto chunk is the largest the expert
+/// cache can lend, and no chunk is larger than the prompt needs), lends the cache slots that hold its buffers (`lent`;
+/// empty when it allocates its own), gives it the CPU pool's share and initializes it. `loan_slots`, when given, gets
+/// the slots the loan spans (0: its own buffers). False with `err`.
+bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64_t rows, LentSlots& lent, std::string& err,
+                      int64_t* loan_slots = nullptr);
+
+/// Refills the lent slots from the expert source and gives them back to the decode tier; `ms` gets the time it took.
+/// Returns 0, or the exit code once the failure is logged.
+int refill_lent(Context& context, const LentSlots& lent, double& ms);
+
+/// Sets `ver` up for windows of up to `max_t` rows over the run's session, as the one-shot loop runs them: the
+/// residency tables, the CPU tier's warm-up, the routing options and the expert dispatch's plan. Returns 0, or the
+/// exit code once the failure is logged.
+int window_init(Context& context, basalt::core::Verifier& ver, int max_t);
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves

@@ -59,6 +59,33 @@ On when the pack has the MTP drafter. `--spec N` sets the window (default 8: the
 plain decoding's ([precision](../precision/qwen38-flash-next.md#drafting-does-not-change-output)). Structured output drafts best
 and prose least.
 
+## Teacher export
+
+`basalt generate --model PACK.basalt --dfly2-export DIR --dfly2-docs FILE --max-context C` generates nothing: it writes what the
+model computes for each document of `FILE` into `DIR`, as the shards a DFly2 drafter is trained on
+([training](../dfly2-training.md#teacher-shards)). No drafter runs and the expert tiers stay as loaded.
+
+- **Input:** one document a line, as token ids separated by spaces or commas. An empty line or an id outside the vocabulary
+  ends the run with the line's number. A document longer than `--max-context` is cut to it and counted.
+- **Two kinds of row:** a document's last `--dfly2-window-rows N` rows (default 512; 0: none) are read through verify windows
+  of 8, as generated rows are when serving, and the rows before them by the batched prompt path (`--prefill`, default auto).
+  With `n` rows the windows start at row `n - min(N, n - 1)`.
+- **Per row:** the head's input and the K and V cells of layers 31, 35, 39, 43 and 47, all FP16: 15,360 bytes.
+- **Anchors:** one per 64 prompt-path rows and one per 8 window rows, drawn from a fixed seed and the line's number, each with
+  the cells those five layers selected for the row before it (up to 2,051 a layer). Every anchor leaves room for a block of 8.
+- **Files:** `shard-NNNNN.dfly2`, each closed at a document's end once it holds 262,144 tokens and named `.part` until it is
+  whole. `export.json` holds the run's settings: the pack, the documents file, the window rows, the context, the prompt chunk,
+  the CPU share, the expert cache's slots and the rotation's base.
+- **Restart:** the same command continues after the documents of the closed shards. A setting that differs from `export.json`
+  is refused with its name and the stored value; when `--prefill auto` settles on another chunk, pass the stored one as
+  `--prefill N`.
+- **Check:** at its end the run reads its first document once more and reports whether the rows, cells and selections are
+  the same as the first time.
+- **Refused:** `--serve`, `--kv` other than `fp16`, `--kv-resident`, `--prefill 0`, a control vector, a rope scaling and
+  `gpu-mode split`.
+- **Memory:** VRAM as a one-shot run with `--spec 8`. RAM: two page-locked buffers of one prompt chunk's rows and cells each
+  (31 MB at a chunk of 2,048, about 0.5 GB at 32,768).
+
 ## Parallel slots
 
 `--parallel N` (1 to 8) serves N requests at once ([running](../running.md#concurrent-requests---parallel-n)).

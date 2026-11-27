@@ -54,6 +54,11 @@ public:
     /// drafts may differ, never the target's tokens' logits.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                   std::string& err);
+    /// The head's input rows of the chunk `on_chunk` reports, from its final residual rows `R_rows` (device, n rows of
+    /// hc * n_embd): the output hyper-connection's mix, as fp16 rows of n_embd copied to `out` (page-locked host
+    /// memory). `rows`, when given, gets the fp32 rows on the device, valid until the next chunk. Call it from
+    /// on_chunk. False with `err`: a weight is missing or has the wrong form, or n is above the chunk.
+    bool head_input(const float* R_rows, int64_t n, uint16_t* out, std::string& err, const float** rows = nullptr);
     Prefill();
     ~Prefill();
     Prefill(const Prefill&) = delete;
@@ -161,6 +166,12 @@ public:
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// Called in each QSA layer of a chunk once its rows' selections are made: the layer, the chunk's first position and
+    /// length, and the selections (device, T rows of `cap` ids; row t's first qsa_selection_width(pos0 + t + 1) are valid,
+    /// ascending). Not synchronized. The ids are valid only inside the call: the layer's FFN half overwrites them, so
+    /// a caller queues its device copies here, on the stream `init` was given. Single-stage runs only.
+    std::function<bool(int64_t layer, int64_t pos0, int64_t T, const int32_t* sel_ids, int64_t cap, std::string& err)> on_selection;
 
     /// Called on the host before each layer of a chunk with the layers done so far, the layer count, the chunk's
     /// length and first position.  No device work is added; the MoE layers' routing readback keeps the host in step

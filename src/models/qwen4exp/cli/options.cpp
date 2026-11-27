@@ -62,7 +62,7 @@ std::optional<int> prepare_input_options(Options& o) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
-    if (!have_tokens && o.serve) {   // requests bring their own tokens
+    if (!have_tokens && (o.serve || !o.dfly2_export.empty())) {   // requests, or the export's documents, bring their own tokens
         o.tokens = {o.turn_token};
         o.max_new = 1;
         have_tokens = true;

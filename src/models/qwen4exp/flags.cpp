@@ -19,6 +19,7 @@ namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
 constexpr int kTopK = 10;                // the routed experts per token
 constexpr float kRoutePriorBare = 0.5f;  // --route-prior alone: on the log probability
+constexpr int kExportWindow = 8;         // the rows of a teacher export's verify windows (kVerifyMaxT)
 }  // namespace
 
 bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& code) {
@@ -55,6 +56,9 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(args.next("--vram-segment-mib"));
     else if (a == "--prefill-until") o.prefill_until = std::atoll(args.next("--prefill-until"));
     else if (a == "--dump-final-r") o.dump_final_r = args.next("--dump-final-r");
+    else if (a == "--dfly2-export") o.dfly2_export = args.next("--dfly2-export");
+    else if (a == "--dfly2-docs") o.dfly2_docs = args.next("--dfly2-docs");
+    else if (a == "--dfly2-window-rows") o.dfly2_window_rows = std::atoll(args.next("--dfly2-window-rows"));
     else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
     else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
     else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(args.next("--spec-corrupt"));
@@ -151,6 +155,28 @@ std::optional<int> finish_flags(Options& o) {
         return 2;
     }
     if (o.diag_batch_check) o.serve = true;   // the batch slots exist in the serving engine, which runs the check
+    if (o.dfly2_export.empty() && !o.dfly2_docs.empty()) {
+        basalt::log::error("basalt generate", "--dfly2-docs is the input of --dfly2-export DIR");
+        return 2;
+    }
+    if (!o.dfly2_export.empty()) {
+        // the export reads whole fp16 cells and unedited rows, in one process that serves nothing
+        const char* why = o.dfly2_docs.empty() ? "needs --dfly2-docs FILE (one document a line, as token ids)"
+                          : o.dfly2_window_rows < 0 ? "takes --dfly2-window-rows of 0 or more"
+                          : o.serve ? "is a one-shot run: not with --serve"
+                          : !o.kv.empty() && o.kv != "fp16" ? "exports fp16 cells: not with --kv other than fp16"
+                          : o.kv_resident > 0 ? "reads whole cells from VRAM: not with --kv-resident"
+                          : o.prefill_given && o.prefill_chunk <= 0 ? "reads a document's first rows through the batched prompt path: not with --prefill 0"
+                          : !o.cvec_files.empty() ? "exports the model's own rows: not with a control vector"
+                          : nullptr;
+        if (why != nullptr) {
+            basalt::log::error("basalt generate", "--dfly2-export %s", why);
+            return 2;
+        }
+        // its last rows go through verify windows of the widest size, and no drafter runs
+        o.spec = kExportWindow;
+        o.spec_given = true;
+    }
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;

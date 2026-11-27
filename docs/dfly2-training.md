@@ -4,9 +4,10 @@
 selects the cells each row reads (Qwen3.8-Flash-Next, architecture `qwen4exp`). It is a C++ program on LibTorch in
 `tools/dfly2-train/`, built apart from the engine.
 
-**Status.** The trainer, its file formats and its CPU tests are in the tree. The engine's teacher export, which writes
-the shards the trainer reads, is not written yet, so there is no shard of a real model to train on: the tests train
-on a small synthetic target. The trainer has not been run on a GPU.
+**Status.** The trainer, its file formats and its CPU tests are in the tree. The engine's teacher export
+([`--dfly2-export`](models/qwen38-flash-next.md#teacher-export)) writes the shards the trainer reads; it has not been
+run on a GPU, so there is no shard of a real model to train on: the tests train on a small synthetic target. The
+trainer has not been run on a GPU.
 
 ## What is trained
 

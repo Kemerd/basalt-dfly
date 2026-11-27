@@ -217,6 +217,7 @@ int dispatch(Context& context) {
     }
 
 
+    if (!o.dfly2_export.empty()) return dfly2_export(context);
     return prefill(context);
 }
 

@@ -150,6 +150,8 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/split.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
+  src/models/qwen4exp/load/dfly2_shard_queue.cpp
+  src/models/qwen4exp/load/dfly2_export.cpp
   src/models/qwen4exp/load/model.cpp
   src/models/qwen4exp/load/layer_plan.cpp
   src/models/qwen4exp/load/weights.cpp
@@ -202,6 +204,13 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+  # the teacher export's writer: pieces in, shards out, a restart and the settings file (host only)
+  add_executable(qwen4exp_dfly2_shard_queue_test tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp
+                 src/models/qwen4exp/load/dfly2_shard_queue.cpp)
+  target_include_directories(qwen4exp_dfly2_shard_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(qwen4exp_dfly2_shard_queue_test PRIVATE engine_session model_file platform warnings)
+  basalt_embed_manifest(qwen4exp_dfly2_shard_queue_test)
+  basalt_cpu_test(NAME qwen4exp_dfly2_shard_queue_test COMMAND qwen4exp_dfly2_shard_queue_test)
 endif()
 endif()
 
@@ -216,6 +225,13 @@ if(BUILD_TESTING)
   target_link_libraries(dfly2_record_test PRIVATE core)
   basalt_cpu_test(NAME dfly2_record_test COMMAND dfly2_record_test)
 endif()
+endif()
+if(BUILD_TESTING)
+  # a teacher export's anchors (include/basalt/dfly2/anchors.hpp): a header, so it builds whatever models are built
+  add_executable(dfly2_anchors_test tests/dfly2/anchors_test.cpp)
+  target_include_directories(dfly2_anchors_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(dfly2_anchors_test PRIVATE warnings)
+  basalt_cpu_test(NAME dfly2_anchors_test COMMAND dfly2_anchors_test)
 endif()
 
 if(BASALT_MODEL_HY4FLASH)

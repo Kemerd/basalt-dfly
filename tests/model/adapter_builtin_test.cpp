@@ -92,6 +92,37 @@ int main() {
         check(all.size() == 3 && all[0].flag == "--relaxed-drafting" && all[1].effect == "--route-prior 1.5 changes expert routing" &&
                   all[2].effect == "--route-tail-skip 9 drops low-ranked missed experts",
               "qwen4exp: every lossy flag, bare ones at their defaults, in the warning order");
+        // the teacher export: finish_flags' exit code (0: accepted) and the window the run is left with
+        const auto finish = [&](std::vector<std::string> words, int* spec = nullptr) {
+            const auto o = q->make_options();
+            words.insert(words.begin(), "basalt");
+            std::vector<char*> argv;
+            for (auto& w : words) argv.push_back(w.data());
+            for (int i = 1; i < (int) argv.size(); ++i) {
+                int code = 0;
+                model::FlagArgs args((int) argv.size(), argv.data(), i);
+                if (!q->parse_flag(argv[i], args, *o, code) || code != 0) return -1;
+            }
+            const int code = q->finish_flags(*o).value_or(0);
+            if (spec != nullptr) *spec = o->spec;
+            return code;
+        };
+        int spec = 0;
+        check(finish({"--dfly2-export", "out", "--dfly2-docs", "docs.txt", "--kv", "fp16", "--prefill", "2048"}, &spec) == 0 &&
+                  spec == 8,
+              "qwen4exp --dfly2-export with its documents is taken, with windows of 8");
+        check(finish({"--dfly2-export", "out", "--dfly2-docs", "docs.txt", "--dfly2-window-rows", "0"}) == 0,
+              "qwen4exp --dfly2-export takes no window rows");
+        check(finish({}, &spec) == 0 && spec == 0, "qwen4exp without --dfly2-export keeps its window");
+        check(finish({"--dfly2-export", "out"}) == 2, "qwen4exp --dfly2-export without --dfly2-docs is refused");
+        check(finish({"--dfly2-docs", "docs.txt"}) == 2, "qwen4exp --dfly2-docs without --dfly2-export is refused");
+        for (const std::vector<std::string>& more : {std::vector<std::string>{"--dfly2-window-rows", "-1"}, {"--kv", "int8"},
+                                                     {"--kv-resident", "20480"}, {"--prefill", "0"},
+                                                     {"--control-vector", "v.gguf"}}) {
+            std::vector<std::string> words = {"--dfly2-export", "out", "--dfly2-docs", "docs.txt"};
+            words.insert(words.end(), more.begin(), more.end());
+            check(finish(words) == 2, ("qwen4exp --dfly2-export is refused with " + more[0] + " " + more[1]).c_str());
+        }
     }
     // the routing flags of every mixture-of-experts model: the bare prior is the model's own; the tail skip needs the pack's
     // experts per token, so without a pack it is refused
