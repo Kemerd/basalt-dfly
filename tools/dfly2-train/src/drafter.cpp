@@ -14,6 +14,20 @@ torch::nn::Linear linear(int64_t in, int64_t out) {
     return torch::nn::Linear(torch::nn::LinearOptions(in, out).bias(false));
 }
 
+/// `x` [N][B][heads][head_dim] as the cache stores it, the gradient passed straight through: FP16, or the INT8 rule's
+/// values for the blocks `kv_int8` ([N] bool, or undefined) marks.
+torch::Tensor as_stored(const torch::Tensor& x, const torch::Tensor& kv_int8) {
+    torch::Tensor stored;
+    {
+        torch::NoGradGuard no_grad;
+        const torch::Tensor plain = x.detach();
+        stored = plain.to(torch::kFloat16).to(x.scalar_type());
+        if (kv_int8.defined()) stored = torch::where(kv_int8.view({-1, 1, 1, 1}), kv_int8_round(plain).to(x.scalar_type()), stored);
+        stored -= plain;
+    }
+    return x + stored;
+}
+
 /// Copies `src` into the parameter `dst` when their shapes agree.
 bool copy_weight(torch::Tensor& dst, const torch::Tensor& src, const char* name, std::string& err) {
     if (!src.defined() || !(src.sizes() == dst.sizes())) {
@@ -66,17 +80,18 @@ torch::Tensor DraftAttentionImpl::rope(const torch::Tensor& x, const torch::Tens
 }
 
 torch::Tensor DraftAttentionImpl::forward(const torch::Tensor& y, const torch::Tensor& pos, const torch::Tensor& k_ctx,
-                                          const torch::Tensor& v_ctx, const torch::Tensor& idx, int64_t chunk_blocks) {
+                                          const torch::Tensor& v_ctx, const torch::Tensor& idx, const torch::Tensor& kv_int8,
+                                          int64_t chunk_blocks) {
     const int64_t N = y.size(0), B = y.size(1), H = shape.n_head, G = shape.n_head_kv, dh = shape.head_dim;
     const torch::Dtype ct = compute_dtype(y);
     // each head's projection is its query half, then its gate half
     const torch::Tensor qg = q_proj->forward(y).view({N, B, H, 2, dh});
     const torch::Tensor q = rope(q_norm->forward(qg.select(3, 0)), pos);
     const torch::Tensor gate = qg.select(3, 1).to(ct);
-    // the block rows' own cells, in the space of the cached ones
-    const torch::Tensor k_blk = rope(k_norm->forward(k_proj->forward(y).view({N, B, G, dh})), pos);
-    const torch::Tensor v_blk = v_proj->forward(y).view({N, B, G, dh}).to(ct);
-    const torch::Tensor attn = sparse_context_attention(q, k_blk, v_blk, k_ctx, v_ctx, idx, chunk_blocks);
+    // the block rows' own cells, in the space of the cached ones and as the cache stores them
+    const torch::Tensor k_blk = as_stored(rope(k_norm->forward(k_proj->forward(y).view({N, B, G, dh})), pos), kv_int8);
+    const torch::Tensor v_blk = as_stored(v_proj->forward(y).view({N, B, G, dh}).to(ct), kv_int8);
+    const torch::Tensor attn = sparse_context_attention(q, k_blk, v_blk, k_ctx, v_ctx, idx, chunk_blocks, kv_int8);
     return o_proj->forward((attn * torch::sigmoid(gate)).to(y.scalar_type()).reshape({N, B, H * dh}));
 }
 
@@ -100,9 +115,10 @@ DraftLayerImpl::DraftLayerImpl(const DrafterShape& s) {
 }
 
 torch::Tensor DraftLayerImpl::forward(const torch::Tensor& x, const torch::Tensor& pos, const torch::Tensor& k_ctx,
-                                      const torch::Tensor& v_ctx, const torch::Tensor& idx, int64_t chunk_blocks) {
+                                      const torch::Tensor& v_ctx, const torch::Tensor& idx, const torch::Tensor& kv_int8,
+                                      int64_t chunk_blocks) {
     const torch::Dtype dt = x.scalar_type();
-    const torch::Tensor h = x + self_attn->forward(input_layernorm->forward(x).to(dt), pos, k_ctx, v_ctx, idx, chunk_blocks);
+    const torch::Tensor h = x + self_attn->forward(input_layernorm->forward(x).to(dt), pos, k_ctx, v_ctx, idx, kv_int8, chunk_blocks);
     return h + mlp->forward(post_attention_layernorm->forward(h).to(dt));
 }
 
@@ -196,7 +212,8 @@ torch::Tensor DrafterImpl::backbone(const torch::Tensor& embedding, const Sequen
     // row r of a block sits r positions after its anchor
     const torch::Tensor pos = blocks.anchors.unsqueeze(1) + torch::arange(shape.block, torch::TensorOptions().dtype(torch::kLong).device(x.device())) + seq.pos0;
     for (int64_t i = 0; i < shape.n_layers; ++i)
-        x = layers->ptr<DraftLayerImpl>((size_t) i)->forward(x, pos, seq.k[(size_t) i], seq.v[(size_t) i], blocks.sel[(size_t) i], chunk_blocks);
+        x = layers->ptr<DraftLayerImpl>((size_t) i)->forward(x, pos, seq.k[(size_t) i], seq.v[(size_t) i], blocks.sel[(size_t) i], blocks.kv_int8,
+                                                            chunk_blocks);
     return final_norm->forward(x).to(x.scalar_type());
 }
 

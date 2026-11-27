@@ -25,6 +25,17 @@ bool ends_with(const std::string& s, const std::string& tail) {
 
 uint64_t piece_align(uint64_t n) { return (n + kPieceAlign - 1) / kPieceAlign * kPieceAlign; }
 
+/// " N <what>, not the M expected", or the first place the two lists differ; empty when they are the same.
+std::string list_differs(const std::vector<int32_t>& got, const std::vector<int32_t>& want, const char* what) {
+    if (got.size() != want.size())
+        return std::to_string(got.size()) + " " + what + "s, not the " + std::to_string(want.size()) + " expected";
+    for (size_t i = 0; i < got.size(); ++i)
+        if (got[i] != want[i])
+            return std::string(what) + " number " + std::to_string(i) + " is " + std::to_string(got[i]) + ", not " +
+                   std::to_string(want[i]);
+    return {};
+}
+
 /// The first geometry or pack identity field of `a` that is not `b`'s, or nullptr.
 const char* differs(const ShardHeader& a, const ShardHeader& b) {
     if (a.hidden != b.hidden) return "hidden width";
@@ -296,19 +307,23 @@ bool ShardQueue::write(Item& item, std::string& err) {
     return shard_tokens_ < limits_.shard_tokens || finish_shard(err);
 }
 
-bool ShardQueue::write_piece(const Piece& p, std::string& err) {
-    const uint64_t page = (uint64_t) limits_.page, heads = geometry_.n_head_kv, dim = geometry_.head_dim;
-    if (!writer_.put_hidden((uint64_t) p.row0, (uint64_t) p.rows, p.hidden, err)) return false;
+void ShardQueue::piece_cells(const Piece& p, uint32_t l, uint64_t page, uint64_t heads, uint64_t dim, uint16_t* k_cells,
+                             uint16_t* v_cells) {
     // the cache keeps a page head-major; the shard keeps a cell's heads together, and only the piece's own cells
-    for (uint32_t l = 0; l < geometry_.n_layers; ++l) {
-        for (uint64_t r = 0; r < (uint64_t) p.rows; ++r) {
-            const uint64_t cell = (uint64_t) p.row0 + r, in_page = cell % page, pg = cell / page - (uint64_t) p.page0;
-            for (uint64_t h = 0; h < heads; ++h) {
-                const size_t src = (size_t) (((pg * heads + h) * page + in_page) * dim), dst = (size_t) ((r * heads + h) * dim);
-                std::memcpy(k_cells_.data() + dst, p.k[l] + src, (size_t) dim * sizeof(uint16_t));
-                std::memcpy(v_cells_.data() + dst, p.v[l] + src, (size_t) dim * sizeof(uint16_t));
-            }
+    for (uint64_t r = 0; r < (uint64_t) p.rows; ++r) {
+        const uint64_t cell = (uint64_t) p.row0 + r, in_page = cell % page, pg = cell / page - (uint64_t) p.page0;
+        for (uint64_t h = 0; h < heads; ++h) {
+            const size_t src = (size_t) (((pg * heads + h) * page + in_page) * dim), dst = (size_t) ((r * heads + h) * dim);
+            std::memcpy(k_cells + dst, p.k[l] + src, (size_t) dim * sizeof(uint16_t));
+            std::memcpy(v_cells + dst, p.v[l] + src, (size_t) dim * sizeof(uint16_t));
         }
+    }
+}
+
+bool ShardQueue::write_piece(const Piece& p, std::string& err) {
+    if (!writer_.put_hidden((uint64_t) p.row0, (uint64_t) p.rows, p.hidden, err)) return false;
+    for (uint32_t l = 0; l < geometry_.n_layers; ++l) {
+        piece_cells(p, l, (uint64_t) limits_.page, geometry_.n_head_kv, geometry_.head_dim, k_cells_.data(), v_cells_.data());
         if (!writer_.put_kv(l, (uint64_t) p.row0, (uint64_t) p.rows, k_cells_.data(), v_cells_.data(), err)) return false;
     }
     for (int i = 0; i < p.n_sel; ++i) {
@@ -363,7 +378,11 @@ bool manifest_check(const std::string& dir, const std::map<std::string, std::str
     const std::string path = dir + "/" + kManifest;
     uint64_t bytes = 0;
     if (!platform::file_size(path, bytes)) {
-        // absent: this run's settings become the directory's
+        // absent: this run's settings become the directory's, unless shards were written under other ones
+        if (platform::file_size(dir + "/" + ShardQueue::shard_name(0), bytes)) {
+            err = dir + " holds shards but no " + kManifest + ": their settings are unknown";
+            return false;
+        }
         if (!platform::make_dirs(dir)) { err = "cannot create " + dir; return false; }
         std::string text = "{\n";
         size_t written = 0;
@@ -394,6 +413,81 @@ bool manifest_check(const std::string& dir, const std::map<std::string, std::str
     }
     for (const auto& member : stored.members)
         if (settings.find(member.first) == settings.end()) { err = path + ": \"" + member.first + "\" is not a setting of this export"; return false; }
+    return true;
+}
+
+bool selection_form(const int32_t* ids, uint64_t count, int64_t n_kv, int64_t block, int64_t cap) {
+    if (n_kv < 1 || block < 1 || cap < 1 || (count != 0 && ids == nullptr)) return false;
+    if (count != (uint64_t) std::min(n_kv, cap)) return false;
+    if (n_kv <= cap) {   // every cell, in order
+        for (uint64_t i = 0; i < count; ++i)
+            if (ids[i] != (int64_t) i) return false;
+        return true;
+    }
+    // a block's cells share its score: a block is taken from its first cell on and the budget ends inside at most
+    // one, and the unfinished block outranks every other
+    const int64_t last = n_kv / block, tail = n_kv % block;
+    int64_t before = -1, in_part = 0;
+    bool tail_whole = tail == 0;
+    for (uint64_t i = 0; i < count;) {
+        if (ids[i] < 0 || ids[i] >= n_kv) return false;
+        const int64_t b = ids[i] / block, cells = b == last ? tail : block;
+        if (b <= before) return false;
+        int64_t have = 0;
+        while (i < count && have < cells && ids[i] == b * block + have) ++have, ++i;
+        if (have == 0) return false;   // the block is not taken from its first cell
+        if (have < cells && (b == last || ++in_part > 1)) return false;
+        tail_whole = tail_whole || b == last;
+        before = b;
+    }
+    return tail_whole;
+}
+
+bool shards_read_back(const std::string& dir, const ShardHeader& geometry, int64_t index_block, uint64_t sequences,
+                      const SequenceSource& expected, const SequenceSink& seen, ReadBack& found, std::string& err) {
+    found = ReadBack{};
+    if (dir.empty() || !expected || index_block < 1) { err = "reading an export back needs its directory, its sequences and the index block"; return false; }
+    SequenceData data;
+    std::vector<int32_t> tokens, anchors;
+    // the closed shards are numbered without a gap: the first missing name ends them
+    for (uint64_t shard = 0; shard <= kLastShard; ++shard) {
+        const std::string path = dir + "/" + ShardQueue::shard_name(shard);
+        uint64_t bytes = 0;
+        if (!platform::file_size(path, bytes)) break;
+        ShardReader reader;
+        if (!reader.open(path, err)) return false;
+        const ShardHeader& h = reader.header();
+        if (const char* field = differs(h, geometry)) { err = path + ": its " + field + " is not this export's"; return false; }
+        for (uint64_t i = 0; i < reader.sequences(); ++i) {
+            const uint64_t seq = found.sequences;
+            const std::string where = path + " sequence " + std::to_string(i) + " (document " + std::to_string(seq + 1) + ")";
+            std::string why;
+            if (!reader.read(i, data, why) || !expected(seq, tokens, anchors, why)) { err = where + ": " + why; return false; }
+            if (data.info.pos0 != 0) { err = where + ": starts at position " + std::to_string(data.info.pos0) + ", an export's sequences start at 0"; return false; }
+            why = list_differs(data.tokens, tokens, "token");
+            if (why.empty()) why = list_differs(data.anchors, anchors, "anchor");
+            if (!why.empty()) { err = where + ": " + why; return false; }
+            // row anchor - 1 selects among `anchor` cells
+            for (size_t a = 0; a < anchors.size(); ++a)
+                for (uint32_t l = 0; l < h.n_layers; ++l) {
+                    const size_t slot = a * h.n_layers + l;
+                    ++found.selections;
+                    if (selection_form(data.selection.data() + slot * h.sel_cap, (uint64_t) data.sel_count[slot], anchors[a], index_block, h.sel_cap))
+                        continue;
+                    if (found.off_form++ == 0)
+                        found.first_off_form = where + ", anchor " + std::to_string(anchors[a]) + ", layer " + std::to_string(h.layers[l]);
+                }
+            if (seen) seen(seq, data);
+            ++found.sequences;
+            found.tokens += tokens.size();
+            found.anchors += anchors.size();
+        }
+        ++found.shards;
+    }
+    if (found.sequences != sequences) {
+        err = dir + ": its closed shards hold " + std::to_string(found.sequences) + " sequences, the export wrote " + std::to_string(sequences);
+        return false;
+    }
     return true;
 }
 

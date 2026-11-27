@@ -91,3 +91,5 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.
+- `dfly2_export_check=N`: with `--dfly2-export`, read every Nth document's window rows by the prompt path too and compare
+  ([teacher export](../models/qwen38-flash-next.md#teacher-export)).

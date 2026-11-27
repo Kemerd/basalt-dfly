@@ -98,12 +98,12 @@ A run drafts with one of them, chosen once at start. No flag selects it: the sta
 
 ## Teacher export
 
-`basalt generate --model PACK.basalt --dfly2-export DIR --dfly2-docs FILE --max-context C` generates nothing: it writes what the
+`bin/basalt --model PACK.basalt --dfly2-export DIR --dfly2-docs FILE --max-context C` generates nothing: it writes what the
 model computes for each document of `FILE` into `DIR`, as the shards a DFly2 drafter is trained on
 ([training](../dfly2-training.md#teacher-shards)). No drafter runs and the expert tiers stay as loaded.
 
-- **Input:** one document a line, as token ids separated by spaces or commas. An empty line or an id outside the vocabulary
-  ends the run with the line's number. A document longer than `--max-context` is cut to it and counted.
+- **Input:** one document a line, as token ids separated by spaces or commas. The whole file is read first: an empty line or
+  an id outside the vocabulary is refused with the line's number before anything is computed. A document longer than `--max-context` is cut to it and counted.
 - **Two kinds of row:** a document's last `--dfly2-window-rows N` rows (default 512; 0: none) are read through verify windows
   of 8, as generated rows are when serving, and the rows before them by the batched prompt path (`--prefill`, default auto).
   With `n` rows the windows start at row `n - min(N, n - 1)`.
@@ -112,12 +112,28 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   the cells those five layers selected for the row before it (up to 2,051 a layer). Every anchor leaves room for a block of 8.
 - **Files:** `shard-NNNNN.dfly2`, each closed at a document's end once it holds 262,144 tokens and named `.part` until it is
   whole. `export.json` holds the run's settings: the pack, the documents file, the window rows, the context, the prompt chunk,
-  the CPU share, the expert cache's slots and the rotation's base.
+  the CPU share, the expert cache's slots, the PCIe share, the routing flags, `--diag-fixed-experts` and the rotation's base.
+  A directory with shards and no `export.json` is refused.
 - **Restart:** the same command continues after the documents of the closed shards. A setting that differs from `export.json`
-  is refused with its name and the stored value; when `--prefill auto` settles on another chunk, pass the stored one as
-  `--prefill N`.
+  is refused with its name and the stored value; when `--prefill auto` settles on another chunk or the expert cache on
+  another size (both follow the free VRAM), pass the stored ones as `--prefill N` and `--expert-cache N`.
 - **Check:** at its end the run reads its first document once more and reports whether the rows, cells and selections are
-  the same as the first time.
+  the same as the first time: an error with `--diag-fixed-experts`, where only state left by the reset between documents can
+  change them, a warning without it. It then reads every closed shard back through the shard reader: each sequence's tokens
+  against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
+  4, the lowest cells of at most one more block, and the unfinished last block), and the first document's arrays against
+  what was computed. A difference is an error line and exit code 1; the shards stay.
+- **Path check:** `--exp dfly2_export_check=N` also reads every Nth document's window rows by the prompt path. Every
+  prompt-path head row is compared with the decode's mix of the same residual row (the windows' mix), which differs by
+  rounding only: a cosine under 0.9999 is an error. The two paths' rows, cells and selections are reported by cells of
+  context, and the rows must match their own window row better than the window row before. The paths compute differently
+  (FP4 or int8 expert activations, a BF16 residual), so their rows are not equal: on this pack's 100k-token test set, head
+  rows' cosine 0.984 against 0.45 for the row before, and 5 to 8% of selected cells differ past 2,051 cells of context.
+- **Placement:** the windows run their experts where the load placed them, with or without `--diag-fixed-experts` (which
+  fixes only the prompt path's: all on the GPU, no CPU share). Two runs give the same bytes when they also pass the same
+  `--prefill N` and `--expert-cache N`.
+- **Cache format:** `--kv fp16`, the one-shot default. A shard holds FP16 cells, which no other format keeps; an INT8
+  cache's codes are a function of those values, 64 at a time, so the trainer can form them from a shard.
 - **Refused:** `--serve`, `--kv` other than `fp16`, `--kv-resident`, `--prefill 0`, a control vector, a rope scaling and
   `gpu-mode split`.
 - **Memory:** VRAM as a one-shot run with `--spec 8`. RAM: two page-locked buffers of one prompt chunk's rows and cells each

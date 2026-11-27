@@ -66,9 +66,12 @@ double simulated_accept_length(const std::vector<double>& hits, double blocks) {
 }
 
 LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch::Tensor& embedding, const torch::Tensor& head,
-                       const SequenceContext& seq, const torch::Tensor& anchors, const LossConfig& cfg, double scale,
-                       torch::Tensor* grad_z) {
+                       const SequenceContext& seq, const torch::Tensor& anchors, const torch::Tensor& block_weight,
+                       const LossConfig& cfg, double scale, torch::Tensor* grad_z) {
     const int64_t N = check_inputs(drafter, z_in, embedding, head, seq, anchors);
+    if (block_weight.defined() && (block_weight.dim() != 1 || block_weight.size(0) != N || !block_weight.is_floating_point() ||
+                                   block_weight.min().item<double>() < 0.0))
+        throw std::invalid_argument("loss: the block weights are not N weights of at least zero");
     const DrafterShape& s = drafter->shape;
     const int64_t B = s.block, rows = B - 1, topk = std::min<int64_t>(std::max<int64_t>(cfg.kl_topk, 1), s.vocab);
     const int64_t step = std::max<int64_t>(1, cfg.chunk_blocks);
@@ -86,7 +89,9 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch:
     out.blocks = (double) N;
     out.hits_corpus.assign((size_t) rows, 0.0);
     out.hits_teacher.assign((size_t) rows, 0.0);
-    double sum_w = 0, sum_kl = 0, sum_bce = 0, sum_e2e = 0, sum_mae = 0;
+    double sum_w = 0, sum_kl = 0, sum_bce = 0, sum_e2e = 0, sum_mae = 0, sum_b = 0;
+    const torch::Tensor weights = block_weight.defined() ? block_weight.to(z.device(), ct)
+                                                         : torch::ones({N}, torch::TensorOptions().dtype(ct).device(z.device()));
 
     for (int64_t c0 = 0; c0 < N; c0 += step) {
         const int64_t c1 = std::min(N, c0 + step);
@@ -118,10 +123,11 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch:
         const torch::Tensor accept = torch::minimum(t_logp.exp(), logq.exp()).sum(-1);
         const torch::Tensor target = accept.detach().clamp(0.0, 1.0);
         const torch::Tensor bce = F::binary_cross_entropy_with_logits(conf, target, F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone));
-        // D-PACE: a row counts for the rows after it that its draft keeps alive
-        const torch::Tensor w = dpace_weights(logq.detach().gather(-1, labels.unsqueeze(-1)).squeeze(-1).exp(), cfg.dpace_alpha);
+        // D-PACE: a row counts for the rows after it that its draft keeps alive; a block for its own weight
+        const torch::Tensor b = weights.slice(0, c0, c1);
+        const torch::Tensor w = dpace_weights(logq.detach().gather(-1, labels.unsqueeze(-1)).squeeze(-1).exp(), cfg.dpace_alpha) * b.unsqueeze(1);
         const torch::Tensor weighted = (w * (kl + cfg.confidence_weight * bce)).sum();
-        const torch::Tensor e2e = e2e_tv_per_block(accept).sum();
+        const torch::Tensor e2e = (e2e_tv_per_block(accept) * b).sum();
 
         if (want_grad) {
             std::vector<torch::Tensor> inputs = {zc};
@@ -145,6 +151,7 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch:
         sum_kl += (w * kl).sum().item<double>();
         sum_bce += (w * bce).sum().item<double>();
         sum_e2e += e2e.item<double>();
+        sum_b += b.sum().item<double>();
         sum_mae += (w * (torch::sigmoid(conf) - target).abs()).sum().item<double>();
         out.tv_accept += torch::cumprod(accept, -1).sum().item<double>();
         const torch::Tensor pick = logits.argmax(-1);
@@ -155,17 +162,17 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch:
         }
     }
 
-    const double denom = std::max(sum_w, 1e-6);
+    const double denom = std::max(sum_w, 1e-6), blocks = sum_b > 0.0 ? sum_b : 1.0;
     out.kl = sum_kl / denom;
     out.confidence = sum_bce / denom;
     out.confidence_mae = sum_mae / denom;
-    out.e2e = sum_e2e / (double) N;
+    out.e2e = sum_e2e / blocks;
     out.loss = out.kl + cfg.confidence_weight * out.confidence + cfg.e2e_weight * out.e2e;
 
     if (want_grad) {
         torch::NoGradGuard no_grad;
         // join the two sums now that both denominators are known; row 0 drafts nothing and gets no gradient
-        const double fw = scale / denom, fe = scale * cfg.e2e_weight / (double) N;
+        const double fw = scale / denom, fe = scale * cfg.e2e_weight / blocks;
         torch::Tensor g = torch::cat(gz_w, 0) * fw;
         if (!gz_e.empty()) g = g + torch::cat(gz_e, 0) * fe;
         *grad_z = torch::cat({torch::zeros({N, 1, s.hidden}, g.options()), g}, 1).to(dt);

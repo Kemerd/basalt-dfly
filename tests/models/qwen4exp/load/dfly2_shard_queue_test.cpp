@@ -1,7 +1,10 @@
 // tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp - the teacher export's writer on synthetic pieces: what goes in
 // page-major comes back cell-major through the shard reader, a piece may start and end inside a cache page, a
 // selection belongs to the piece that holds the row before its anchor, the pieces are the only buffers, shards roll
-// and a restart counts them, and the settings file refuses a changed setting. Host only, no model.
+// and a restart counts them, the settings file refuses a changed setting, a selection has the form of the index's
+// rule, the shards read back against what was handed over, and the documents file is checked whole. Host only, no
+// model.
+#include "models/qwen4exp/load/dfly2_docs.hpp"
 #include "models/qwen4exp/load/dfly2_shard_queue.hpp"
 
 #include <atomic>
@@ -17,8 +20,16 @@
 
 namespace fs = std::filesystem;
 using namespace basalt::dfly2;
+using basalt::models::qwen4exp::generate::DocsFile;
+using basalt::models::qwen4exp::generate::ReadBack;
+using basalt::models::qwen4exp::generate::SequenceSink;
+using basalt::models::qwen4exp::generate::SequenceSource;
 using basalt::models::qwen4exp::generate::ShardQueue;
+using basalt::models::qwen4exp::generate::document_parse;
+using basalt::models::qwen4exp::generate::documents_check;
 using basalt::models::qwen4exp::generate::manifest_check;
+using basalt::models::qwen4exp::generate::selection_form;
+using basalt::models::qwen4exp::generate::shards_read_back;
 
 namespace {
 int g_fail = 0;
@@ -52,6 +63,7 @@ void* take_none(size_t) { return nullptr; }
 const ShardQueue::Memory kPlain{&take_plain, &give_plain};
 
 constexpr int64_t kPage = 4;            // cells of a cache page
+constexpr int32_t kIndexBlock = 2;      // cells that share an index key: the selection is 4 cells and a block's rest
 constexpr uint16_t kNotMine = 0xFFFF;   // what a page holds where the piece has no cell
 constexpr int32_t kPastCount = 77777;   // what a selection row holds past its ids
 
@@ -91,12 +103,20 @@ uint16_t hidden_of(uint64_t seq, int64_t row, uint32_t d) { return (uint16_t) (1
 uint16_t cell_of(uint64_t seq, uint32_t layer, bool value, int64_t cell, uint32_t head, uint32_t d) {
     return (uint16_t) (1 + (seq * 977 + layer * 4099 + (value ? 2053 : 0) + (uint64_t) cell * 37 + head * 11 + d) % 0xE000);
 }
-// row anchor - 1's cells in `layer`: every cell while they fit, else spread over the cells below the anchor
+// row anchor - 1's cells in `layer`: every cell while they fit; else whole blocks (an odd layer the first ones, an
+// even one the last), the lowest cells of one more block, and the unfinished block
 std::vector<int32_t> selection_of(const ShardHeader& h, uint32_t layer, int32_t anchor) {
     std::vector<int32_t> ids;
-    const int32_t count = anchor < (int32_t) h.sel_cap ? anchor : (int32_t) h.sel_cap;
-    for (int32_t j = 0; j < count; ++j)
-        ids.push_back(anchor <= (int32_t) h.sel_cap ? j : (int32_t) ((int64_t) j * (anchor - 1 - (int32_t) layer % 2) / (count - 1)));
+    const int32_t cap = (int32_t) h.sel_cap;
+    if (anchor <= cap) {
+        for (int32_t j = 0; j < anchor; ++j) ids.push_back(j);
+        return ids;
+    }
+    const int32_t full = anchor / kIndexBlock, tail = anchor % kIndexBlock;
+    const int32_t whole = (cap - tail) / kIndexBlock, part = (cap - tail) % kIndexBlock;
+    const int32_t first = layer % 2 ? 0 : full - whole - (part ? 1 : 0);
+    for (int32_t j = 0; j < whole * kIndexBlock + part; ++j) ids.push_back(first * kIndexBlock + j);
+    for (int32_t j = 0; j < tail; ++j) ids.push_back(full * kIndexBlock + j);
     return ids;
 }
 
@@ -369,6 +389,185 @@ int main() {
         check(!manifest_check(dir5, {}, err) && !manifest_check("", settings, err), "no settings or no directory");
         std::ofstream(dir5 + "/export.json") << "not json";
         refused(!manifest_check(dir5, settings, err), "a file that is not the settings is refused", err);
+        const std::string orphan = d.sub("orphan");
+        fs::create_directories(orphan);
+        std::ofstream(orphan + "/" + ShardQueue::shard_name(0)) << "a shard";
+        refused(!manifest_check(orphan, settings, err) && !fs::exists(orphan + "/export.json"),
+                "shards without a settings file are refused, and none is written", err);
+    }
+
+    std::printf("6. a selection's form\n");
+    {
+        // blocks of 4 cells, 8 cells and a block's rest selected: 11 of the 18 cells row 17 reads among
+        const auto form = [](const std::vector<int32_t>& ids, int64_t n_kv) {
+            return selection_form(ids.data(), ids.size(), n_kv, 4, 11);
+        };
+        check(form({0, 1, 2, 3, 4}, 5) && form({0}, 1), "every cell while they fit");
+        check(!form({0, 1, 2, 4, 5}, 5) && !form({0, 1, 2, 3}, 5) && !form({1, 2, 3, 4, 5}, 5), "and nothing else then");
+        std::vector<int32_t> eleven;
+        for (int32_t j = 0; j < 11; ++j) eleven.push_back(j);
+        check(form(eleven, 11), "the widest selection that is every cell");
+        check(form(eleven, 12) && !form(eleven, 13), "one cell more: two blocks and three cells; two more: the last is missing");
+        check(form({0, 1, 2, 3, 8, 9, 10, 11, 12, 16, 17}, 18), "two blocks, one cell of a third and the unfinished block");
+        check(form({4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15}, 16), "no unfinished block: three cells of one block");
+        check(form({0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18}, 19), "an unfinished block of three leaves two whole blocks");
+        check(!form({0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14}, 18), "the unfinished block is always selected");
+        check(!form({0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 16}, 18), "and whole");
+        check(!form({0, 1, 2, 3, 4, 5, 8, 9, 10, 16, 17}, 18), "the budget ends inside one block only");
+        check(!form({0, 1, 2, 3, 8, 9, 10, 11, 13, 16, 17}, 18), "a block gives its lowest cells");
+        check(!form({0, 1, 2, 3, 8, 9, 10, 11, 12, 16}, 18) && !form({0, 1, 2, 3, 8, 9, 10, 11, 12, 16, 17, 18}, 19),
+              "another count than the budget");
+        check(!form({8, 9, 10, 11, 0, 1, 2, 3, 12, 16, 17}, 18) && !form({0, 1, 2, 3, 8, 9, 10, 11, 12, 16, 18}, 18) &&
+              !form({-1, 1, 2, 3, 8, 9, 10, 11, 12, 16, 17}, 18),
+              "blocks out of order, a cell past the row's, a negative id");
+        check(!selection_form(nullptr, 3, 3, 4, 11) && !selection_form(eleven.data(), 11, 0, 4, 11) &&
+              !selection_form(eleven.data(), 11, 11, 0, 11) && !selection_form(eleven.data(), 11, 11, 4, 0),
+              "no ids, no cells, no block, no budget");
+        check(selection_form(nullptr, 0, 0, 4, 11) == false, "a row reads at least its own cell");
+    }
+
+    std::printf("7. the shards read back\n");
+    {
+        // the directory of part 1 and its restart: the five sequences and the one the restart added
+        std::vector<Seq> all = kSeqs;
+        all.push_back({6, {1, 5}});
+        uint64_t tokens = 0, anchors = 0;
+        for (const Seq& q : all) {
+            tokens += (uint64_t) q.n;
+            anchors += q.anchors.size();
+        }
+        const SequenceSource expected = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors_of,
+                                            std::string& e) {
+            if (seq >= all.size()) { e = "no such document"; return false; }
+            ids.clear();
+            for (int64_t r = 0; r < all[(size_t) seq].n; ++r) ids.push_back(token_of(seq, r));
+            anchors_of = all[(size_t) seq].anchors;
+            return true;
+        };
+        uint64_t seen_sequences = 0, seen_rows = 0;
+        const SequenceSink seen = [&](uint64_t seq, const SequenceData& data) {
+            seen_sequences += seq == seen_sequences ? 1 : 0;
+            seen_rows += data.info.n_tokens;
+        };
+        ReadBack back;
+        check(shards_read_back(dir, h, kIndexBlock, all.size(), expected, seen, back, err), "every shard reads back", err);
+        check(back.shards == 4 && back.sequences == all.size() && back.tokens == tokens && back.anchors == anchors,
+              "its shards, sequences, tokens and anchors are counted");
+        check(back.selections == anchors * h.n_layers && back.off_form == 0 && back.first_off_form.empty(),
+              "every selection has the index's form");
+        check(seen_sequences == all.size() && seen_rows == tokens, "each sequence is handed on, in order");
+        check(shards_read_back(dir, h, kIndexBlock, all.size(), expected, nullptr, back, err), "without a sink too", err);
+        // another index block: the selections past the budget no longer have its form, and the pass still ends
+        const bool other_block = shards_read_back(dir, h, 4, all.size(), expected, nullptr, back, err);
+        refused(other_block && back.off_form > 0 && back.off_form < back.selections &&
+                back.first_off_form.find("anchor 8, layer 3") != std::string::npos,
+                "selections of another form are counted and the first is named", back.first_off_form);
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size() + 1, expected, nullptr, back, err) &&
+                err.find("hold 6 sequences") != std::string::npos, "a document the shards lack", err);
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size() - 1, expected, nullptr, back, err), "a sequence too many", err);
+        const SequenceSource short_docs = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors_of,
+                                              std::string& e) {
+            if (seq >= 4) { e = "no such document"; return false; }
+            return expected(seq, ids, anchors_of, e);
+        };
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size(), short_docs, nullptr, back, err) &&
+                err.find("no such document") != std::string::npos && err.find(ShardQueue::shard_name(2)) != std::string::npos,
+                "documents that end before the shards do", err);
+        const SequenceSource other_token = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors_of,
+                                               std::string& e) {
+            if (!expected(seq, ids, anchors_of, e)) return false;
+            if (seq == 3) ids[7] = (ids[7] + 1) % 50;
+            return true;
+        };
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size(), other_token, nullptr, back, err) &&
+                err.find("token number 7") != std::string::npos && err.find("document 4") != std::string::npos &&
+                err.find(ShardQueue::shard_name(1) + " sequence 1") != std::string::npos,
+                "another token is refused with its shard, sequence and document", err);
+        const SequenceSource other_anchor = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors_of,
+                                                std::string& e) {
+            if (!expected(seq, ids, anchors_of, e)) return false;
+            if (seq == 1) anchors_of[2] = 8;
+            return true;
+        };
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size(), other_anchor, nullptr, back, err) &&
+                err.find("anchor number 2 is 6, not 8") != std::string::npos, "another anchor is refused", err);
+        const SequenceSource fewer_anchors = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors_of,
+                                                 std::string& e) {
+            if (!expected(seq, ids, anchors_of, e)) return false;
+            if (seq == 0) anchors_of.pop_back();
+            return true;
+        };
+        refused(!shards_read_back(dir, h, kIndexBlock, all.size(), fewer_anchors, nullptr, back, err) &&
+                err.find("3 anchors, not the 2 expected") != std::string::npos, "another count of anchors is refused", err);
+        ShardHeader other = h;
+        other.vocab = 51;
+        refused(!shards_read_back(dir, other, kIndexBlock, all.size(), expected, nullptr, back, err) &&
+                err.find("vocabulary") != std::string::npos, "another geometry is refused", err);
+        refused(!shards_read_back("", h, kIndexBlock, 0, expected, nullptr, back, err) &&
+                !shards_read_back(dir, h, kIndexBlock, all.size(), nullptr, nullptr, back, err) &&
+                !shards_read_back(dir, h, 0, all.size(), expected, nullptr, back, err),
+                "no directory, no documents or no index block", err);
+        check(shards_read_back(d.sub("nothing"), h, kIndexBlock, 0, expected, nullptr, back, err) && back.shards == 0,
+              "a directory without shards holds no sequence", err);
+        // a shard cut short, and one whose bytes changed under a selection
+        const std::string cut = d.sub("cut"), bent = d.sub("bent");
+        fs::create_directories(cut);
+        fs::create_directories(bent);
+        fs::copy_file(s0, cut + "/" + ShardQueue::shard_name(0));
+        fs::resize_file(cut + "/" + ShardQueue::shard_name(0), fs::file_size(s0) - 8);
+        refused(!shards_read_back(cut, h, kIndexBlock, 2, expected, nullptr, back, err) &&
+                err.find("truncated") != std::string::npos, "a shard cut short", err);
+        fs::copy_file(s0, bent + "/" + ShardQueue::shard_name(0));
+        {
+            // sequence 0's first selection row: its second id set below its first
+            SequenceLayout lay;
+            check(shard_sequence_layout(h, (uint64_t) kSeqs[0].n, kSeqs[0].anchors.size(), lay, err), "its layout", err);
+            std::fstream f(bent + "/" + ShardQueue::shard_name(0), std::ios::in | std::ios::out | std::ios::binary);
+            const int32_t bad = -5;
+            f.seekp((std::streamoff) (sizeof(ShardHeader) + lay.selection + 2 * h.sel_cap * sizeof(int32_t) + sizeof(int32_t)));
+            f.write((const char*) &bad, sizeof bad);
+        }
+        refused(!shards_read_back(bent, h, kIndexBlock, 2, expected, nullptr, back, err) &&
+                err.find("sequence 0") != std::string::npos, "a selection the reader refuses", err);
+    }
+
+    std::printf("8. the documents file\n");
+    {
+        const std::string dir8 = d.sub("docs");
+        fs::create_directories(dir8);
+        const auto write = [&](const std::string& name, const std::string& text) {
+            std::ofstream(dir8 + "/" + name, std::ios::binary) << text;
+            return dir8 + "/" + name;
+        };
+        uint64_t lines = 0;
+        check(documents_check(write("good.txt", "1 2 3\n4,5\r\n6"), 10, lines, err) && lines == 3,
+              "spaces, commas, a CRLF line and a last line without its end: three documents", err);
+        // a line longer than one read of the file
+        std::string longer;
+        for (int i = 0; i < 300000; ++i) longer += "7 ";
+        check(documents_check(write("long.txt", "1\n" + longer + "\n2\n"), 10, lines, err) && lines == 3,
+              "a line longer than one read", err);
+        DocsFile f;
+        std::string line;
+        std::vector<int64_t> doc;
+        check(f.open(dir8 + "/long.txt") && f.next(line) && line == "1" && f.next(line) &&
+                  document_parse(line, 10, doc, err) && doc.size() == 300000 && f.next(line) && line == "2" &&
+                  !f.next(line) && !f.failed(),
+              "read a line at a time, the long one whole", err);
+        refused(!documents_check(write("blank.txt", "1 2\n\n3\n"), 10, lines, err) && err.find("line 2") != std::string::npos,
+                "an empty line, by its number", err);
+        refused(!documents_check(write("tail.txt", "1 2\n3\n\n"), 10, lines, err) && err.find("line 3") != std::string::npos,
+                "a blank last line", err);
+        refused(!documents_check(write("vocab.txt", "1 2\n3 10\n"), 10, lines, err) && err.find("line 2") != std::string::npos &&
+                    err.find("10") != std::string::npos,
+                "an id outside the vocabulary", err);
+        refused(!documents_check(write("text.txt", "1 2\nhello\n"), 10, lines, err) && err.find("line 2") != std::string::npos,
+                "a line that is not token ids", err);
+        refused(!documents_check(write("nul.txt", std::string("1 2\n3\0 4\n", 9)), 10, lines, err) &&
+                    err.find("line 2") != std::string::npos,
+                "a NUL inside a line", err);
+        refused(!documents_check(dir8 + "/missing.txt", 10, lines, err), "a file that is not there", err);
+        check(documents_check(write("empty.txt", ""), 10, lines, err) && lines == 0, "an empty file holds no document", err);
     }
 
     if (g_fail) {

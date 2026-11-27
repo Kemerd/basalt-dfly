@@ -62,7 +62,10 @@ bool open_session(const RunOptions& o, const DrafterFile& file, torch::Dtype dty
     if (!(o.loss.dpace_alpha >= 0.0 && o.loss.dpace_alpha <= 1.0) || !(o.loss.e2e_weight >= 0.0) || !(o.loss.confidence_weight >= 0.0)) { err = "a loss weight is out of range"; return false; }
     if (!parse_device(o.device, s.device, err)) return false;
     if (!s.pack.open(o.model, err) || !drafter_file_matches(file, s.pack.identity(), err)) return false;
-    if (!s.shards.open(o.shards, file.shape, s.pack.identity(), err)) return false;
+    DataOptions data;
+    data.prefix_weight = o.prefix_weight;
+    data.kv_int8_share = o.kv_int8_share;
+    if (!s.shards.open(o.shards, file.shape, s.pack.identity(), data, err)) return false;
 
     // the drafter: every parameter from the file, then moved and rounded to the forward's type
     s.drafter = Drafter(file.shape);
@@ -102,6 +105,7 @@ SequenceContext to_device(const SequenceContext& c, const torch::Device& device)
 BlockBatch make_batch(const LoadedSequence& s, int64_t i0, int64_t i1, const torch::Device& device) {
     BlockBatch b;
     b.anchors = s.anchors.slice(0, i0, i1).to(device);
+    if (s.kv_int8.defined()) b.kv_int8 = s.kv_int8.slice(0, i0, i1).to(device);
     for (int64_t l = 0; l < s.selection.size(1); ++l) {
         const int64_t width = std::max<int64_t>(1, s.sel_count.slice(0, i0, i1).select(1, l).max().item<int32_t>());
         b.sel.push_back(s.selection.slice(0, i0, i1).select(1, l).slice(1, 0, width).to(device, torch::kLong));
@@ -265,10 +269,13 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
     // the schedule's length, and a resumed run's settings against the ones it was started with
     const int64_t total = o.steps > 0 ? o.steps : std::max<int64_t>(1, (int64_t) std::ceil(o.epochs * (double) s.shards.blocks() / (double) o.blocks_per_step));
     if (resumed && (state.seed != o.seed || state.blocks_per_step != o.blocks_per_step || state.total_steps != total ||
-                    state.dataset_blocks != s.shards.blocks() || state.dataset_sequences != s.shards.sequences().size())) {
+                    state.dataset_blocks != s.shards.blocks() || state.dataset_sequences != s.shards.sequences().size() ||
+                    state.prefix_weight != o.prefix_weight || state.kv_int8_share != o.kv_int8_share)) {
+        char weights[96];
+        std::snprintf(weights, sizeof weights, "prefix weight %g, INT8 share %g", state.prefix_weight, state.kv_int8_share);
         err = "the run in " + o.run + " was started with seed " + std::to_string(state.seed) + ", " + std::to_string(state.blocks_per_step) + " blocks per step, " +
-              std::to_string(state.total_steps) + " steps and shards of " + std::to_string(state.dataset_blocks) + " blocks in " + std::to_string(state.dataset_sequences) +
-              " sequences; it resumes only with the same";
+              std::to_string(state.total_steps) + " steps, " + weights + " and shards of " + std::to_string(state.dataset_blocks) + " blocks in " +
+              std::to_string(state.dataset_sequences) + " sequences; it resumes only with the same";
         return false;
     }
     OptimConfig cfg = o.optim;
@@ -285,10 +292,13 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
 
     const int64_t drafts = shape.block - 1;
     const double dataset_blocks = (double) s.shards.blocks();
-    basalt::log::info(kTag, "%zu shards: %zu sequences, %s tokens, %s blocks of %lld rows", s.shards.shards(), s.shards.sequences().size(),
-                      short_count((double) s.shards.tokens()).c_str(), short_count(dataset_blocks).c_str(), (long long) shape.block);
-    basalt::log::info(kTag, "%s at step %lld of %lld: %lld blocks per step in forwards of up to %lld, %s weights on %s", resumed ? "resuming" : "starting",
-                      (long long) opt.steps(), (long long) total, (long long) o.blocks_per_step, (long long) o.blocks, dtype_name.c_str(), o.device.c_str());
+    basalt::log::info(kTag, "%zu shards: %zu sequences, %s tokens, %s blocks of %lld rows, %s of them after a prompt-path row (weight %g; the last %lld rows "
+                            "of a sequence are window rows)",
+                      s.shards.shards(), s.shards.sequences().size(), short_count((double) s.shards.tokens()).c_str(), short_count(dataset_blocks).c_str(),
+                      (long long) shape.block, short_count((double) s.shards.prefix_blocks()).c_str(), o.prefix_weight, (long long) s.shards.window_rows());
+    basalt::log::info(kTag, "%s at step %lld of %lld: %lld blocks per step in forwards of up to %lld, %s weights on %s, %g of the blocks read as from an INT8 cache",
+                      resumed ? "resuming" : "starting", (long long) opt.steps(), (long long) total, (long long) o.blocks_per_step, (long long) o.blocks,
+                      dtype_name.c_str(), o.device.c_str(), o.kv_int8_share);
 
     // the place the next step starts from; only a finished step moves it
     int64_t at_epoch = resumed ? state.epoch : 0;
@@ -321,6 +331,8 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
         st.total_steps = total;
         st.dataset_blocks = s.shards.blocks();
         st.dataset_sequences = s.shards.sequences().size();
+        st.prefix_weight = o.prefix_weight;
+        st.kv_int8_share = o.kv_int8_share;
         for (const auto& [name, t] : opt.buffers()) st.buffers[name] = snapshot(t);
         last_saved = opt.steps();
         return writer.submit(std::move(snap), std::move(st), e);
@@ -343,14 +355,16 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
             have = seq.anchors.size(0);
             used = 0;
         }
-        // one forward and backward; its gradient stands for `take` blocks of the step
+        // one forward and backward; its gradient stands for the summed weight of its `take` blocks
         const int64_t take = std::min({o.blocks, have - used, o.blocks_per_step - in_step});
         const BlockBatch batch = make_batch(seq, used, used + take, s.device);
+        const torch::Tensor weight = seq.weight.slice(0, used, used + take);
+        const double weight_sum = weight.sum().item<double>();
         const torch::Tensor z = s.drafter->backbone(s.embedding, ctx, batch, o.attention_blocks);
         torch::Tensor grad_z;
-        const LossTerms terms = chunked_loss(s.drafter, z, s.embedding, s.head, ctx, batch.anchors, o.loss, (double) take, &grad_z);
+        const LossTerms terms = chunked_loss(s.drafter, z, s.embedding, s.head, ctx, batch.anchors, weight, o.loss, weight_sum, &grad_z);
         z.backward(grad_z);
-        opt.accumulate((double) take);
+        opt.accumulate(weight_sum);
         used += take;
         in_step += take;
         window.add(terms);
@@ -429,7 +443,7 @@ bool evaluate_impl(const EvalOptions& o, EvalResult& result, std::string& err) {
             const int64_t take = (int64_t) std::min({(double) o.blocks, (double) (have - used), limit - sum.blocks});
             const BlockBatch batch = make_batch(seq, used, used + take, s.device);
             const torch::Tensor z = s.drafter->backbone(s.embedding, ctx, batch, o.attention_blocks);
-            sum.add(chunked_loss(s.drafter, z, s.embedding, s.head, ctx, batch.anchors, o.loss, 1.0, nullptr));
+            sum.add(chunked_loss(s.drafter, z, s.embedding, s.head, ctx, batch.anchors, seq.weight.slice(0, used, used + take), o.loss, 1.0, nullptr));
             served += served_chain_accept(s.drafter, z, s.embedding, s.head, ctx, batch.anchors, o.loss.chunk_blocks);
             used += take;
         }
