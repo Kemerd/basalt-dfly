@@ -409,6 +409,24 @@ decoding_ernie.py) and vLLM-ERNIE reference kernels as the reference design, not
 the Apache License, Version 2.0, reproduced above.
 
 ================================================================================
+AngelSpec (https://github.com/Tencent/AngelSpec), commit e02ea36, Apache License 2.0
+Copyright (C) 2026 Tencent. All rights reserved.
+================================================================================
+
+The DFly2 drafter trainer (tools/dfly2-train/) and the drafter checkpoint it writes
+(include/basalt/artifact/dfly2_checkpoint.hpp) follow AngelSpec's dense DFly2 recipe as the reference design,
+not its code: the drafter (gated fusion of the anchor with the target's last hidden state, the dense layers
+that read the target's cache at the cells the target selected, the hidden correction and the confidence head)
+and its initialisation; the loss (KL over the teacher's likeliest tokens, the D-PACE row weights, the
+end-to-end accepted-length term and the confidence term); the offline accepted-length metrics; and the
+optimiser (Muon with its Newton-Schulz coefficients over FP32 master weights behind BF16 weights, AdamW for
+the rest, the joint clip and the warmup-cosine schedule) with the recipe's default settings. Licensed under
+the Apache License, Version 2.0, reproduced above. The files followed (angelspec/models/dflash.py,
+angelspec/models/draft/dflash.py, angelspec/training/dflash_trainer.py, optimizer.py, lr_scheduler.py and
+muon_utils.py) include parts AngelSpec takes from torchspec, Copyright (c) 2026 LightSeek Foundation, under
+the MIT licence, whose text is reproduced above.
+
+================================================================================
 DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
 serve/models/deepseek41_encoding.py
 ================================================================================
