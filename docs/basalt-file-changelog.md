@@ -31,6 +31,9 @@ download or any re-quantizing.
 - **Added `dflash`, optional, no version change:** a DFlash 2 block drafter attached to a Flash-Next pack. Its tensors are
   listed in `meta.tensors` with the section's name, as the Engram table is, and its shape in `gguf_kv`
   ([model file](model-file.md#flash-next-block-drafter)).
+- **`dfly` on a Flash-Next pack, optional, no version change:** a DFly2 drafter trained for the pack, its tensors BF16
+  and its shape in `meta.dfly2` ([model file](model-file.md#flash-next-dfly2-drafter)). The section and the record keep
+  the names Hy4-flash's drafter has; the record's `format` tells the two apart.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
   `hc8` records and no converter revision, provenance that changed whenever a section was replaced.
 

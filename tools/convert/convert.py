@@ -9,6 +9,7 @@
     python3 tools/convert/convert.py --verify PACK.basalt --gguf MODEL-00001-of-0000N.gguf
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --drafter DFLASH2_DIR --into PACK.basalt --undo-dir DIR [--workers N]
+    python3 tools/convert/convert.py --dfly CHECKPOINT.safetensors --into PACK.basalt --undo-dir DIR [--force]
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
@@ -105,6 +106,14 @@ Adding a block drafter to a Flash-Next pack that exists
                      dflash section: its tensors, each 4096 aligned, are listed in meta.tensors with that section's
                      name, its shape goes to gguf_kv as qwen4exp.dflash.*; --roll-back takes it out again. The section
                      is written beside the pack first, so the disk needs twice its size while this runs.
+
+Adding a DFly2 drafter to a pack that exists
+  --dfly FILE --into PACK.basalt --undo-dir DIR
+                     added like --dspark, as the dfly section, and taken out again by --roll-back. A hy4flash pack takes
+                     the checkpoint's own drafter tensors, stored whole (tools/convert/dfly_attach.py). A Flash-Next pack
+                     takes a drafter checkpoint trained for it (tools/convert/dfly_qwen4exp_attach.py): its FP32 tensors
+                     are rounded to BF16 and its shape is checked against the pack; a drafter trained on another pack
+                     or with another rotary base is refused unless --force is given.
 
 Options
   --name NAME        the model's name, reported by the server
@@ -270,6 +279,24 @@ def add_drafter(a) -> None:
     if not m.verify(dflash.SECTION) or not m.verify("meta"):
         die(f"{pack}: the new sections do not read back as written; --roll-back puts the file back")
     print(f"done: {pack} is {pack.stat().st_size} bytes, {len(m.names())} sections")
+
+
+def add_dfly(a) -> None:
+    """--dfly with --into: the DFly2 drafter joins a pack that exists, by the attach of the pack's architecture."""
+    pack = Path(a.into)
+    if not pack.is_file():
+        die(f"missing input: {pack}")
+    try:
+        meta = json.loads(ModelFile(str(pack)).read("meta"))
+    except (ValueError, KeyError, struct.error):
+        die(f"{pack}: not a .basalt model file")
+    if meta.get("arch") == "hy4flash":
+        import dfly_attach as attach
+    elif (meta.get("gguf_kv") or {}).get("general.architecture") == QWEN.name:
+        import dfly_qwen4exp_attach as attach
+    else:
+        die(f"{pack} is no hy4flash or Flash-Next pack: it takes no DFly2 drafter")
+    attach.add_dfly(a, source_record)
 
 
 def json_safe(v):
@@ -939,7 +966,8 @@ def main():
     ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
-    ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
+    ap.add_argument("--dfly", metavar="FILE", help="the DFly2 drafter, added as the dfly section: hy4flash's safetensors "
+                    "(model.dfly_layers.*), or with --into on a Flash-Next pack a drafter checkpoint trained for it")
     ap.add_argument("--nvfp4", action="store_true",
                     help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")
     ap.add_argument("--dense-q6k", action="store_true", help="with --nvfp4: the attention, shared-expert and dense FFN projections as Q6_K")
@@ -972,7 +1000,8 @@ def main():
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
                          "(default) or to NVFP4")
-    ap.add_argument("--force", action="store_true", help="overwrite --out")
+    ap.add_argument("--force", action="store_true", help="overwrite --out; with --dfly and --into on a Flash-Next pack: "
+                    "attach a drafter trained on another pack or with another rotary base")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
@@ -980,8 +1009,7 @@ def main():
         if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + bool(a.drafter) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.dflash2:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly, --drafter or --roll-back, and nothing else")
         if a.dfly:
-            from dfly_attach import add_dfly
-            add_dfly(a, source_record)
+            add_dfly(a)
         elif a.drafter:
             add_drafter(a)
         else:

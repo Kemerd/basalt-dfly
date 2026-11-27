@@ -116,6 +116,20 @@ python3 tools/convert/convert.py --drafter Qwen3.8-Flash-Next-DFlash2 --into PAC
 - `dflash` (761,018,368 bytes): the drafter's tensors under the [27B pack](#qwen38-27b-pack)'s names and forms, each 4096 aligned.
   `meta.tensors` lists them with `"section": "dflash"`, `gguf_kv` has its shape as `qwen4exp.dflash.*`, `meta.dflash` its source files.
 
+## Flash-Next DFly2 drafter
+
+`--dfly` with `--into` adds a DFly2 drafter to a Flash-Next pack that exists, as `--dspark` does (`--roll-back` restores the pack
+bit for bit). The input is a `tools/dfly2-train` checkpoint: FP32 safetensors whose metadata states its shape and its pack.
+
+```sh
+python3 tools/convert/convert.py --dfly drafter.safetensors --into PACK.basalt --undo-dir DIR
+```
+
+- `dfly`: the checkpoint's tensors under their own names, each rounded to BF16 (nearest even) and 64-byte aligned. `meta.dfly2`:
+  `format` `dfly2-qwen4exp`, the settings every DFly2 drafter has, this drafter's shape, `step`, `source` and `tensors`.
+- Refused: a tensor set, width, head count, vocabulary, target layer, selection width, block or mask token that does not fit the
+  pack; with `--force` a rotary base or a recorded pack size or `meta` digest that is not this pack's is attached anyway.
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint
