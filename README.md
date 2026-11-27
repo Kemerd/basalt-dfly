@@ -1,5 +1,28 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
+## This fork: basalt-dfly
+
+A fork of [Basalt](https://github.com/jesdga95/basalt) for one job: faster drafting. A small drafter guesses the next few tokens,
+the big model checks them in one pass, and the output stays exactly what plain decoding gives. This fork is about better guesses.
+
+Nothing below is measured yet. Numbers get posted when they exist.
+
+| Work | What it is | Status |
+| --- | --- | --- |
+| DFlash 2 on Qwen3.8-Flash-Next | Run the released `incoai/Qwen3.8-Flash-Next-DFlash2` drafter in place of the built-in MTP layer. No training. | Designing; weights downloaded and checksummed |
+| DFly2 on DeepSeek-V4.1-Flash | Tencent's drafter that reads the target's own cache and index picks, against today's DSpark. | Designed and reviewed; the shared `dfly2` module is going in |
+| DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Spec written |
+| Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | Starting |
+| Draft tries | Offer the runner-up guess where the drafter is unsure and let the target pick a branch. Pays on prose, not on code. | Idea; needs a measurement first |
+| Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | Idea |
+
+Header-aware drafting needs the header in the conversation before the source file. The engine cannot reorder what a model writes, so
+that part is a prompt rule: tell the model to write declarations first.
+
+Everything that works goes upstream as pull requests. The rest of this page is upstream's.
+
+---
+
 Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash**, **Inkling 2 Mini** and **ERNIE-5.5-Flash**. It runs
 on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spark (GB10, Arm64), with what does not fit in VRAM
 (the experts of a mixture-of-experts model) in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
