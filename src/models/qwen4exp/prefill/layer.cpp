@@ -72,6 +72,8 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
         if (half == 1 && basalt::kernels::cvec().covers(l))   // --control-vector-scaled
             basalt::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
     }
+    // the layer's output is in R: whoever reads the rows of some layers takes them before the next one writes
+    if (owner.on_layer_rows && !owner.on_layer_rows(l, p0, T, m.R, err)) return false;
     return true;
 }
 

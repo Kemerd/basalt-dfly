@@ -161,6 +161,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             return false;
         }
     }
+    for (size_t k = 0; k < mean_layers_.size(); ++k) {
+        const int64_t l = mean_layers_[k];
+        if (lb_ != 0 || le_ != g.n_layers || next_ != nullptr || l < 0 || l >= g.n_layers ||
+            (k > 0 && l <= mean_layers_[k - 1])) {
+            err = "verify: kept stream means need ascending layers on a verifier that runs every layer";
+            return false;
+        }
+    }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -241,6 +249,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         if (!keep_layers_.empty()) sel_keep_ = b.take<int32_t>(keep_layers_.size() * T * (uint64_t) cap_);
+        if (!mean_layers_.empty()) mean_keep_ = b.take<float>(mean_layers_.size() * T * N);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -401,6 +410,18 @@ int32_t* Verifier::sel_at(int64_t layer) const {
 const int32_t* Verifier::selection(int k) const {
     if (k < 0 || (size_t) k >= keep_layers_.size() || sel_keep_ == nullptr) return nullptr;
     return sel_keep_ + (size_t) k * (size_t) max_t_ * (size_t) cap_;
+}
+
+float* Verifier::mean_at(int64_t layer) const {
+    if (mean_keep_ == nullptr) return nullptr;
+    for (size_t k = 0; k < mean_layers_.size(); ++k)
+        if (mean_layers_[k] == layer) return mean_keep_ + k * (size_t) max_t_ * (size_t) g_->n_embd;
+    return nullptr;
+}
+
+const float* Verifier::stream_means(int k) const {
+    if (k < 0 || (size_t) k >= mean_layers_.size() || mean_keep_ == nullptr) return nullptr;
+    return mean_keep_ + (size_t) k * (size_t) max_t_ * (size_t) g_->n_embd;
 }
 
 }  // namespace basalt::core

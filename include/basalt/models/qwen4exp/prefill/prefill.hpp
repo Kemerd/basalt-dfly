@@ -178,6 +178,13 @@ public:
     /// with the GPU.  Not called under a layer split.
     std::function<void(int64_t layers_done, int64_t n_layers, int64_t T, int64_t pos0)> on_layer;
 
+    /// Called after each layer this path reads of a chunk: the layer, the chunk's first position and length, and the
+    /// chunk's residual rows after that layer (device, T x hc*n_embd, the layer's output).  Not synchronized.  The rows
+    /// are valid only inside the call: the next layer rewrites them, so a caller queues its device work here, on the
+    /// stream `init` was given.  A stage of a split calls it for its own layers only, on its thread with its device
+    /// current.
+    std::function<bool(int64_t layer, int64_t pos0, int64_t T, const float* R_rows, std::string& err)> on_layer_rows;
+
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a

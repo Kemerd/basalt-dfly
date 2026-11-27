@@ -14,6 +14,7 @@
 #include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/stream_mean.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include <exception>
@@ -210,6 +211,17 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         }
     } else if (cvec().covers(l)) {
         cvec_apply(Rt(0), l, n, HC * N, v_.bo_, N, v_.inj2_, HC, true, cs);
+    }
+    if (float* mean = v_.mean_at(l)) {
+        // a kept layer's stream mean.  R holds the layer's output only where its FFN write was applied above (the last
+        // layer's own write, a control vector's); elsewhere the write is pending and the kernel adds it without writing R
+        const bool written = l == g.n_layers - 1 ? !fuse_head_gr : cvec().covers(l);
+        // after the device-planned tail it starts as the kernel before's dependent and lets the next read in as its own,
+        // so that read still stages its weights during the tail; after a copy or a wait it is a plain launch
+        PdlScope ps(pdl && dm);
+        try {
+            stream_mean(Rt(0), n, HC * N, N, HC, written ? nullptr : v_.bo_, N, written ? nullptr : v_.inj2_, HC, mean, cs);
+        } catch (const std::exception& e) { err = "verify stream mean: " + std::string(e.what()); return false; }
     }
     return true;
 }
