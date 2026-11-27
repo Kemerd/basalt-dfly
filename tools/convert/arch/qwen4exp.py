@@ -37,6 +37,7 @@ class Qwen4Exp(Arch):
     form_table = FORM
     # the PLE table comes from the `gguf` section, never the dense pool
     not_in_dense = frozenset({"per_layer_token_embd.weight"})
+    dflash_ok = True
     sampling_kv = {"general.sampling.temp": 1.0, "general.sampling.top_p": 0.95, "general.sampling.top_k": 20}
 
     def native(self, name, type_name):

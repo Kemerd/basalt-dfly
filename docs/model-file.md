@@ -1,7 +1,7 @@
 # `.basalt` model file
 
-One file holds everything the engine, the server and the vision sidecar load: weights, tokenizer and chat template, MTP or DSpark
-drafter, 8-bit hyper-connection copies, vision projector, and the GGUF metadata with default sampling. Flags and the expert profile are
+One file holds everything the engine, the server and the vision sidecar load: weights, tokenizer and chat template, MTP, DSpark
+or block drafter, 8-bit hyper-connection copies, vision projector, and the GGUF metadata with default sampling. Flags and the expert profile are
 not in it.
 
 - **Layout:** a 64 KiB header (magic `BASALTMF`, version 2, up to 511 named sections with offset, size and SHA-256), then sections aligned
@@ -102,6 +102,19 @@ hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6 --local-dir 
 python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --checkpoint fp4-local \
     --out Qwen3.8-FN-FP4-Local.basalt --name "Qwen3.8-Flash-Next FP4-Local"
 ```
+
+## Flash-Next block drafter
+
+`--drafter` with `--into` adds a DFlash 2 block drafter
+([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)) to a Flash-Next pack that
+exists, as `--dspark` does: no other section moves, the MTP sections stay, and `--roll-back` restores the pack bit for bit.
+
+```sh
+python3 tools/convert/convert.py --drafter Qwen3.8-Flash-Next-DFlash2 --into PACK.basalt --undo-dir DIR
+```
+
+- `dflash` (761,018,368 bytes): the drafter's tensors under the [27B pack](#qwen38-27b-pack)'s names and forms, each 4096 aligned.
+  `meta.tensors` lists them with `"section": "dflash"`, `gguf_kv` has its shape as `qwen4exp.dflash.*`, `meta.dflash` its source files.
 
 ## Qwen3.8-27B pack
 

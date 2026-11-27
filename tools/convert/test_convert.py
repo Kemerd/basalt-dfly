@@ -428,6 +428,48 @@ class ConvertTest(unittest.TestCase):
         w.close()
         self.assertFalse(verify_pack.verify(str(bad_v7), [str(s1), str(s2)], workers=1))
 
+    def test_verify_pack_checks_an_attached_block_drafter_within_its_section(self):
+        import test_dflash
+        import verify_pack
+        from gguf_reader import GGUFFile
+        # the fixture as a Flash-Next GGUF with a head of the synthetic drafter's width and vocabulary
+        self.tok["vocab.json"] = json.dumps({t: i for i, t in enumerate(TOKENS)}).encode()
+        g0, raw = GGUFFile(self.gguf), self.gguf.read_bytes()
+        gw = GGUFWriter()
+        gw.add("general.architecture", "qwen4exp")
+        gw.add("qwen4exp.block_count", N_LAYERS, "u32")
+        gw.add("qwen4exp.embedding_length", test_dflash.H, "u32")
+        gw.add("tokenizer.ggml.tokens", TOKENS)
+        gw.add("tokenizer.chat_template", "{{ x }}")
+        for t in g0.tensors:
+            gw.add_raw(t.name, t.shape, t.type_name, raw[g0.data_start + t.offset:g0.data_start + t.offset + t.expected_bytes()])
+        # GGUF order: ne0 (the width) first
+        gw.add_f32("output.weight", np.random.default_rng(5).standard_normal((test_dflash.H, test_dflash.VOCAB)).astype(np.float32))
+        gguf = gw.write(self.t / "fn.gguf")
+        pack = self.t / "fn.basalt"
+        convert.convert(self.args(gguf=[str(gguf)], out=str(pack)))
+        self.assertTrue(verify_pack.verify(str(pack), str(gguf), workers=1))
+        plain = pack.read_bytes()
+        test_dflash.write_drafter(self.t / "drafter")
+        convert.add_drafter(type("A", (), dict(into=str(pack), drafter=str(self.t / "drafter"), undo_dir=str(self.t / "undo"), workers=1))())
+        self.assertTrue(verify_pack.verify(str(pack), str(gguf), workers=1))
+        # a drafter tensor moved off its place, and the section gone with its tensors still listed: both fail
+        m = ModelFile(str(pack))
+        meta = json.loads(m.read("meta"))
+        for name, change in (("moved.basalt", lambda e: e.update(offset=e["offset"] + 32)), ("cut.basalt", None)):
+            new = json.loads(json.dumps(meta))
+            if change:
+                change(new["tensors"]["dflash.norm.weight"])
+            w = ModelWriter(str(self.t / name))
+            for n in m.names():
+                if n != "meta" and (change or n != "dflash"):
+                    w.add_bytes(n, m.read(n))
+            w.add_bytes("meta", json.dumps(new, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            w.close()
+            self.assertFalse(verify_pack.verify(str(self.t / name), str(gguf), workers=1), name)
+        convert.add_dspark(type("A", (), dict(into=str(pack), undo_dir=str(self.t / "undo"), roll_back=True))())
+        self.assertEqual(pack.read_bytes(), plain)
+
     def test_help(self):
         r = subprocess.run([sys.executable, str(Path(convert.__file__)), "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
