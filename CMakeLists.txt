@@ -380,6 +380,13 @@ add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
 if(BUILD_TESTING)
+  # the dense stack's block drafter on seeded inputs at the 27B drafter's shape, no pack: prints the hashes of its
+  # features, context rings and drafts, which a change that must not move a bit leaves as they are (GPU)
+  add_executable(dense_block_drafter_hash tests/dense/block_drafter_hash.cpp)
+  target_include_directories(dense_block_drafter_hash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_gpu_include_directories})
+  target_link_libraries(dense_block_drafter_hash PRIVATE dense ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dense_block_drafter_hash COMMAND dense_block_drafter_hash)
+  set_tests_properties(dense_block_drafter_hash PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # the session's running state through the shared checkpoint transfer and back (a 27B pack: argument or
   # BASALT_QWEN35_PACK; skipped without one)
   add_executable(qwen35_checkpoint_round_trip tests/models/qwen35/checkpoint_round_trip.cpp)

@@ -600,10 +600,6 @@ void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     kernels::gdn_commit_layers(a, s, 64, n);
 }
 
-namespace {
-
-// The block drafter's features of target layer j: its rows (`rows16`, the BF16 residual after it) through its block of the
-// projection into `dacc` (j == 0 writes it, later ones add).
 void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cudaStream_t s) {
     const Linear& fc = m.bd_dec.fc[j];
     const void* xq = rows16;
@@ -614,6 +610,8 @@ void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cud
     prod(m, fc, xq, j == 0 ? dacc : m.ws.tmp, T, s);
     if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
 }
+
+namespace {
 
 // A window's layers [m.lb, m.le) of `rows` rows in m.ws.x, the drafter's features of its target layers into `dacc`; on a layer
 // split, the window's first rows from the main card (the second card's model) and its later layers' rows from the second

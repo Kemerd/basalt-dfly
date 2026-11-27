@@ -291,6 +291,9 @@ bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
+/// The block drafter's features of target layer j: its rows (`rows16`, the BF16 residual after it) through its block of the
+/// projection into `dacc` (j == 0 writes it, later ones add).
+void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cudaStream_t s);
 /// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
 /// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
