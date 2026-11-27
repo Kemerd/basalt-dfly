@@ -1,5 +1,6 @@
 // The flags Flash-Next takes on top of the common ones.
 #include "models/qwen4exp/adapter.hpp"
+#include "models/qwen4exp/cli/dfly2_flags.hpp"
 
 #include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
@@ -160,17 +161,17 @@ std::optional<int> finish_flags(Options& o) {
         return 2;
     }
     if (!o.dfly2_export.empty()) {
-        // the export reads whole fp16 cells and unedited rows, in one process that serves nothing
-        const char* why = o.dfly2_docs.empty() ? "needs --dfly2-docs FILE (one document a line, as token ids)"
-                          : o.dfly2_window_rows < 0 ? "takes --dfly2-window-rows of 0 or more"
-                          : o.serve ? "is a one-shot run: not with --serve"
-                          : !o.kv.empty() && o.kv != "fp16" ? "exports fp16 cells: not with --kv other than fp16"
-                          : o.kv_resident > 0 ? "reads whole cells from VRAM: not with --kv-resident"
-                          : o.prefill_given && o.prefill_chunk <= 0 ? "reads a document's first rows through the batched prompt path: not with --prefill 0"
-                          : !o.cvec_files.empty() ? "exports the model's own rows: not with a control vector"
-                          : nullptr;
-        if (why != nullptr) {
-            basalt::log::error("basalt generate", "--dfly2-export %s", why);
+        cli::ExportFlags f;
+        f.docs = !o.dfly2_docs.empty();
+        f.window_rows = o.dfly2_window_rows;
+        f.serve = o.serve;
+        f.kv = o.kv;
+        f.kv_resident = o.kv_resident;
+        f.no_prompt_path = o.prefill_given && o.prefill_chunk <= 0;
+        f.control_vector = !o.cvec_files.empty();
+        const std::string why = cli::export_refusal(f);
+        if (!why.empty()) {
+            basalt::log::error("basalt generate", "--dfly2-export %s", why.c_str());
             return 2;
         }
         // its last rows go through verify windows of the widest size, and no drafter runs
