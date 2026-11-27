@@ -9,10 +9,10 @@ Nothing below is measured yet. Numbers get posted when they exist.
 
 | Work | What it is | Status |
 | --- | --- | --- |
-| DFlash 2 on Qwen3.8-Flash-Next | Run the released `incoai/Qwen3.8-Flash-Next-DFlash2` drafter in place of the built-in MTP layer. No training. | Designing; weights downloaded and checksummed |
-| DFly2 on DeepSeek-V4.1-Flash | Tencent's drafter that reads the target's own cache and index picks, against today's DSpark. | Designed and reviewed; the shared `dfly2` module is going in |
-| DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Spec written |
-| Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | Starting |
+| DFlash 2 on Qwen3.8-Flash-Next | Run the released `incoai/Qwen3.8-Flash-Next-DFlash2` drafter in place of the built-in MTP layer. No training. | Design reviewed; being built on `main` |
+| DFly2 on DeepSeek-V4.1-Flash | Tencent's drafter that reads the target's own cache and index picks, against today's DSpark. | Designed and reviewed; the first part of the shared `dfly2` module is on `main`. The rest waits for a DeepSeek pack to test on |
+| DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Trainer being written on `dfly2-trainer`; the export and runtime are being designed |
+| Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | First part on `grammar-drafts`: the grammar reports the tokens it forces. Not wired into serving yet |
 | Draft tries | Offer the runner-up guess where the drafter is unsure and let the target pick a branch. Pays on prose, not on code. | Idea; needs a measurement first |
 | Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | Idea |
 
