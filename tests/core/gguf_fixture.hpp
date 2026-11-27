@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ struct Tensor {
     std::vector<uint64_t> shape;   ///< GGUF order: dim 0 varies fastest
     uint32_t type = 0;
     uint8_t seed = 1;              ///< payload byte i is (seed * 131 + i * 7 + i / 4093) & 0xff
+    std::function<void(uint8_t* dst, uint64_t n)> fill;   ///< when set, writes the payload's n bytes in place of the pattern
 };
 
 inline uint8_t pattern(uint8_t seed, uint64_t i) { return (uint8_t) ((seed * 131u + i * 7u + i / 4093u) & 0xffu); }
@@ -89,7 +91,13 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
     b.resize((size_t) w.data_start, 0);
     for (size_t i = 0; i < ts.size(); ++i) {
         b.resize((size_t) (w.data_start + w.offsets[i]), 0);
-        for (uint64_t j = 0; j < bytes[i]; ++j) b.push_back(pattern(ts[i].seed, j));
+        if (ts[i].fill) {
+            const size_t start = b.size();
+            b.resize(start + (size_t) bytes[i]);
+            ts[i].fill(b.data() + start, bytes[i]);
+        } else {
+            for (uint64_t j = 0; j < bytes[i]; ++j) b.push_back(pattern(ts[i].seed, j));
+        }
     }
     if (cut > b.size()) cut = b.size();
     b.resize(b.size() - (size_t) cut);

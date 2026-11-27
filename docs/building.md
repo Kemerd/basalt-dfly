@@ -54,7 +54,9 @@ Configure with `-DBUILD_TESTING=ON`, build, and run `ctest --test-dir build`.
 - Tokenizer parity: register `tokenizer_parity` with `-DBASALT_TOKENIZER_DIR=<a pack's tokenizer/ directory>`.
 - The DFly2 drafter for Flash-Next is tested without a pack. On the CPU: `qwen4exp_dfly_meta_test` (the record, and a drafter
   read from a pack file) and `qwen4exp_dfly_host_test` (a session's K/V pools, the bytes a start charges, the head's type).
-  On the GPU: `qwen4exp_dfly_parity [LAYERS]`, the block pass against a CPU reference (2 layers by default; the trained
-  drafter has 5).
+  On the GPU: `qwen4exp_dfly_parity [LAYERS [VOCAB]]`, the block pass against a CPU reference, over plain buffers and over an
+  output head and embedding table read from a synthetic GGUF, for a Q8_0, a Q5_K and a Q6_K head. The defaults are 2 layers
+  and 4,096 rows; `5 248320` is the trained drafter's shape, which takes several GB of RAM, of VRAM and of the temporary
+  directory.
 
 `basalt-bench` reads its prompts from `data/bench` (run from the repository root, or pass `--fixtures DIR`).
