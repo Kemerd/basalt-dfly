@@ -27,7 +27,7 @@ namespace {
 
 struct St {
     std::string path;
-    std::map<std::string, DflyTensor> t;   // absolute offsets
+    std::map<std::string, basalt::dfly2::Tensor> t;   // absolute offsets
 };
 
 bool open_st(const std::string& path, St& s, const std::string& prefix) {
@@ -42,8 +42,9 @@ bool open_st(const std::string& path, St& s, const std::string& prefix) {
     s.path = path;
     for (const auto& [name, v] : j.members) {
         if (name == "__metadata__" || name.rfind(prefix, 0) != 0) continue;
-        DflyTensor t;
+        basalt::dfly2::Tensor t;
         const Json* off = v.get("data_offsets");
+        if (const Json* dt = v.get("dtype"); dt && dt->is_string()) t.dtype = dt->s;
         t.offset = 8 + n + off->items[0].u64();
         t.bytes = off->items[1].u64() - off->items[0].u64();
         for (const Json& d : v.get("shape")->items) t.shape.push_back(d.u64());
@@ -93,7 +94,7 @@ static int check_pack(const std::string& pack_path, const std::string& dfly_path
     open_st(dfly_path, dfly, "model.dfly_layers.");
     int bad = 0;
     for (const DflySpec& s : dfly_specs(w->dims)) {
-        const DflyTensor& t = dfly.t.at(s.name);
+        const basalt::dfly2::Tensor& t = dfly.t.at(s.name);
         const std::vector<uint8_t> raw = read_at(dfly_path, t.offset, t.bytes);
         size_t diff = 0, n = (size_t) s.elems();
         if (s.f32) {
@@ -128,15 +129,19 @@ int main(int argc, char** argv) {
     const std::string dense_path = argc > 3 ? argv[3] : "/mnt/nvme/models/hy4-bf16-extra/dense-bf16.safetensors";
     St dfly, dense;
     if (!open_st(dfly_path, dfly, "model.dfly_layers.") || !open_st(dense_path, dense, "")) return 1;
+    // the record a pack of this checkpoint holds, with the file's own tensors
+    basalt::dfly2::Record rec;
+    rec.layers = 5; rec.mask_id = 120009; rec.topk = 2048;
+    rec.kv_layers = rec.idx_layers = {25, 29, 33, 37, 41};
+    rec.tensors = dfly.t;
     DflyDims d;
-    d.layers = 5; d.vocab = 120832; d.mask_id = 120009; d.rms_eps = 1e-5f; d.rope_base = 1e7f; d.topk = 2048;
-    d.kv_layers = d.idx_layers = {25, 29, 33, 37, 41};
+    d.vocab = 120832; d.rms_eps = 1e-5f; d.rope_base = 1e7f;
     std::string err;
-    if (!dfly_check_shapes(dfly.t, d, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    if (!dfly_check_shapes(rec, d, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     DflyWeights w;
     if (!w.allocate(d, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     for (const DflySpec& s : dfly_specs(d)) {
-        const DflyTensor& t = dfly.t.at(s.name);
+        const basalt::dfly2::Tensor& t = dfly.t.at(s.name);
         const std::vector<uint8_t> raw = read_at(dfly_path, t.offset, t.bytes);
         if (s.f32) {
             std::vector<float> v(raw.size() / 2);
@@ -149,7 +154,7 @@ int main(int argc, char** argv) {
             basalt::core::device_copy(w.slot(s.name), q.data(), q.size(), cudaMemcpyHostToDevice);
         } else basalt::core::device_copy(w.slot(s.name), raw.data(), raw.size(), cudaMemcpyHostToDevice);
     }
-    const DflyTensor& hw = dense.t.at("lm_head.weight");
+    const basalt::dfly2::Tensor& hw = dense.t.at("lm_head.weight");
     void* head = nullptr;   // the head as the engine loads it: BF16 rounded to Q8_0
     {
         const std::vector<uint8_t> raw = read_at(dense_path, hw.offset, hw.bytes);
@@ -160,7 +165,7 @@ int main(int argc, char** argv) {
     }
     w.head_q8 = head;
     if (!w.pack_screen(nullptr, err)) { std::printf("%s\n", err.c_str()); return 1; }
-    const DflyTensor& ew = dense.t.at("model.embed_tokens.weight");
+    const basalt::dfly2::Tensor& ew = dense.t.at("model.embed_tokens.weight");
     const int E = d.E;
 
     const std::vector<uint8_t> hidb = slurp(dir + "/hid.f32");

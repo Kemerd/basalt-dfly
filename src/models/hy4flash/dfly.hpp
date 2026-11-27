@@ -38,6 +38,7 @@
 
 #include "basalt/core/loader.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/dfly2/record.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/program/options.hpp"
 
@@ -55,8 +56,6 @@ struct Pack;
 
 constexpr int kDflyBlock = 6;       ///< rows of a full block: the anchor and five masks
 constexpr int kDflyDrafts = kDflyBlock - 1;
-constexpr int kDflyTapRows = 16;    ///< rows of a window the tap keeps (the draft policy's widest window)
-constexpr int kDflyMaxLayers = 8;
 
 /// The drafter's shape: from the pack's meta.dfly2 (the checkpoint's `dfly_*` settings) and the tensors' shapes.
 struct DflyDims {
@@ -67,21 +66,6 @@ struct DflyDims {
     std::vector<int> kv_layers;       ///< the target layer whose cache each draft layer reads
     std::vector<int> idx_layers;      ///< the target layer whose selection each draft layer reads
 };
-
-struct DflyTensor {
-    uint64_t offset = 0, bytes = 0;   ///< absolute in the file
-    std::vector<uint64_t> shape;      ///< safetensors order, outermost first
-};
-
-struct DflyPack {
-    bool present = false;
-    DflyDims dims;
-    std::map<std::string, DflyTensor> tensors;   ///< by name without `model.dfly_layers.`
-};
-
-/// Reads meta.dfly2 (null or absent: present stays false) of a pack whose `dfly` section starts at `section_offset`;
-/// offsets in the record are relative to it. False with `err` when the record is malformed.
-bool parse_dfly_meta(const core::Json& dfly2, uint64_t section_offset, DflyPack& out, std::string& err);
 
 /// One tensor the engine reads: its name, shape and whether it is held as FP32 (the norms, the sink, the gate, the
 /// confidence head) or as the checkpoint's BF16.
@@ -96,8 +80,11 @@ struct DflySpec {
 };
 /// Every tensor of a drafter of these dims.
 std::vector<DflySpec> dfly_specs(const DflyDims& d);
-/// Fills the dims the shapes carry (E, q_lora, heads, ffn, hc_ffn) from `tensors`, and checks every spec against them.
-bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDims& d, std::string& err);
+/// Fills `d` from the pack's record `rec`, whose tensors are named without `model.dfly_layers.`: the settings it states
+/// (layers, mask token, target layers, and the selection width, the default above when it states none) and the dims the
+/// shapes carry (E, q_lora, heads, ffn, hc_ffn), and checks every spec against them. Refuses what this drafter does not
+/// run: a local window of the context, and a tensor that is not BF16.
+bool dfly_check_shapes(const dfly2::Record& rec, DflyDims& d, std::string& err);
 
 struct DflyLayer {
     const void *q_a, *q_b, *kv_a;                        // Q8_0
@@ -136,14 +123,6 @@ private:
 /// An error when it has one that does not fit the target (`geometry`).
 model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DflyWeights>& out);
 
-/// The window row whose output chose the token at `pos`: row pos - 1 - pos0 of a window that began at `pos0`, when its hidden
-/// state (bit r of `hid_ok`) and every one of the `layers` selections (bits of sel_ok[r]) were kept; else -1.
-inline int dfly_source_row(int64_t pos0, unsigned hid_ok, const unsigned* sel_ok, int layers, int64_t pos) {
-    const int64_t r = pos - 1 - pos0;
-    if (pos0 < 0 || r < 0 || r >= kDflyTapRows || !(hid_ok & (1u << r)) || sel_ok[r] != (1u << layers) - 1u) return -1;
-    return (int) r;
-}
-
 /// What the target leaves of the rows of its last decode window: each row's last-layer hidden state (after the output
 /// norm) and, per draft layer, the cells that row's attention selected in the layer that layer reads. The drafter after a
 /// window reads the row of the last accepted token. Rows are valid only for the positions of that one window.
@@ -159,7 +138,7 @@ public:
     /// The row whose output chose the token at position `pos` (the row at pos - 1), or -1 when it was not kept whole.
     int source_row(int64_t pos) const;
     const float* hidden_row(int row) const { return hid_ + (size_t) row * E_; }
-    const int32_t* cells(int slot, int row) const { return sel_ + ((size_t) slot * kDflyTapRows + row) * cap_; }
+    const int32_t* cells(int slot, int row) const { return sel_ + ((size_t) slot * dfly2::kTapRows + row) * cap_; }
     int count(int slot, int row) const { return n_[row][slot]; }
 
 private:
@@ -170,8 +149,8 @@ private:
     int32_t* sel_ = nullptr;
     int64_t pos0_ = -1;
     unsigned hid_ok_ = 0;
-    unsigned sel_ok_[kDflyTapRows] = {};
-    int n_[kDflyTapRows][kDflyMaxLayers] = {};
+    unsigned sel_ok_[dfly2::kTapRows] = {};
+    int n_[dfly2::kTapRows][dfly2::kMaxLayers] = {};
 };
 
 /// The block pass and the sequential heads, with their own scratch (one per session).
@@ -254,13 +233,6 @@ private:
     int64_t ctx_ = 0;
     bool fp8_ = false;
 };
-
-/// The drafts of a block in order, `step(j, previous)` giving draft j after the token before it (the anchor first), or
-/// ending the block before it (`go` false): `made` drafts. The loop DflyRunner::finish runs, apart from the device, so a
-/// test can run it over fake logits. False when a step fails.
-bool dfly_draft_loop(int n, int32_t anchor,
-                     const std::function<bool(int j, int32_t previous, int32_t& token, float& conf, bool& go)>& step,
-                     int32_t* ids, float* conf, int& made);
 
 /// The flags a Hy4-flash start takes for speculative decoding, as DeepSeek's: --spec N, --spec-oracle FILE, --diag-teacher,
 /// --draft-log FILE. False when `a` is none of them.

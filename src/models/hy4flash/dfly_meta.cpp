@@ -1,5 +1,5 @@
-// src/models/hy4flash/dfly_meta.cpp - the host side of the DFly2 drafter that needs no device: the pack's record, the
-// tensors it must hold, the draft loop, and the flags.
+// src/models/hy4flash/dfly_meta.cpp - the host side of the DFly2 drafter that needs no device: the tensors it must hold,
+// its check of the pack's record (basalt/dfly2/record.hpp), and the flags.
 #include "models/hy4flash/dfly.hpp"
 
 #include "basalt/core/diag.hpp"
@@ -15,67 +15,6 @@ uint64_t DflySpec::elems() const {
     uint64_t n = 1;
     for (uint64_t d : shape) n *= d;
     return n;
-}
-
-namespace {
-
-using core::Json;
-
-std::vector<int> ints(const Json* j) {
-    std::vector<int> v;
-    if (j && j->is_array())
-        for (const Json& x : j->items) v.push_back((int) x.num());
-    return v;
-}
-
-}  // namespace
-
-bool parse_dfly_meta(const Json& d, uint64_t section_offset, DflyPack& out, std::string& err) {
-    out = DflyPack{};
-    if (!d.is_object()) return true;
-    auto num = [&](const char* k, double dflt) {
-        const Json* j = d.get(k);
-        return j && j->is_number() ? j->num() : dflt;
-    };
-    DflyDims& m = out.dims;
-    m.layers = (int) num("layers", 0);
-    m.mask_id = (int) num("mask_token_id", -1);
-    m.topk = (int) num("target_index_topk", 2048);
-    m.kv_layers = ints(d.get("target_kv_layers"));
-    m.idx_layers = ints(d.get("target_index_layers"));
-    if (num("context_local_window", 0) != 0) {
-        err = "meta.dfly2: a local window of the context is not run";
-        return false;
-    }
-    if (m.layers < 1 || m.layers > kDflyMaxLayers || (int) m.kv_layers.size() != m.layers || (int) m.idx_layers.size() != m.layers ||
-        m.mask_id < 0) {
-        err = "meta.dfly2: layers, target_kv_layers, target_index_layers or mask_token_id are missing or disagree";
-        return false;
-    }
-    const Json* tj = d.get("tensors");
-    if (!tj || !tj->is_object()) {
-        err = "meta.dfly2 has no tensors";
-        return false;
-    }
-    for (const auto& [name, t] : tj->members) {
-        const Json* dt = t.get("dtype");
-        if (!dt || dt->s != "BF16") {
-            err = "meta.dfly2: " + name + " is not BF16";
-            return false;
-        }
-        DflyTensor r;
-        const Json *off = t.get("offset"), *by = t.get("bytes"), *sh = t.get("shape");
-        if (!off || !by || !sh || !sh->is_array()) {
-            err = "meta.dfly2: " + name + " has no offset, bytes or shape";
-            return false;
-        }
-        r.offset = section_offset + off->u64();
-        r.bytes = by->u64();
-        for (const Json& x : sh->items) r.shape.push_back(x.u64());
-        out.tensors.emplace(name, std::move(r));
-    }
-    out.present = true;
-    return true;
 }
 
 std::vector<DflySpec> dfly_specs(const DflyDims& d) {
@@ -117,7 +56,26 @@ std::vector<DflySpec> dfly_specs(const DflyDims& d) {
     return v;
 }
 
-bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDims& d, std::string& err) {
+bool dfly_check_shapes(const dfly2::Record& rec, DflyDims& d, std::string& err) {
+    // what this drafter does not run: a near window of the context, and tensors stored as anything but BF16
+    if (rec.local_window != 0) {
+        err = "meta.dfly2: a local window of the context is not run";
+        return false;
+    }
+    const std::map<std::string, dfly2::Tensor>& tensors = rec.tensors;
+    for (const auto& [name, t] : tensors) {
+        if (t.dtype != "BF16") {
+            err = "meta.dfly2: " + name + " is not BF16";
+            return false;
+        }
+    }
+    // the record's settings; one without a selection width has the width the dims start with
+    d.layers = rec.layers;
+    d.mask_id = rec.mask_id;
+    d.topk = rec.topk ? rec.topk : DflyDims{}.topk;
+    d.kv_layers = rec.kv_layers;
+    d.idx_layers = rec.idx_layers;
+    // the dims the shapes carry
     auto shape = [&](const char* n) -> const std::vector<uint64_t>* {
         auto it = tensors.find(n);
         return it == tensors.end() ? nullptr : &it->second.shape;
@@ -143,18 +101,6 @@ bool dfly_check_shapes(const std::map<std::string, DflyTensor>& tensors, DflyDim
             err = "dfly: tensor " + s.name + " has another shape than the drafter's";
             return false;
         }
-    }
-    return true;
-}
-
-bool dfly_draft_loop(int n, int32_t anchor, const std::function<bool(int, int32_t, int32_t&, float&, bool&)>& step, int32_t* ids,
-                     float* conf, int& made) {
-    int32_t prev = anchor;
-    for (made = 0; made < n; ++made) {
-        bool go = true;
-        if (!step(made, prev, ids[made], conf[made], go)) return false;
-        if (!go) break;
-        prev = ids[made];
     }
     return true;
 }
