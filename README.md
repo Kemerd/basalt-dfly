@@ -14,7 +14,7 @@ Nothing below is measured yet. Numbers get posted when they exist.
 | DFly2 on Qwen3.8-Flash-Next | No such drafter exists, so: a teacher export in Basalt, a C++ (LibTorch) trainer, and a runtime that picks the drafter up when a pack carries one. | Trainer on `main` (`tools/dfly2-train`, [how to run it](docs/dfly2-training.md)); CPU tests pass, not yet run on a GPU. The export and runtime are being written |
 | Grammar-forced drafts | When a JSON schema or tool grammar allows exactly one next token, draft it from the grammar. Today the grammar only vetoes after the fact. | First part on `grammar-drafts`: the grammar reports the tokens it forces. Not wired into serving yet |
 | Draft tries | Offer the runner-up guess where the drafter is unsure and let the target pick a branch. Pays on prose, not on code. | Idea; needs a measurement first |
-| Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | Idea |
+| Header-aware drafts for C and C++ | Build scope tries (`Namespace::`, `Class::`, `Enum::`) from declarations already in the conversation, and draft a definition's signature from its declaration. | First part on `scope-drafts`: the index of the declarations in the conversation and what it proposes. Not wired into serving yet |
 
 Header-aware drafting needs the header in the conversation before the source file. The engine cannot reorder what a model writes, so
 that part is a prompt rule: tell the model to write declarations first.

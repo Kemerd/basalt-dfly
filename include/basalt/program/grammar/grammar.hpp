@@ -5,6 +5,7 @@
 // the set of live parse stacks and answers: does this token's byte string keep the output inside the language
 // (allows), advance over it (accept), which vocabulary entries are allowed next (fill_mask), and which bytes can only
 // come next (forced, and forced_tokens for drafts of them). A state is a small value: copying it is the clone/rewind.
+// Vocab::spell gives the same drafts for bytes known from elsewhere.
 // Lazy states stay inactive, allowing everything, until a trigger string is seen
 // or a trigger token is accepted or a trigger pattern (regex) matches; the trigger text itself is then fed to the grammar.
 //
@@ -98,9 +99,19 @@ public:
     const std::vector<int32_t>& end_ids() const { return end_ids_; }
     /// Distinguishes this vocabulary from every other one built in the process.
     uint64_t id() const { return id_; }
+    /// Draft tokens that spell the start of `bytes`: at most `max_tokens`, each the longest entry the bytes after the
+    /// ones before it start with (of entries with the same bytes, the highest id), until no entry fits; none runs
+    /// past the bytes. End tokens and entries without text are never among them. A model may write the same bytes as
+    /// other tokens, so these are drafts to verify. `out` is replaced.
+    void spell(std::string_view bytes, size_t max_tokens, std::vector<int32_t>& out) const;
 
 private:
     friend class GrammarState;
+    /// The walk behind spell() and GrammarState::forced_tokens: down the trie along the bytes of `src`, the deepest
+    /// entry passed is the next draft. `src.next(byte)` gives the next byte and steps over it (false at the end of
+    /// what is known), `src.keep()` marks where the drafts so far end, `src.rewind()` returns there.
+    template <class Source>
+    void longest_entries(Source& src, size_t max_tokens, std::vector<int32_t>& out) const;
     uint64_t id_ = 0;
     // Compact DFS-preorder trie node (12 bytes): living subtrees scan sequentially; pruned subtrees jump to `skip`.
     struct Node {

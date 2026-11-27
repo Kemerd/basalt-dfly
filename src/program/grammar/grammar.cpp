@@ -977,6 +977,49 @@ Vocab::Vocab(std::vector<std::string> bytes, std::vector<int32_t> end_ids)
     nodes_[0].skip = (uint32_t) nodes_.size();
 }
 
+template <class Source>
+void Vocab::longest_entries(Source& src, size_t max_tokens, std::vector<int32_t>& out) const {
+    out.clear();
+    const Node* nodes = nodes_.data();
+    const size_t n_nodes = nodes_.size();
+    while (out.size() < max_tokens) {
+        // down the trie along the bytes, as far as an entry goes; the deepest entry passed is the draft
+        src.rewind();
+        int32_t pick = -1;
+        uint32_t node = 0;
+        char byte = 0;
+        while (node < n_nodes && src.next(byte)) {
+            // a node's children follow it in byte order, each one's subtree skipped in one step
+            const uint32_t end = nodes[node].skip, b = (unsigned char) byte;
+            uint32_t child = node + 1;
+            while (child < end && (nodes[child].depth_byte & 0xFFu) < b) child = nodes[child].skip;
+            if (child >= end || (nodes[child].depth_byte & 0xFFu) != b) break;
+            node = child;
+            if (nodes[node].first_token < 0) continue;
+            pick = nodes[node].first_token;
+            src.keep();
+        }
+        if (pick < 0) break;
+        out.push_back(pick);
+    }
+}
+
+void Vocab::spell(std::string_view bytes, size_t max_tokens, std::vector<int32_t>& out) const {
+    // the bytes as given: `kept` is where the drafts so far end, `at` the walk ahead of them
+    struct Bytes {
+        std::string_view text;
+        size_t kept, at;
+        bool next(char& byte) {
+            if (at >= text.size()) return false;
+            byte = text[at++];
+            return true;
+        }
+        void keep() { kept = at; }
+        void rewind() { at = kept; }
+    } src{bytes, 0, 0};
+    longest_entries(src, max_tokens, out);
+}
+
 // --------------------------------------------------------------------------------------------- state
 
 // Static upper bound on the byte length of any match of an unanchored ECMAScript regex.
@@ -1441,31 +1484,16 @@ std::string GrammarState::forced(size_t max_bytes) const {
 void GrammarState::forced_tokens(const Vocab& vocab, size_t max_tokens, std::vector<int32_t>& out) const {
     out.clear();
     if (!g_ || !arena_ || !active_) return;
-    const Vocab::Node* nodes = vocab.nodes_.data();
-    const size_t n_nodes = vocab.nodes_.size();
-    int32_t set = set_id_;   // where the drafts so far end
-    Utf8 u = utf8_;
-    while (out.size() < max_tokens) {
-        // down the trie along the forced bytes, as far as an entry goes; the deepest entry passed is the draft
-        int32_t walk_set = set, pick = -1;
-        Utf8 walk_u = u;
-        uint32_t node = 0;
-        char byte = 0;
-        while (node < n_nodes && forced_byte(walk_set, walk_u, byte)) {
-            // a node's children follow it in byte order, each one's subtree skipped in one step
-            const uint32_t end = nodes[node].skip, b = (unsigned char) byte;
-            uint32_t child = node + 1;
-            while (child < end && (nodes[child].depth_byte & 0xFFu) < b) child = nodes[child].skip;
-            if (child >= end || (nodes[child].depth_byte & 0xFFu) != b) break;
-            node = child;
-            if (nodes[node].first_token < 0) continue;
-            pick = nodes[node].first_token;
-            set = walk_set;
-            u = walk_u;
-        }
-        if (pick < 0) break;
-        out.push_back(pick);
-    }
+    // the forced bytes, one at a time: `set` and `u` are where the drafts so far end, the walk runs ahead of them
+    struct Forced {
+        const GrammarState& state;
+        int32_t set, walk_set;
+        Utf8 u, walk_u;
+        bool next(char& byte) { return state.forced_byte(walk_set, walk_u, byte); }
+        void keep() { set = walk_set; u = walk_u; }
+        void rewind() { walk_set = set; walk_u = u; }
+    } src{*this, set_id_, set_id_, utf8_, utf8_};
+    vocab.longest_entries(src, max_tokens, out);
 }
 
 void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const {
