@@ -7,6 +7,11 @@
 //
 // A block is trained only when it lies inside its sequence (anchor + block <= rows), so every drafted row has a
 // corpus token and a teacher row and the loss needs no mask.
+//
+// The export reads a sequence's first rows by the target's batched prompt path and its last `window_rows` (its
+// export.json) through verify windows, as served rows are read. An anchor whose row before is a prompt-path row (a
+// prefix anchor) carries that path's hidden row and selection, which serving never hands a drafter; its blocks weigh
+// `prefix_weight` in the loss, and none is taken at weight 0.
 #pragma once
 
 #include "target_weights.hpp"
@@ -22,12 +27,18 @@
 
 namespace basalt::dfly2 {
 
+/// How a shard set's blocks are taken.
+struct DataOptions {
+    double prefix_weight = 1.0;   ///< loss weight of a prefix anchor's block, in [0, 1]; 0 takes none
+};
+
 /// A sequence of the set that has at least one trainable block.
 struct SequenceRef {
     uint32_t shard = 0;       ///< which file
     uint64_t index = 0;       ///< which sequence of the file
     uint64_t tokens = 0;      ///< its rows
-    uint64_t blocks = 0;      ///< its anchors whose block lies inside it
+    uint64_t blocks = 0;      ///< its anchors whose block lies inside it and that are taken
+    uint64_t window_from = 0; ///< its first row read through a verify window
 };
 
 /// One sequence read from a shard, on the CPU, with the blocks still to take from it.
@@ -36,6 +47,7 @@ struct LoadedSequence {
     torch::Tensor anchors;               ///< [n] int64, in the order the blocks are taken
     torch::Tensor selection;             ///< [n][layers][sel_cap] int32, -1 padded
     torch::Tensor sel_count;             ///< [n][layers] int32: ids before the padding
+    torch::Tensor weight;                ///< [n] float32: each block's loss weight
     int64_t epoch = 0;
     uint64_t position = 0;               ///< place in the epoch's order
     uint64_t first = 0;                  ///< blocks of the sequence that came before anchors[0]
@@ -52,13 +64,16 @@ uint64_t sequence_seed(uint64_t seed, int64_t epoch, uint64_t sequence);
 /// The shards of one directory, checked against the drafter they are for.
 class ShardSet {
 public:
-    /// Opens every file of `dir` whose name ends with kShardExtension and counts its trainable blocks. Each must
-    /// carry `shape`'s geometry and paired layers and name the pack `pack`. False with `err` when the directory has
-    /// no usable shard or one does not fit.
-    bool open(const std::string& dir, const DrafterShape& shape, const PackIdentity& pack, std::string& err);
+    /// Opens every file of `dir` whose name ends with kShardExtension and counts its trainable blocks, with the
+    /// window rows of the export.json beside them. Each must carry `shape`'s geometry and paired layers and name the
+    /// pack `pack`. False with `err` when the directory has no usable shard, no export.json, or a shard does not fit.
+    bool open(const std::string& dir, const DrafterShape& shape, const PackIdentity& pack, const DataOptions& options,
+              std::string& err);
 
     const std::vector<SequenceRef>& sequences() const { return refs_; }
     uint64_t blocks() const { return blocks_; }
+    uint64_t prefix_blocks() const { return prefix_blocks_; }   ///< of blocks(): those after a prompt-path row
+    int64_t window_rows() const { return window_rows_; }
     uint64_t tokens() const { return tokens_; }
     size_t shards() const { return paths_.size(); }
 
@@ -72,9 +87,11 @@ private:
 
     static constexpr size_t kOpenShards = 32;
     DrafterShape shape_;
+    DataOptions options_;
+    int64_t window_rows_ = 0;
     std::vector<std::string> paths_;
     std::vector<SequenceRef> refs_;
-    uint64_t blocks_ = 0, tokens_ = 0;
+    uint64_t blocks_ = 0, tokens_ = 0, prefix_blocks_ = 0;
     std::list<std::pair<uint32_t, std::unique_ptr<ShardReader>>> open_;   ///< most recently used first
 };
 

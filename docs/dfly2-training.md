@@ -111,6 +111,7 @@ with, and then takes the steps the uninterrupted run would have taken.
 | `--muon-head-rows N` | rows of a query projection orthogonalised together (the head width); 0: the whole matrix |
 | `--grad-clip X` | joint gradient norm clip (1) |
 | `--kl-topk`, `--dpace-alpha`, `--e2e-weight`, `--confidence-weight` | the loss (10, 0.5, 1, 1) |
+| `--prefix-weight X` | loss weight, 0 to 1, of a block whose anchor follows a prompt-path row (below); 0 leaves them out (1) |
 
 Memory on the device is set by three options: `--blocks` bounds the layers' activations, `--loss-blocks` the logits
 (`blocks x (block - 1) x vocabulary`), and `--attention-blocks` the attention scores. The step's gradient does not
@@ -182,6 +183,13 @@ A sequence also records the rotary position of its first row. The trainer refuse
 layers differ from the drafter's, or that names another pack than `--model`. It trains the anchors whose block lies
 inside the sequence (`anchor + block <= L`); the teacher's logits are computed in the trainer from `hidden` and the
 pack's output head.
+
+The directory also holds the export's `export.json`, which the trainer needs: its `window_rows` (`W`) says which rows
+the target read the way it reads served rows. With `m = L - min(W, L - 1)`, rows `[m, L)` came through verify windows
+and rows `[0, m)` through the batched prompt path. An anchor at or before `m` (a prefix anchor) carries the prompt path's
+hidden row and selection, which serving never hands a drafter; `--prefix-weight` sets how much its block counts. The
+export's `--exp dfly2_export_check` run says whether the prompt path's rows are close enough to the windows' past
+2,051 cells of context to train on.
 
 Per token a shard holds the hidden row and two cells per paired layer: 15,360 bytes for Flash-Next with FP16 hidden
 rows and five layers, plus about 41 KiB per anchor of selections.

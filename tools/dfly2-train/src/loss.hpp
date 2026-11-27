@@ -3,13 +3,14 @@
 // A block's rows 1..B-1 each draft one token; row k's teacher is the target's own next-token distribution at that
 // position, computed here from the exported head input and the served head. The loss is
 //
-//   L = sum(w * (KL_top + c * BCE)) / max(sum(w), 1e-6)  +  e * mean over blocks(1 - (1/(B-1)) * sum_k prod_{j<=k} a_j)
+//   L = sum(b * w * (KL_top + c * BCE)) / max(sum(b * w), 1e-6)  +  e * sum(b * (1 - (1/(B-1)) * sum_k prod_{j<=k} a_j)) / sum(b)
 //
 //   KL_top  sum over the teacher's `kl_topk` likeliest tokens of p * (log p - log q), both softmaxes over the whole
 //           vocabulary
 //   a_k     sum_v min(p_v, q_v): the chance a sampling verifier accepts draft k
 //   BCE     the confidence head's logit against a_k (a_k held constant)
 //   w_k     D-PACE: with s_j = (1 - alpha) * q_j[corpus token] + alpha, w_k = sum_{m>=k} prod_{j<=m} s_j, held constant
+//   b       the block's own weight (1 unless the caller weighs it)
 //
 // Logits of every row of every block do not fit a card at once, so the loss runs a few whole blocks at a time
 // (the weights and the accepted-length product couple the rows of one block only) and backpropagates each chunk to
@@ -53,15 +54,17 @@ torch::Tensor e2e_tv_per_block(const torch::Tensor& accept);
 /// `hits` says, independently per row.
 double simulated_accept_length(const std::vector<double>& hits, double blocks);
 
-/// The loss of the blocks at `anchors` given the backbone's output `z` ([N][block][hidden], used detached).
+/// The loss of the blocks at `anchors` given the backbone's output `z` ([N][block][hidden], used detached), each
+/// block weighing `block_weight` ([N], at least zero; undefined: every block weighs 1). The counts and accepted
+/// lengths of the result are not weighted.
 ///
 /// With `grad_z` set, the gradient times `scale` is left in two places: `*grad_z` receives d(loss)/d(z) for the
 /// caller to send back through the backbone, and the gradients of the correction's and the confidence head's
 /// parameters are added to their .grad. With `grad_z` null nothing is differentiated.
 /// `embedding` and `head` are the target's [vocab][hidden] tables; every anchor's block must lie inside the sequence.
 LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z, const torch::Tensor& embedding, const torch::Tensor& head,
-                       const SequenceContext& seq, const torch::Tensor& anchors, const LossConfig& cfg, double scale,
-                       torch::Tensor* grad_z);
+                       const SequenceContext& seq, const torch::Tensor& anchors, const torch::Tensor& block_weight,
+                       const LossConfig& cfg, double scale, torch::Tensor* grad_z);
 
 /// The serving chain's accepted drafts, summed over the blocks: each row's Hidden-Correction reads the token the row
 /// before it drafted (the anchor for row 1), and a block scores the rows before its first draft that is not the

@@ -37,6 +37,7 @@ struct RunOptions {
     int64_t attention_blocks = kAttentionChunkBlocks;   ///< blocks whose attention scores are alive at once
     uint64_t queue_bytes = 4ull << 30; ///< host memory of the sequences read ahead
     uint64_t seed = 42;                ///< of the data order
+    double prefix_weight = 1.0;        ///< loss weight of a block whose anchor follows a prompt-path row; 0 takes none
     LossConfig loss;                   ///< its chunk_blocks is the blocks whose logits are alive at once
 };
 

@@ -145,7 +145,7 @@ int main() {
         z[0][2] = torch::tensor(p2, f64).log();
         LossConfig cfg;
         cfg.kl_topk = 2;
-        const LossTerms t = chunked_loss(d, z, eye, eye, seq, torch::tensor(std::vector<int64_t>{1}, torch::kLong), cfg, 1.0, nullptr);
+        const LossTerms t = chunked_loss(d, z, eye, eye, seq, torch::tensor(std::vector<int64_t>{1}, torch::kLong), torch::Tensor(), cfg, 1.0, nullptr);
         // row 1: KL over the teacher's two likeliest = 0.5 ln 2 - 0.25 ln 2; accept 0.75. Row 2: equal distributions.
         // confidences 0.25 and 0.1 -> s = [0.625, 0.55], weights [0.96875, 0.34375]
         const double ln2 = std::log(2.0), kl = 0.96875 * 0.25 * ln2 / 1.3125;
@@ -186,7 +186,7 @@ int main() {
         for (const int64_t chunk : {1, 2, 64}) {
             cfg.chunk_blocks = chunk;
             torch::Tensor gz;
-            const LossTerms t = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, cfg, 1.0, &gz);
+            const LossTerms t = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, &gz);
             const double dl = std::abs(t.loss - ref.item<double>()), dz = max_abs_diff(gz, ref_gz), dp = worst(take_head_grads(drafter), ref_gp);
             std::printf("  %lld blocks at a time: |loss - plain| %.3e, max |dz - plain| %.3e, max |dparams - plain| %.3e\n", (long long) chunk, dl, dz, dp);
             check(dl < 1e-12 && dz < 1e-12 && dp < 1e-12, "chunks of " + std::to_string(chunk) + ": the same value and gradients");
@@ -194,16 +194,41 @@ int main() {
         }
         // the scale multiplies the gradients and they add to what is already there
         torch::Tensor gz1, gz3;
-        chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, cfg, 1.0, &gz1);
-        chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, cfg, 3.0, &gz3);
+        chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, &gz1);
+        chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 3.0, &gz3);
         std::vector<torch::Tensor> four = ref_gp;
         for (torch::Tensor& g : four) g = g * 4.0;
         check(max_abs_diff(gz3, gz1 * 3.0) < 1e-12 && worst(take_head_grads(drafter), four) < 1e-11, "a scale of 3 after a scale of 1 leaves four times the gradient");
-        const LossTerms quiet = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, cfg, 1.0, nullptr);
+        const LossTerms quiet = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, nullptr);
         check(std::abs(quiet.loss - ref.item<double>()) < 1e-12, "without a gradient request the value is the same");
         bool clean = true;
         for (const torch::Tensor& g : take_head_grads(drafter)) clean = clean && g.abs().max().item<double>() == 0.0;
         check(clean, "and no gradient is left behind");
+
+        // block weights: zero leaves a block out, the same weight everywhere changes nothing
+        cfg.chunk_blocks = 2;
+        const torch::Tensor keep = torch::tensor(std::vector<int64_t>{0, 2, 4}, torch::kLong);
+        torch::Tensor gz_sub, gz_w, gz_half, gz_one;
+        const LossTerms sub = chunked_loss(drafter, z.index_select(0, keep), embedding, head, seq, blocks.anchors.index_select(0, keep),
+                                           torch::Tensor(), cfg, 1.0, &gz_sub);
+        const std::vector<torch::Tensor> sub_gp = take_head_grads(drafter);
+        const torch::Tensor w01 = torch::tensor(std::vector<double>{1, 0, 1, 0, 1}, f64);
+        const LossTerms weighted = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, w01, cfg, 1.0, &gz_w);
+        const double dw = std::abs(weighted.loss - sub.loss), dzw = max_abs_diff(gz_w.index_select(0, keep), gz_sub);
+        std::printf("  weights 1,0,1,0,1 against the three blocks alone: |loss| %.3e, max |dz| %.3e\n", dw, dzw);
+        check(dw < 1e-12 && dzw < 1e-12 && worst(take_head_grads(drafter), sub_gp) < 1e-12 &&
+                  gz_w.index_select(0, torch::tensor(std::vector<int64_t>{1, 3}, torch::kLong)).abs().max().item<double>() == 0.0,
+              "a block of weight 0 is left out, its rows get no gradient");
+        const LossTerms one = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, &gz_one);
+        const std::vector<torch::Tensor> one_gp = take_head_grads(drafter);
+        const LossTerms half = chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::full({5}, 0.5, f64), cfg, 1.0, &gz_half);
+        check(std::abs(half.loss - one.loss) < 1e-12 && max_abs_diff(gz_half, gz_one) < 1e-12 && worst(take_head_grads(drafter), one_gp) < 1e-12 &&
+                  half.blocks == 5.0 && half.hits_teacher == one.hits_teacher,
+              "the same weight on every block is the unweighted loss, and the counts are not weighted");
+        bool threw = false;
+        try { chunked_loss(drafter, z, embedding, head, seq, blocks.anchors, torch::full({5}, -1.0, f64), cfg, 1.0, nullptr); } catch (const std::exception&) { threw = true; }
+        check(threw, "a negative weight is refused");
+        cfg.chunk_blocks = 64;
     }
 
     std::printf("5. two stages against one graph through the backbone\n");
@@ -216,7 +241,7 @@ int main() {
         drafter->zero_grad();
         const torch::Tensor zb = drafter->backbone(embedding, seq, blocks, 64);
         torch::Tensor gz;
-        chunked_loss(drafter, zb, embedding, head, seq, blocks.anchors, cfg, 1.0, &gz);
+        chunked_loss(drafter, zb, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, &gz);
         zb.backward(gz);
         std::vector<torch::Tensor> two;
         for (const auto& p : drafter->named_parameters()) two.push_back(p.value().grad().defined() ? p.value().grad().clone() : torch::zeros_like(p.value()));
@@ -253,11 +278,11 @@ int main() {
         for (size_t n = 0; n < anchor_rows.size(); ++n)
             for (int64_t k = 0; k < rows; ++k) perfect[(int64_t) n][k + 1] = seq.hidden[anchor_rows[n] + k];
         check(served_chain_accept(drafter, perfect, embedding, head, seq, blocks.anchors, 64) == 5.0 * (double) rows, "a drafter equal to the teacher is accepted everywhere");
-        const LossTerms t = chunked_loss(drafter, perfect, embedding, head, seq, blocks.anchors, cfg, 1.0, nullptr);
+        const LossTerms t = chunked_loss(drafter, perfect, embedding, head, seq, blocks.anchors, torch::Tensor(), cfg, 1.0, nullptr);
         check(std::abs(t.kl) < 1e-12 && std::abs(t.e2e) < 1e-12 && std::abs(t.tv_accept - 5.0 * (double) rows) < 1e-9 && simulated_accept_length(t.hits_teacher, t.blocks) == (double) rows,
               "and its KL and accepted-length terms are zero");
         bool threw = false;
-        try { chunked_loss(drafter, perfect, embedding, head, seq, torch::tensor(std::vector<int64_t>{0, 3, 9, 17, 37}, torch::kLong), cfg, 1.0, nullptr); } catch (const std::exception&) { threw = true; }
+        try { chunked_loss(drafter, perfect, embedding, head, seq, torch::tensor(std::vector<int64_t>{0, 3, 9, 17, 37}, torch::kLong), torch::Tensor(), cfg, 1.0, nullptr); } catch (const std::exception&) { threw = true; }
         check(threw, "a block that runs past its sequence is refused");
     }
     return dfly2_test::finish("loss_test");

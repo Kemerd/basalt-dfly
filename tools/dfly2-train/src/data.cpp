@@ -1,8 +1,14 @@
 // tools/dfly2-train/src/data.cpp - the shard set, the training order and the read-ahead thread (data.hpp).
 #include "data.hpp"
 
+#include "basalt/core/model_file.hpp"
+#include "basalt/dfly2/anchors.hpp"
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <random>
 
@@ -23,11 +29,54 @@ bool ends_with(const std::string& name, const std::string& tail) {
     return name.size() > tail.size() && name.compare(name.size() - tail.size(), tail.size(), tail) == 0;
 }
 
-/// The anchors of an ascending list whose block of `block` rows lies inside a sequence of `tokens` rows.
-uint64_t count_inside(const int32_t* anchors, uint64_t n, uint64_t tokens, int64_t block) {
-    uint64_t usable = 0;
-    while (usable < n && (uint64_t) anchors[usable] + (uint64_t) block <= tokens) ++usable;
-    return usable;
+/// The export's settings file beside the shards.
+constexpr const char* kExportManifest = "export.json";
+constexpr uint64_t kExportManifestMaxBytes = 1u << 20;
+
+/// The window rows of the export that wrote the shards of `dir`, from its settings file.
+bool export_window_rows(const std::string& dir, int64_t& rows, std::string& err) {
+    const std::string path = dir + "/" + kExportManifest;
+    uint64_t bytes = 0;
+    if (!platform::file_size(path, bytes)) {
+        err = dir + " has no " + kExportManifest + ": which rows the target's prompt path computed is unknown";
+        return false;
+    }
+    if (bytes == 0 || bytes > kExportManifestMaxBytes) { err = path + " is not an export's settings file"; return false; }
+    std::string text((size_t) bytes, '\0');
+    std::FILE* f = platform::open_file_utf8(path, "rb");
+    if (f == nullptr) { err = "cannot read " + path; return false; }
+    const bool got = std::fread(text.data(), 1, text.size(), f) == text.size();
+    std::fclose(f);
+    core::Json root;
+    std::string why;
+    if (!got || !core::parse_json(text.data(), text.size(), root, why) || !root.is_object()) {
+        err = path + " is not an export's settings file" + (why.empty() ? "" : ": " + why);
+        return false;
+    }
+    // the export writes every setting as a string
+    const core::Json* w = root.get("window_rows");
+    const char* end = w != nullptr && w->is_string() ? w->s.data() + w->s.size() : nullptr;
+    if (end == nullptr || w->s.empty() || std::from_chars(w->s.data(), end, rows).ptr != end || rows < 0) {
+        err = path + " has no \"window_rows\" of whole rows";
+        return false;
+    }
+    return true;
+}
+
+/// The anchors a run takes from an ascending list, as indices into it: those whose block of `block` rows lies inside
+/// a sequence of `tokens` rows, and of the prefix anchors (at or before row `window_from`) only when `prefix` is set.
+/// `prefix_taken` gets how many of them are prefix anchors.
+std::vector<int64_t> taken_anchors(const int32_t* anchors, uint64_t n, uint64_t tokens, int64_t block, uint64_t window_from,
+                                   bool prefix, uint64_t& prefix_taken) {
+    std::vector<int64_t> taken;
+    prefix_taken = 0;
+    for (uint64_t i = 0; i < n && (uint64_t) anchors[i] + (uint64_t) block <= tokens; ++i) {
+        const bool is_prefix = (uint64_t) anchors[i] <= window_from;
+        if (is_prefix && !prefix) continue;
+        prefix_taken += is_prefix ? 1 : 0;
+        taken.push_back((int64_t) i);
+    }
+    return taken;
 }
 
 /// Checks a shard's header against the drafter and the pack; false with the reason in `err`.
@@ -66,12 +115,16 @@ uint64_t sequence_seed(uint64_t seed, int64_t epoch, uint64_t sequence) { return
 
 // ---------------------------------------------------------------- the shard set
 
-bool ShardSet::open(const std::string& dir, const DrafterShape& shape, const PackIdentity& pack, std::string& err) {
+bool ShardSet::open(const std::string& dir, const DrafterShape& shape, const PackIdentity& pack, const DataOptions& options,
+                    std::string& err) {
     shape_ = shape;
+    options_ = options;
     paths_.clear();
     refs_.clear();
     open_.clear();
-    blocks_ = tokens_ = 0;
+    blocks_ = tokens_ = prefix_blocks_ = 0;
+    if (!(options.prefix_weight >= 0.0 && options.prefix_weight <= 1.0)) { err = "the prefix anchors' weight is outside [0, 1]"; return false; }
+    if (!export_window_rows(dir, window_rows_, err)) return false;
     std::vector<platform::DirFile> files;
     if (!platform::list_files(dir, files)) { err = "cannot read the shard directory " + dir; return false; }
     // by name, so the set's sequence numbering does not depend on the order the OS lists files in
@@ -90,10 +143,14 @@ bool ShardSet::open(const std::string& dir, const DrafterShape& shape, const Pac
             if (info == nullptr) { err = path + ": sequence " + std::to_string(i) + " is missing"; return false; }
             anchors.resize((size_t) info->n_anchors);
             if (!r.read_anchors(i, anchors.data(), err)) { err = path + ": " + err; return false; }
-            const uint64_t usable = count_inside(anchors.data(), info->n_anchors, info->n_tokens, shape.block);
+            const uint64_t from = (uint64_t) window_from((int64_t) info->n_tokens, window_rows_);
+            uint64_t prefix = 0;
+            const uint64_t usable = taken_anchors(anchors.data(), info->n_anchors, info->n_tokens, shape.block, from,
+                                                  options.prefix_weight > 0.0, prefix).size();
             if (usable == 0) continue;
-            refs_.push_back({shard, i, info->n_tokens, usable});
+            refs_.push_back({shard, i, info->n_tokens, usable, from});
             blocks_ += usable;
+            prefix_blocks_ += prefix;
             tokens_ += info->n_tokens;
         }
     }
@@ -145,20 +202,31 @@ bool ShardSet::load(size_t ref_index, uint64_t seed, uint64_t first, LoadedSeque
     }
     if (!r->read(ref.index, spans, err)) { err = r->path() + ": sequence " + std::to_string(ref.index) + ": " + err; return false; }
 
-    // the blocks that fit, in this epoch's order, from where the run stands
-    const uint64_t usable = count_inside(anchors.data_ptr<int32_t>(), (uint64_t) A, info->n_tokens, shape_.block);
+    // the blocks the run takes, in this epoch's order, from where the run stands
+    uint64_t prefix = 0;
+    const std::vector<int64_t> taken = taken_anchors(anchors.data_ptr<int32_t>(), (uint64_t) A, info->n_tokens, shape_.block,
+                                                     ref.window_from, options_.prefix_weight > 0.0, prefix);
+    const uint64_t usable = taken.size();
     if (usable != ref.blocks) { err = r->path() + ": sequence " + std::to_string(ref.index) + " changed since the shard was counted"; return false; }
     if (first >= usable) { err = "the run's place (block " + std::to_string(first) + ") is past sequence " + std::to_string(ref.index) + " of " + r->path(); return false; }
     const std::vector<uint64_t> order = shuffled_order(usable, seed);
     torch::Tensor take = torch::empty({(int64_t) (usable - first)}, torch::kLong);
-    for (uint64_t i = first; i < usable; ++i) take.data_ptr<int64_t>()[i - first] = (int64_t) order[(size_t) i];
+    out.weight = torch::empty({(int64_t) (usable - first)}, torch::kFloat32);
+    for (uint64_t i = first; i < usable; ++i) {
+        const int64_t a = taken[(size_t) order[(size_t) i]];
+        take.data_ptr<int64_t>()[i - first] = a;
+        // a prefix anchor follows a prompt-path row
+        const bool is_prefix = (uint64_t) anchors.data_ptr<int32_t>()[a] <= ref.window_from;
+        out.weight.data_ptr<float>()[i - first] = is_prefix ? (float) options_.prefix_weight : 1.0f;
+    }
     out.anchors = anchors.to(torch::kLong).index_select(0, take);
     out.selection = selection.index_select(0, take);
     out.sel_count = counts.index_select(0, take);
     out.ctx.tokens = tokens.to(torch::kLong);
     out.ctx.pos0 = info->pos0;
     out.first = first;
-    out.bytes = out.ctx.tokens.nbytes() + out.ctx.hidden.nbytes() + out.anchors.nbytes() + out.selection.nbytes() + out.sel_count.nbytes();
+    out.bytes = out.ctx.tokens.nbytes() + out.ctx.hidden.nbytes() + out.anchors.nbytes() + out.selection.nbytes() + out.sel_count.nbytes() +
+                out.weight.nbytes();
     for (int64_t l = 0; l < layers; ++l) out.bytes += out.ctx.k[(size_t) l].nbytes() + out.ctx.v[(size_t) l].nbytes();
     return true;
 }

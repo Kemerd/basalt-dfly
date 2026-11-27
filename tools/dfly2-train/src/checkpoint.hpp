@@ -44,6 +44,7 @@ struct TrainState {
     uint64_t seed = 0;                             ///< settings a resumed run must repeat
     int64_t blocks_per_step = 0, total_steps = 0;
     uint64_t dataset_blocks = 0, dataset_sequences = 0;
+    double prefix_weight = 1.0;
     std::map<std::string, torch::Tensor> buffers;  ///< FP32 on the CPU, by the optimiser's names
 };
 

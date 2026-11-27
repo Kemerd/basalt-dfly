@@ -15,7 +15,7 @@ namespace basalt::dfly2 {
 namespace {
 
 constexpr const char* kStateFormat = "basalt-dfly2-train-state";
-constexpr const char* kStateVersion = "1";
+constexpr const char* kStateVersion = "2";
 constexpr const char* kDrafterTail = ".safetensors";
 constexpr const char* kStateTail = ".state.safetensors";
 
@@ -139,8 +139,9 @@ bool write_train_state(const std::string& path, const TrainState& state, std::st
     std::vector<torch::Tensor> keep;
     std::vector<StWrite> entries;
     if (!to_entries(named, keep, entries, err)) return false;
-    char elapsed[64];
+    char elapsed[64], prefix_weight[64];
     std::snprintf(elapsed, sizeof elapsed, "%.3f", state.elapsed);
+    std::snprintf(prefix_weight, sizeof prefix_weight, "%.17g", state.prefix_weight);
     const std::map<std::string, std::string> meta = {
         {"format", kStateFormat},
         {"version", kStateVersion},
@@ -155,6 +156,7 @@ bool write_train_state(const std::string& path, const TrainState& state, std::st
         {"total_steps", std::to_string(state.total_steps)},
         {"dataset_blocks", std::to_string(state.dataset_blocks)},
         {"dataset_sequences", std::to_string(state.dataset_sequences)},
+        {"prefix_weight", prefix_weight},
     };
     return safetensors_write(path, meta, entries, err);
 }
@@ -163,14 +165,15 @@ bool read_train_state(const std::string& path, TrainState& out, std::string& err
     SafetensorsFile f;
     if (!f.open(path, err)) return false;
     const auto& m = f.metadata();
-    std::string format, version, elapsed;
+    std::string format, version, elapsed, prefix_weight;
     out = TrainState{};
     uint64_t step = 0, adam = 0, epoch = 0, bps = 0, total = 0;
     if (!meta_text(m, "format", format, err) || !meta_text(m, "version", version, err)) { err = path + ": " + err; return false; }
     if (format != kStateFormat || version != kStateVersion) { err = path + ": not a training state this build reads (" + format + " " + version + ")"; return false; }
     if (!meta_u64(m, "step", step, err) || !meta_u64(m, "adam_steps", adam, err) || !meta_u64(m, "epoch", epoch, err) || !meta_u64(m, "position", out.position, err) ||
         !meta_u64(m, "first", out.first, err) || !meta_text(m, "elapsed", elapsed, err) || !meta_u64(m, "seed", out.seed, err) || !meta_u64(m, "blocks_per_step", bps, err) ||
-        !meta_u64(m, "total_steps", total, err) || !meta_u64(m, "dataset_blocks", out.dataset_blocks, err) || !meta_u64(m, "dataset_sequences", out.dataset_sequences, err)) {
+        !meta_u64(m, "total_steps", total, err) || !meta_u64(m, "dataset_blocks", out.dataset_blocks, err) || !meta_u64(m, "dataset_sequences", out.dataset_sequences, err) ||
+        !meta_text(m, "prefix_weight", prefix_weight, err)) {
         err = path + ": " + err;
         return false;
     }
@@ -180,6 +183,10 @@ bool read_train_state(const std::string& path, TrainState& out, std::string& err
     out.blocks_per_step = (int64_t) bps;
     out.total_steps = (int64_t) total;
     if (!detail::parse_real(elapsed, out.elapsed) || !(out.elapsed >= 0.0)) { err = path + ": elapsed is not a time: " + elapsed; return false; }
+    if (!detail::parse_real(prefix_weight, out.prefix_weight) || !(out.prefix_weight >= 0.0 && out.prefix_weight <= 1.0)) {
+        err = path + ": prefix_weight is not a weight: " + prefix_weight;
+        return false;
+    }
     for (const StTensor& t : f.tensors())
         if (!to_tensor(f, t, out.buffers[t.name], err)) { err = path + ": " + err; return false; }
     return true;

@@ -28,6 +28,13 @@ using dfly2_test::refused;
 namespace {
 
 constexpr int64_t kBlock = 4;
+constexpr int64_t kWindowRows = 40;   // the fixture's export read each sequence's last 40 rows through verify windows
+
+/// The settings file an export leaves beside its shards; the trainer reads its window rows.
+void write_export_json(const std::string& dir, int64_t window_rows) {
+    std::ofstream(std::filesystem::path(std::u8string(dir.begin(), dir.end())) / "export.json", std::ios::binary)
+        << "{\n  \"seed\": \"42\",\n  \"window_rows\": \"" << window_rows << "\"\n}\n";
+}
 
 /// `t` as FP16 bit patterns, row-major.
 std::vector<uint16_t> half_bits(const torch::Tensor& t) {
@@ -145,7 +152,7 @@ int main(int argc, char** argv) {
     check(pack.open(pack_path, err), "the tiny pack opens", err);
     const std::string shards = dir.file("shards"), run_a = dir.file("run-a"), run_b = dir.file("run-b"), run_c = dir.file("run-c");
     std::filesystem::create_directories(dir.path / "shards");
-    int64_t fixture_blocks = 0, fixture_sequences = 0;
+    int64_t fixture_blocks = 0, fixture_sequences = 0, fixture_prefix = 0, window_blocks = 0, window_sequences = 0;
     {
         // a token's teacher row scores one token far above the rest, and the chain follows it
         const torch::Tensor head = tiny.expect.at("output.weight");                           // [vocab][hidden]
@@ -161,15 +168,21 @@ int main(int argc, char** argv) {
             ok = w.open(shards + "/part-" + std::to_string(f) + kShardExtension, h, err);
             for (const auto& s : plan[f]) {
                 ok = ok && write_sequence(w, h, state, next, s[0], s[1], s[2], rng, err);
-                // an anchor counts when its block of four rows ends inside the sequence
-                int64_t blocks = 0;
-                for (int64_t a = s[1]; a + kBlock <= s[0]; a += 2) ++blocks;
+                // an anchor counts when its block of four rows ends inside the sequence; it is a prefix anchor when
+                // the row before it came before the windows
+                int64_t blocks = 0, prefix = 0;
+                const int64_t from = s[0] - std::min(kWindowRows, s[0] - 1);
+                for (int64_t a = s[1]; a + kBlock <= s[0]; a += 2) ++blocks, prefix += a <= from ? 1 : 0;
                 fixture_blocks += blocks;
                 fixture_sequences += blocks > 0 ? 1 : 0;
+                fixture_prefix += prefix;
+                window_blocks += blocks - prefix;
+                window_sequences += blocks - prefix > 0 ? 1 : 0;
             }
             ok = ok && w.close(err);
         }
         check(ok, "two shards of seven sequences are written", err);
+        write_export_json(shards, kWindowRows);
     }
 
     std::printf("2. init\n");
@@ -191,9 +204,31 @@ int main(int argc, char** argv) {
           "its attention is the target's, its fusion gate and correction output zero");
     {
         ShardSet set;
-        check(set.open(shards, init.shape, pack.identity(), err), "the shards open for it", err);
-        check((int64_t) set.blocks() == fixture_blocks && (int64_t) set.sequences().size() == fixture_sequences && set.shards() == 2,
-              "the set counts the fixture's " + std::to_string(fixture_blocks) + " blocks in " + std::to_string(fixture_sequences) + " sequences");
+        check(set.open(shards, init.shape, pack.identity(), DataOptions{}, err), "the shards open for it", err);
+        check((int64_t) set.blocks() == fixture_blocks && (int64_t) set.sequences().size() == fixture_sequences && set.shards() == 2 &&
+                  (int64_t) set.prefix_blocks() == fixture_prefix && set.window_rows() == kWindowRows,
+              "the set counts the fixture's " + std::to_string(fixture_blocks) + " blocks in " + std::to_string(fixture_sequences) + " sequences, " +
+                  std::to_string(fixture_prefix) + " of them after a prompt-path row");
+        // at weight 0 the prefix anchors are not taken; at 0.25 they weigh that
+        ShardSet windows_only;
+        check(windows_only.open(shards, init.shape, pack.identity(), DataOptions{0.0}, err) && (int64_t) windows_only.blocks() == window_blocks &&
+                  (int64_t) windows_only.sequences().size() == window_sequences && windows_only.prefix_blocks() == 0,
+              "at prefix weight 0 only the " + std::to_string(window_blocks) + " window blocks are taken", err);
+        {
+            ShardSet quarter;
+            check(quarter.open(shards, init.shape, pack.identity(), DataOptions{0.25}, err), "the set opens at prefix weight 0.25", err);
+            SequenceLoader loader(quarter, 9, 0, 0, 0, 1, 1);
+            LoadedSequence q;
+            double weights = 0;
+            bool right = true;
+            while (loader.next(q, err)) {
+                weights += q.weight.sum().item<double>();
+                right = right && q.weight.size(0) == q.anchors.size(0);
+            }
+            const double expect = (double) window_blocks + 0.25 * (double) fixture_prefix;
+            check(err.empty() && right && std::abs(weights - expect) < 1e-9, "and its blocks' weights sum to the window blocks plus a quarter of the rest", err);
+        }
+        refused(!windows_only.open(shards, init.shape, pack.identity(), DataOptions{1.5}, err), "a prefix weight above 1", err);
         // one pass hands out every block once
         SequenceLoader loader(set, 9, 0, 0, 0, 1, 1);
         LoadedSequence s;
@@ -205,6 +240,13 @@ int main(int argc, char** argv) {
             inside = inside && s.anchors.max().item<int64_t>() + kBlock <= s.ctx.tokens.size(0) && s.selection.size(0) == s.anchors.size(0) && s.ctx.hidden.scalar_type() == torch::kFloat16;
         }
         check(err.empty() && seen == fixture_blocks && sequences == fixture_sequences && inside, "a pass of the loader hands out every block once, each inside its sequence", err);
+        // shards without the export's settings file
+        const std::string bare = dir.file("bare-shards");
+        std::filesystem::create_directories(dir.path / "bare-shards");
+        std::filesystem::copy_file(std::filesystem::path(std::u8string(shards.begin(), shards.end())) / ("part-0" + std::string(kShardExtension)),
+                                   dir.path / "bare-shards" / ("part-0" + std::string(kShardExtension)));
+        refused(!set.open(bare, init.shape, pack.identity(), DataOptions{}, err) && err.find("export.json") != std::string::npos,
+                "shards without export.json", err);
     }
 
     std::printf("3. eval before training\n");
@@ -224,6 +266,9 @@ int main(int argc, char** argv) {
     EvalResult part;
     check(evaluate(eo, part, err) && part.blocks == 50, "--max-blocks measures that many", err);
     eo.max_blocks = 0;
+    eo.prefix_weight = 0.0;
+    check(evaluate(eo, part, err) && part.blocks == window_blocks, "--prefix-weight 0 measures the window blocks alone", err);
+    eo.prefix_weight = 1.0;
 
     std::printf("4. train\n");
     TrainOptions to;
@@ -284,6 +329,9 @@ int main(int argc, char** argv) {
         bad.dtype = "bf16";
         refused(!train(bad, nullptr, rb, err), "a run resumed with another weight type", err);
         bad = to;
+        bad.prefix_weight = 0.5;
+        refused(!train(bad, nullptr, rb, err), "a run resumed with another prefix weight", err);
+        bad = to;
         bad.run = run_c;
         refused(!train(bad, nullptr, rb, err), "a new run without --init", err);
         bad.init = init_file;
@@ -299,10 +347,11 @@ int main(int argc, char** argv) {
         const ShardHeader h = shard_header(target, other);
         const bool wrote = w.open(elsewhere + "/part-0" + kShardExtension, h, err) &&
                            write_sequence(w, h, torch::randn({target.vocab, target.hidden}), torch::zeros({target.vocab}, torch::kLong), 20, 1, 0, rng, err) && w.close(err);
+        write_export_json(elsewhere, kWindowRows);
         check(wrote, "a shard naming another pack is written", err);
         bad.device = "cpu";
         bad.shards = elsewhere;
-        refused(!train(bad, nullptr, rb, err), "shards exported from another pack", err);
+        refused(!train(bad, nullptr, rb, err) && err.find("another pack") != std::string::npos, "shards exported from another pack", err);
         bad.shards = dir.file("no-such-directory");
         refused(!train(bad, nullptr, rb, err), "a shard directory that does not exist", err);
         EvalOptions bad_eval = eo;
