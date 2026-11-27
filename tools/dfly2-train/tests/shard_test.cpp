@@ -142,6 +142,9 @@ int main() {
         check(r.read(1, d, err) && same(h, b, d), "sequence 1 reads back", err);
         check(r.read(2, d, err) && same(h, c, d), "sequence 2 reads back", err);
         check(!r.read(3, d, err), "a sequence past the end is refused");
+        // the anchors alone, as a pass that only counts blocks reads them
+        std::vector<int32_t> only((size_t) r.info(2)->n_anchors, -7);
+        check(r.read_anchors(2, only.data(), err) && only == d.anchors && !r.read_anchors(3, only.data(), err), "a sequence's anchors read on their own");
     }
 
     std::printf("2. the writer's refusals\n");

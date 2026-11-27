@@ -43,6 +43,7 @@ static_assert(std::endian::native == std::endian::little, "the shard layout is l
 
 constexpr char kShardMagic[8] = {'B', 'S', 'L', 'T', 'D', 'F', '2', 'S'};
 constexpr uint32_t kShardVersion = 1;
+constexpr const char* kShardExtension = ".dfly2";   ///< a shard's file name ends with this
 constexpr uint32_t kShardMaxLayers = 16;       ///< paired layers a shard can carry
 constexpr uint64_t kShardAlign = 64;           ///< every array's file offset is a multiple of this
 constexpr uint32_t kSequenceMagic = 0x51455332;   ///< "2SEQ"
@@ -383,6 +384,22 @@ public:
     uint64_t sequences() const { return infos_.size(); }
     /// Sequence `i`'s header, or nullptr.
     const SequenceHeader* info(uint64_t i) const { return i < infos_.size() ? &infos_[(size_t) i] : nullptr; }
+
+    /// Reads only sequence `i`'s anchors ([n_anchors], checked for order and range), for a pass that counts blocks.
+    bool read_anchors(uint64_t i, int32_t* anchors, std::string& err) {
+        if (file_ == nullptr || i >= infos_.size()) { err = "no such sequence " + std::to_string(i); return false; }
+        const SequenceHeader& s = infos_[(size_t) i];
+        SequenceLayout lay;
+        if (!shard_sequence_layout(header_, s.n_tokens, s.n_anchors, lay, err)) return false;
+        if (s.n_anchors == 0) return true;
+        if (!read_at(offsets_[(size_t) i] + lay.anchors, anchors, s.n_anchors * sizeof(int32_t), err)) return false;
+        int64_t prev = -1;
+        for (uint64_t a = 0; a < s.n_anchors; ++a) {
+            if (anchors[a] <= prev || (uint64_t) anchors[a] >= s.n_tokens) { err = "anchor " + std::to_string(anchors[a]) + " is not ascending inside the sequence"; return false; }
+            prev = anchors[a];
+        }
+        return true;
+    }
 
     /// Reads sequence `i` into `dst`, whose buffers are sized from info(i) and the header.
     bool read(uint64_t i, const SequenceSpans& dst, std::string& err) {
