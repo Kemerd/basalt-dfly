@@ -234,7 +234,9 @@ bool BlockDraft::load(const std::vector<std::string>& shards, int64_t n_layers, 
         }
         // ---- the forms its passes read (made in finish(), once the bytes are there), then the working memory
         std::string why;
-        if (!dflash::decode_forms(bd, false, forms_, why)) {
+        // the pack's Q8_0 values: a verify window here costs far more than the pass, so the drafts' acceptance outweighs
+        // the bytes NVFP4 would save
+        if (!dflash::decode_forms(bd, false, false, forms_, why)) {
             err = "block drafter: " + why;
             return false;
         }

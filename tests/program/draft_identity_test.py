@@ -10,7 +10,9 @@ must be among the drafter session's.
 
 The requests cover what a drafter's context has to follow: a new conversation, the next turn of it (read on from the
 live session), a turn that rewinds into it, a prompt read in chunks, a prompt longer than the drafter's context, and
-the first conversation again after the others.
+the first conversation again after the others. Each request is compared across the two sessions only: read again as a
+fresh prompt, a turn goes through the prompt path, which rounds differently from the decode windows that read it the
+first time (docs/precision/qwen38-flash-next.md), so its reply may differ from the first one in both sessions.
 
 The experts' placement must be the same in both sessions, or rows round differently: pass a fixed tier in ENGINE ARGS
 (`--expert-cache N`, and a fixed peer tier when there is one). Adaptive swaps are turned off here. With
@@ -173,10 +175,6 @@ def main() -> int:
         if ref != new:
             i = next((k for k, (x, y) in enumerate(zip(ref, new)) if x != y), min(len(ref), len(new)))
             print(f"FAIL {name}: token {i} differs: plain {ref[i:i + 5]} drafter {new[i:i + 5]}")
-            ok = False
-    for label, r in results.items():   # the same prompt gives the same reply whatever the session read before it
-        if r["tokens"].get("next turn") != r["tokens"].get("first again"):
-            print(f"FAIL {label}: the next turn's reply changed when it was read again")
             ok = False
     # every row the plain session hashed is a row of the drafter session (which also hashes the prompt rows its first
     # window folds in)

@@ -158,7 +158,7 @@ bool decode_drafter(Model& m, std::string& err) {
         return false;
     }
     std::string why;
-    if (!dflash::decode_forms(bd, true, m.bd_forms, why)) {
+    if (!dflash::decode_forms(bd, true, true, m.bd_forms, why)) {
         err = m.o.arch + ": " + why;
         return false;
     }
