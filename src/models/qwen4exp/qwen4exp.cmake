@@ -98,10 +98,19 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/mtp/draft.cpp
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
+  src/models/qwen4exp/decode/dfly/meta.cpp
   src/models/qwen4exp/conversation/conversation_snapshot.cpp
   src/models/qwen4exp/conversation/conversation_state.cpp)
 target_include_directories(model_qwen4exp_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model_qwen4exp_engine PUBLIC core model tiers model_qwen4exp_kernels kernels_cpu ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # the DFly2 drafter's record, the starts that pass it over and a block's source row (host only)
+  add_executable(qwen4exp_dfly_meta_test tests/models/qwen4exp/decode/dfly_meta_test.cpp
+    src/models/qwen4exp/decode/dfly/meta.cpp src/dfly2/record.cpp)
+  target_include_directories(qwen4exp_dfly_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(qwen4exp_dfly_meta_test PRIVATE core)
+  basalt_cpu_test(NAME qwen4exp_dfly_meta_test COMMAND qwen4exp_dfly_meta_test)
+endif()
 
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu src/models/qwen4exp/prefill/kernels.cu
