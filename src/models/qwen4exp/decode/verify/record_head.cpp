@@ -67,18 +67,6 @@ bool Verifier::WindowRecorder::head() {
         if (v_.head_ != nullptr && v_.head_->loaded()) {
             try {
                 native_quantize_q8_1(v_.head_mixed_, v_.xq_, (int) N, T, cs);
-                // rows [0, n) of `w` into y (T rows of n); the same kernel and bits as the whole head
-                auto head_rows = [&](const void* w, float* y, int n, cudaStream_t s) {
-                    const void* x = s == cs ? (const void*) v_.xq_ : v_.hs_xq_;
-                    if (v_.head_->type() == 13 && q5k_head_supported((int) N, T))
-                        q5k_head_mmvq(w, x, y, (int) N, n, T, s);
-                    else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
-                        q6k_head_mmvq(w, x, y, (int) N, n, T, s);
-                    else if (v_.head_->planes())
-                        q80p_mmvq(w, x, y, (int) N, n, T, s);
-                    else
-                        native_mmvq(v_.head_->type(), w, x, y, (int) N, n, T, s);
-                };
                 if (v_.hs_two_ && !v_.batch_rec_ && q80p_supported((int) N, T)) {
                     // the peer's share (hs_launch) screens its rows against CUDA0's thresholds and lists its scored
                     // entries; CUDA0 posts the input beside its own screen, then writes the list into its columns
@@ -102,11 +90,11 @@ bool Verifier::WindowRecorder::head() {
                         const OnDevice on(v_.hs_dev_);
                         ok = ok && cudaStreamWaitEvent(v_.hs_s_, v_.hs_in_, 0) == cudaSuccess &&
                              cudaMemcpyAsync(v_.hs_xq_, v_.hs_hxq_, xb, cudaMemcpyHostToDevice, v_.hs_s_) == cudaSuccess;
-                        if (ok) head_rows(v_.hs_w_, v_.hs_y_, r1, v_.hs_s_);
+                        if (ok) v_.head_->score_rows(v_.hs_w_, v_.hs_xq_, v_.hs_y_, r1, T, v_.hs_s_);
                         ok = ok && cudaMemcpyAsync(v_.hs_hy_, v_.hs_y_, (size_t) T * r1 * 4, cudaMemcpyDeviceToHost, v_.hs_s_) == cudaSuccess &&
                              cudaEventRecord(v_.hs_out_, v_.hs_s_) == cudaSuccess;
                     }
-                    head_rows(v_.head_->weights(), v_.hs_y0_, r0, cs);
+                    v_.head_->score_rows(v_.head_->weights(), v_.xq_, v_.hs_y0_, r0, T, cs);
                     ok = ok && cudaMemcpy2DAsync(v_.head_logits_, (size_t) v_.n_vocab_ * 4, v_.hs_y0_, (size_t) r0 * 4, (size_t) r0 * 4, T,
                                                  cudaMemcpyDeviceToDevice, cs) == cudaSuccess &&
                          cudaStreamWaitEvent(cs, v_.hs_out_, 0) == cudaSuccess &&
