@@ -51,7 +51,8 @@ target_include_directories(dfly2_io PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
 target_link_libraries(dfly2_io PUBLIC model_file)
 
 # The drafter and what trains it.
-add_library(dfly2_core STATIC src/sparse_attention.cpp src/drafter.cpp src/target_weights.cpp src/loss.cpp)
+add_library(dfly2_core STATIC src/sparse_attention.cpp src/drafter.cpp src/target_weights.cpp src/loss.cpp
+  src/optimizer.cpp)
 target_compile_options(dfly2_core PUBLIC ${_dfly2_torch_flags})
 if(MSVC)
   # LibTorch's headers instantiate standard-library templates with narrowing conversions and leave unreachable code
@@ -68,4 +69,5 @@ if(BUILD_TESTING)
   dfly2_test(drafter_test dfly2_core)
   dfly2_test(target_weights_test dfly2_core)
   dfly2_test(loss_test dfly2_core)
+  dfly2_test(optimizer_test dfly2_core)
 endif()
