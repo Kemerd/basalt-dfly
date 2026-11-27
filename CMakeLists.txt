@@ -151,6 +151,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
   src/models/qwen4exp/load/dfly2_shard_queue.cpp
+  src/models/qwen4exp/load/dfly2_export.cpp
   src/models/qwen4exp/load/model.cpp
   src/models/qwen4exp/load/layer_plan.cpp
   src/models/qwen4exp/load/weights.cpp

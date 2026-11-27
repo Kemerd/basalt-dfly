@@ -45,6 +45,9 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
             if (!gdn(v)) return false;
         } else if (half == 0) {
             if (!qsa(v)) return false;
+            if (owner.on_selection && LB == 0 && owner.next_ == nullptr &&
+                !owner.on_selection(l, p0, T, m.sel_ids, m.cap, err))
+                return false;
         } else {
             if (!moe(l, v)) return false;
         }

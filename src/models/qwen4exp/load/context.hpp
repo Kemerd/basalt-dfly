@@ -162,6 +162,8 @@ int resident_load(Context& context);
 int prompt_split(Context& context);
 int dispatch(Context& context);
 int prefill(Context& context);
+/// --dfly2-export: reads every document of the token file and writes the teacher shards; the run's exit code.
+int dfly2_export(Context& context);
 int decode(Context& context);
 
 }

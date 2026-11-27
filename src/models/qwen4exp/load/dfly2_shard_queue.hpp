@@ -63,6 +63,8 @@ public:
     bool begin(std::vector<int32_t> tokens, std::vector<int32_t> anchors, std::string& err);
     /// Queues a piece from `take`; the writer gives it back when it is written. Pieces arrive in row order.
     bool put(Piece* p, std::string& err);
+    /// Gives a piece from `take` back unwritten.
+    void give_back(Piece* p);
     /// Ends the sequence: every row, cell and selection must have been put.
     bool end(std::string& err);
     /// Drains the queue, closes the last shard and joins the writer. False with the first failure.

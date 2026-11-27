@@ -218,6 +218,15 @@ bool ShardQueue::put(Piece* p, std::string& err) {
     return false;
 }
 
+void ShardQueue::give_back(Piece* p) {
+    if (p == nullptr || pieces_.empty() || p < pieces_.data() || p >= pieces_.data() + pieces_.size()) return;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        free_.push_back(p);
+    }
+    cv_free_.notify_one();
+}
+
 bool ShardQueue::end(std::string& err) {
     Item item;
     item.kind = Item::End;

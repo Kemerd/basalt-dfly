@@ -49,8 +49,10 @@ void lend_cache_tail(Context& context, int64_t k, LentSlots& lent, void*& borrow
 
 /// Readies `prefill` for a prompt of `rows` tokens: settles `o.prefill_chunk` (an auto chunk is the largest the expert
 /// cache can lend, and no chunk is larger than the prompt needs), lends the cache slots that hold its buffers (`lent`;
-/// empty when it allocates its own), gives it the CPU pool's share and initializes it. False with `err`.
-bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64_t rows, LentSlots& lent, std::string& err);
+/// empty when it allocates its own), gives it the CPU pool's share and initializes it. `loan_slots`, when given, gets
+/// the slots the loan spans (0: its own buffers). False with `err`.
+bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64_t rows, LentSlots& lent, std::string& err,
+                      int64_t* loan_slots = nullptr);
 
 /// Refills the lent slots from the expert source and gives them back to the decode tier; `ms` gets the time it took.
 /// Returns 0, or the exit code once the failure is logged.

@@ -109,6 +109,7 @@ add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu sr
   src/models/qwen4exp/prefill/layout.cpp
   src/models/qwen4exp/prefill/projection.cpp
   src/models/qwen4exp/prefill/draft_kv.cpp
+  src/models/qwen4exp/prefill/head_input.cpp
   src/models/qwen4exp/prefill/peer.cpp
   src/models/qwen4exp/prefill/pipeline.cpp
   src/models/qwen4exp/prefill/statistics.cpp

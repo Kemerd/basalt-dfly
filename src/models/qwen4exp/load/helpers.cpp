@@ -80,7 +80,8 @@ void lend_cache_tail(Context& context, int64_t k, LentSlots& lent, void*& borrow
                                          : (uint64_t) k * (uint64_t) blob;
 }
 
-bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64_t rows, LentSlots& lent, std::string& err) {
+bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64_t rows, LentSlots& lent, std::string& err,
+                      int64_t* loan_slots) {
     auto& o = *context.o;
     auto& g = *context.g;
     auto& ss = *context.ss;
@@ -88,6 +89,7 @@ bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64
     auto& host_res = *context.host_res;
     void* borrow = nullptr;
     uint64_t borrow_bytes = 0;
+    if (loan_slots != nullptr) *loan_slots = 0;
     if (!host_res.empty() && *context.d_res != nullptr) {
         int64_t chunk = o.prefill_chunk;
         int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, *context.auto_ceiling,
@@ -107,6 +109,7 @@ bool prompt_path_init(Context& context, basalt::prefill::Prefill& prefill, int64
         }
         if (k > 0) {   // the lent slots are refilled after the prompt
             lend_cache_tail(context, k, lent, borrow, borrow_bytes);
+            if (loan_slots != nullptr) *loan_slots = k;
             basalt::log::info("basalt generate", "prompt path borrows %lld cache slots (%.2f GiB)", (long long) k,
                          (double) borrow_bytes / 1073741824.0);
         }

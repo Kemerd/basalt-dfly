@@ -96,6 +96,11 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
+    /// --dfly2-export DIR: the run writes what the target computes for each document of `dfly2_docs` as the shards a
+    /// DFly2 drafter is trained on, and generates nothing (docs/models/qwen38-flash-next.md#teacher-export).
+    std::string dfly2_export;
+    std::string dfly2_docs;            ///< --dfly2-docs FILE: one document a line, as token ids
+    int64_t dfly2_window_rows = 512;   ///< --dfly2-window-rows N: a document's last N rows are read through verify windows
     /// --diag-fixed-experts: every expert row runs the same way whatever the cards hold: a prompt's on the GPU (the
     /// missed experts read over PCIe, no CPU share), a window's on the CPU pool (the windows see no expert in VRAM), so
     /// placements that differ (a split and its reference on one card) compute the same rows

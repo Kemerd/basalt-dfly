@@ -282,6 +282,8 @@ int main() {
         again->row0 = 4; again->rows = 4; again->page0 = 2; again->pages = 1; again->n_sel = 0;
         check(!q.put(again, err), "a piece whose pages do not hold its rows is refused");
         again = q.take();
+        q.give_back(again);
+        check(q.take() == again, "a piece given back unwritten is free again");
         fill_piece(*again, h, 9, 4, 4, {});
         check(q.put(again, err) && q.end(err), "the sequence completes", err);
         ShardQueue::Piece other{};
