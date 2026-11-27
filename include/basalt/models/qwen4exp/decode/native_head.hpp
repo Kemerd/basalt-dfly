@@ -28,6 +28,11 @@ public:
     /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
     static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+    /// Rows [0, n) of the head rows at `w` (weights(), or a copy of a run of its rows on the stream's device) against
+    /// T q8_1 columns of the head's input width: T rows of n logits in `y`, each the bits of the whole head's.  The
+    /// kernel is the one the head's type and T select; launches only.  Throws std::invalid_argument on an unloaded
+    /// head, a null buffer or a count out of range, and whatever the kernel throws.
+    void score_rows(const void* w, const void* x_q8_1, float* y, int n, int T, void* stream) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.

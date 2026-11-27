@@ -1506,6 +1506,12 @@ add_executable(cvec_parity tests/models/qwen4exp/kernels/cvec_parity.cpp)
 target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
+# the stream mean with and without the pending write, bitwise against the fused read's folded write and the streams'
+# sum, against gr_write and a double reference (GPU, synthetic, no model; --bench adds timings)
+add_executable(stream_mean_parity tests/models/qwen4exp/kernels/stream_mean_parity.cpp)
+target_include_directories(stream_mean_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(stream_mean_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME stream_mean_parity COMMAND stream_mean_parity)
 
 # The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
 # `--bench` adds previous/new timings on engine-like shapes.

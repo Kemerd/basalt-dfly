@@ -5,6 +5,7 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/platform/memory.hpp"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include "basalt/log.hpp"
 
 namespace basalt::core {
@@ -154,6 +156,21 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     return true;
+}
+
+void NativeHead::score_rows(const void* w, const void* x_q8_1, float* y, int n, int T, void* stream) const {
+    using namespace basalt::kernels;
+    if (!loaded() || w == nullptr || x_q8_1 == nullptr || y == nullptr || n < 1 || n > n_out_ || T < 1)
+        throw std::invalid_argument("native head rows: an unloaded head, a null buffer or a count out of range");
+    // the wide-head kernels where the type and the column count have one, else the plain product: the same bits
+    if (type_ == 13 && q5k_head_supported(n_in_, T))
+        q5k_head_mmvq(w, x_q8_1, y, n_in_, n, T, stream);
+    else if (type_ == 14 && q6k_head_supported(n_in_, T))
+        q6k_head_mmvq(w, x_q8_1, y, n_in_, n, T, stream);
+    else if (planes_)
+        q80p_mmvq(w, x_q8_1, y, n_in_, n, T, stream);
+    else
+        native_mmvq(type_, w, x_q8_1, y, n_in_, n, T, stream);
 }
 
 // ================================ THE NATIVE EMBEDDING ================================
