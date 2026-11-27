@@ -8,6 +8,10 @@ metadata the engine reads, for any model that carries one:
   dflash.selector.*              BF16 as stored
   <arch>.dflash.*                the drafter's shape, as GGUF metadata
 
+A pack built from a checkpoint holds the tensors in `gguf`. A pack that exists takes them as a section of its own,
+`dflash` (convert.py --drafter DIR --into PACK): each at a multiple of TENSOR_ALIGN, listed in meta.tensors with that
+section's name.
+
 Needs numpy.
 """
 from __future__ import annotations
@@ -15,11 +19,17 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import sys
 
 import numpy as np
 
 import checkpoint as C
 import model_sections as S
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from model_file import TENSOR_ALIGN  # noqa: E402
+
+SECTION = "dflash"
 
 # drafter tensor (after `layers.N.`) -> (GGUF name after `dflash.blk.N.`, type)
 LAYER = {
@@ -56,29 +66,47 @@ class Drafter:
 
     def __init__(self, d, arch: str, hidden: int, vocab: int, layers: int):
         self.dir, self.arch = pathlib.Path(d), arch
-        self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
-        if self.config.get("architectures") != ["DFlash2DraftModel"]:
+        cfg = self.dir / "config.json"
+        if not cfg.is_file():
+            raise S.ConvertError(f"{cfg} not found")
+        try:
+            self.config = json.loads(cfg.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise S.ConvertError(f"{cfg}: {e}")
+        if not isinstance(self.config, dict) or self.config.get("architectures") != ["DFlash2DraftModel"]:
             raise S.ConvertError(f"{self.dir}: not a DFlash2DraftModel")
-        dc = self.config["dflash_config"]
-        if int(self.config["hidden_size"]) != hidden or int(self.config["vocab_size"]) != vocab:
+        try:   # every key the pack records is read here, before anything is written
+            targets = self.kv()[arch + ".dflash.target_layers"]
+            H, n_layers = int(self.config["hidden_size"]), int(self.config["num_hidden_layers"])
+            fits = H == hidden and int(self.config["vocab_size"]) == vocab
+        except (KeyError, TypeError, ValueError) as e:
+            raise S.ConvertError(f"{cfg}: a key is missing or malformed ({e})")
+        if not fits:
             raise S.ConvertError(f"{self.dir}: the drafter's width or vocabulary differs from the model's")
-        if any(t >= layers for t in dc["target_layer_ids"]):
-            raise S.ConvertError(f"{self.dir}: a target layer past the model's layers")
+        if not targets or any(not 0 <= t < layers for t in targets):
+            raise S.ConvertError(f"{self.dir}: target layers {targets} outside the model's {layers} layers")
         if self.config.get("is_causal") is not False or set(self.config.get("layer_types", [])) != {"sliding_attention"}:
             raise S.ConvertError(f"{self.dir}: only the non-causal sliding-window drafter is converted")
         self.files, self.t = sorted(self.dir.glob("*.safetensors")), {}
+        if not self.files:
+            raise S.ConvertError(f"{self.dir}: no safetensors files")
         for f in self.files:
             head, base = S.read_safetensors_header(f)
             for k, v in sorted(((k, v) for k, v in head.items() if k != "__metadata__"), key=lambda kv: kv[1]["data_offsets"][0]):
+                if k in self.t:
+                    raise S.ConvertError(f"{f.name}: duplicate tensor {k}")
                 a_, b_ = v["data_offsets"]
                 self.t[k] = (f, base + a_, v["dtype"], list(v["shape"]), b_ - a_)
         self.tensors, self.slices = {}, {}
-        H = int(self.config["hidden_size"])
         for k, (f, off, dt, shape, n) in self.t.items():
+            if dt != "BF16":
+                raise S.ConvertError(f"{k} is {dt}, expected BF16")
+            if n != 2 * int(np.prod(shape)):
+                raise S.ConvertError(f"{k}: {n} bytes, BF16 of shape {shape} takes {2 * int(np.prod(shape))}")
             if k == "fc.weight":   # one [H][H] block per target layer, so the features project as each layer ends
-                if shape != [H, H * len(dc["target_layer_ids"])]:
+                if shape != [H, H * len(targets)] or H % 32:
                     raise S.ConvertError(f"{self.dir}: fc.weight is {shape}")
-                for j in range(len(dc["target_layer_ids"])):
+                for j in range(len(targets)):
                     name = f"dflash.fc.{j}.weight"
                     self.tensors[name] = C.Tensor(name, "Q8_0", k, "id", [H, H])
                     self.slices[name] = (j * H, shape[1])
@@ -87,10 +115,18 @@ class Drafter:
             rule = LAYER.get(m.group(2)) if m else GLOBAL.get(k)
             if rule is None:
                 raise S.ConvertError(f"{self.dir}: drafter tensor {k} has no counterpart")
-            if dt != "BF16":
-                raise S.ConvertError(f"{k} is {dt}, expected BF16")
+            ne = list(reversed(shape))
+            if rule[1] == "Q8_0" and (len(ne) != 2 or ne[0] % 32):
+                raise S.ConvertError(f"{k}: a tensor of shape {shape} cannot be Q8_0")
             name = "dflash." + (f"blk.{m.group(1)}.{rule[0]}" if m else rule[0])
-            self.tensors[name] = C.Tensor(name, rule[1], k, "id", list(reversed(shape)))
+            self.tensors[name] = C.Tensor(name, rule[1], k, "id", ne)
+        # what the engine reads: a feature block per target layer, the globals and every layer's tensors
+        need = {f"dflash.fc.{j}.weight" for j in range(len(targets))} | {"dflash." + r[0] for r in GLOBAL.values()}
+        need |= {f"dflash.blk.{l}.{r[0]}" for l in range(n_layers) for r in LAYER.values()}
+        if need != set(self.tensors):
+            odd = sorted(need ^ set(self.tensors))
+            raise S.ConvertError(f"{self.dir}: {len(odd)} tensors missing, or of a layer past the drafter's {n_layers}: "
+                                 + ", ".join(odd[:8]))
 
     def kv(self) -> dict:
         c, dc = self.config, self.config["dflash_config"]
@@ -116,6 +152,8 @@ class Drafter:
     def float_bytes(self, name) -> bytes:
         t = self.tensors[name]
         x = self.values(name)
+        if not np.isfinite(x).all():
+            raise S.ConvertError(f"{name} has a non-finite value")
         if t.type_name == "F32":
             return np.ascontiguousarray(x, dtype="<f4").tobytes()
         f, off, dt, shape, n = self.t[t.src]
@@ -132,3 +170,56 @@ class Drafter:
             if isinstance(b, str):
                 raise S.ConvertError(f"{name}: {b}")
             yield b
+
+    def write(self, path, pool) -> dict:
+        """The tensors as the `dflash` section's bytes in the file `path`, each at a multiple of TENSOR_ALIGN; returns
+        their meta.tensors entries (offsets from the section's start)."""
+        entries, pos = {}, 0
+        with open(path, "wb") as f:
+            for name, t in self.tensors.items():
+                pad = (-pos) % TENSOR_ALIGN
+                f.write(b"\0" * pad)
+                pos += pad
+                n = 0
+                for b in (self.chunks(name, pool) if t.type_name == "Q8_0" else (self.float_bytes(name),)):
+                    f.write(b)
+                    n += len(b)
+                if n != t.expected_bytes():
+                    raise S.ConvertError(f"{name}: {n} bytes written, expected {t.expected_bytes()}")
+                entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne], "bytes": n,
+                                 "offset": pos, "section": SECTION}
+                pos += n
+        return entries
+
+
+def section_problems(meta: dict, size) -> list[str]:
+    """What is wrong with the `dflash` section of a pack whose meta is `meta`; `size` is the section's bytes, None when
+    the pack has none. Its tensors lie one after another, aligned, each of the size its type and shape give."""
+    tensors = meta.get("tensors") or {}
+    entries = {n: e for n, e in tensors.items() if isinstance(e, dict) and e.get("section") == SECTION}
+    rec = meta.get("dflash")
+    recorded = isinstance(rec, dict) and rec.get("section") == SECTION    # a drafter held in `gguf` records no section
+    if size is None:
+        return [f"meta names a {SECTION} section the pack does not have"] if entries or recorded else []
+    out = []
+    if not entries:
+        out.append(f"the {SECTION} section has no tensor in meta.tensors")
+    if not recorded or rec.get("bytes") != size:
+        out.append(f"meta.dflash does not record the {SECTION} section of {size} bytes")
+    spans = []
+    for name, e in entries.items():
+        try:
+            t = C.Tensor(name, e["type"], None, "id", e["shape"])
+            off, n, want = int(e["offset"]), int(e["bytes"]), t.expected_bytes()
+        except (KeyError, TypeError, ValueError):
+            out.append(f"{name}: a malformed meta.tensors entry")
+            continue
+        if n != want or e.get("type_id") != t.type_id:
+            out.append(f"{name}: {e['type']} {e['shape']} is recorded as type {e.get('type_id')} of {n} bytes")
+        spans.append((off, n, name))
+    end = 0
+    for off, n, name in sorted(spans):
+        if off % TENSOR_ALIGN or off < end or off + n > size:
+            out.append(f"{name}: offset {off} is not {TENSOR_ALIGN} aligned, overlaps the tensor before it or runs past the section")
+        end = max(end, off + n)
+    return out

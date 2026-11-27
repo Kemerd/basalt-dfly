@@ -33,6 +33,8 @@ class Arch:
     needs_hf_dir = False
     # takes a DSpark drafter GGUF (--dspark) as the dspark/gguf section
     dspark_ok = False
+    # takes a DFlash 2 block drafter (--drafter with --into) as the dflash section
+    dflash_ok = False
     # the model's sampling defaults, for a GGUF that does not carry them (llama.cpp's general.sampling.* keys)
     sampling_kv: dict = {}
 

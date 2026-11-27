@@ -10,7 +10,7 @@ The current version. The engine refuses version 1 files and names
 download or any re-quantizing.
 
 - **Contains:** `meta`, `tokenizer/*`, `dense`, `dense.index`, `experts`, `experts.layout`, `gguf`, `mtp/*`, `hc8`,
-  `dspark/gguf`, `vision/*`.
+  `dspark/gguf`, `dflash`, `vision/*`.
 - **Added `hc8`, now required:** the int8 copies of the hyper-connection matrices the decode reads, the bits the
   engine used to compute at every start. A start reads them as they are and skips reading the BF16 matrices to
   quantize them (about half a second).
@@ -28,6 +28,9 @@ download or any re-quantizing.
   from before it refuses such a tensor by name ("the dense kernels read ...").
 - **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
+- **Added `dflash`, optional, no version change:** a DFlash 2 block drafter attached to a Flash-Next pack. Its tensors are
+  listed in `meta.tensors` with the section's name, as the Engram table is, and its shape in `gguf_kv`
+  ([model file](model-file.md#flash-next-block-drafter)).
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
   `hc8` records and no converter revision, provenance that changed whenever a section was replaced.
 
