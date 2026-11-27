@@ -1771,9 +1771,15 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests.
 # speculation components that need no GPU.
-add_library(spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(spec STATIC src/spec/suffix_drafter.cpp src/spec/scope_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
 target_include_directories(spec PUBLIC include)
 if(BUILD_TESTING)
+  # the C and C++ scope index and its proposals, spelled as tokens by the grammar library's vocabulary (CPU only)
+  add_executable(scope_drafter_test tests/spec/scope_drafter_test.cpp)
+  target_link_libraries(scope_drafter_test PRIVATE spec grammar warnings)
+  basalt_embed_manifest(scope_drafter_test)
+  basalt_cpu_test(NAME scope_drafter_test COMMAND scope_drafter_test)
+  set_tests_properties(scope_drafter_test PROPERTIES TIMEOUT 120)
   add_executable(suffix_drafter_test tests/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE spec)
   basalt_cpu_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
