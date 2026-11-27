@@ -40,6 +40,7 @@ import ggufq  # noqa: E402
 import model_sections as S  # noqa: E402
 from checkpoint import _expert_job, bounded_imap  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelFile, ModelWriter  # noqa: E402
+from mxfp4 import mxfp4_rows  # noqa: E402
 
 MXFP4 = 39
 ENGRAM_ROW = 256
@@ -101,24 +102,6 @@ def fp8_values(codes: np.ndarray, scales: np.ndarray, skip: int = 0) -> np.ndarr
     n, c = codes.shape
     s = np.ldexp(np.float32(1), scales.astype(np.int32) - 127).astype(np.float32)
     return v * np.repeat(np.repeat(s, 32, 0)[skip:skip + n], 32, 1)[:, :c]
-
-
-def mxfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    """The checkpoint's MXFP4 rows (codes [rows, 128]: value 2i in the low nibble of byte i, 2i + 1 in the high one;
-    E8M0 scales [rows, 8]) as ggml MXFP4 rows: per 32 values the scale byte, then 16 bytes whose low nibble is value j
-    and high nibble value j + 16."""
-    rows = codes.shape[0]
-    nb = ENGRAM_ROW // 32
-    c64 = np.ascontiguousarray(codes, dtype=np.uint8).view(np.uint64).reshape(rows, nb, 2)
-    lo, hi = c64[..., 0], c64[..., 1]
-    ev = (lo & np.uint64(0x0F0F0F0F0F0F0F0F)) | ((hi & np.uint64(0x0F0F0F0F0F0F0F0F)) << np.uint64(4))
-    od = ((lo >> np.uint64(4)) & np.uint64(0x0F0F0F0F0F0F0F0F)) | (hi & np.uint64(0xF0F0F0F0F0F0F0F0))
-    out = np.empty((rows, nb, 17), np.uint8)
-    out[..., 0] = scales
-    q = out[..., 1:].reshape(rows, nb, 8, 2)
-    q[..., 0] = ev.view(np.uint8).reshape(rows, nb, 8)
-    q[..., 1] = od.view(np.uint8).reshape(rows, nb, 8)
-    return out.reshape(-1)
 
 
 MXFP4_VALUES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], np.float32)
