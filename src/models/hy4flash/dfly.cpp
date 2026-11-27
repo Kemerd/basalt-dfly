@@ -122,11 +122,11 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
     const core::ModelFile::Section* sec = pack.file.find("dfly");
     if (!sec) return {model::Status::Error, "hy4flash: meta.dfly2 names no dfly section"};
     const Geometry& g = pack.geo;
-    DflyPack dp;
+    dfly2::Record rec;
+    DflyDims d;
     std::string err;
-    if (!parse_dfly_meta(*meta, sec->offset, dp, err) || !dfly_check_shapes(dp.tensors, dp.dims, err))
+    if (!dfly2::parse_record(*meta, sec->offset, rec, err) || !dfly_check_shapes(rec, d, err))
         return {model::Status::Error, "hy4flash: " + err};
-    DflyDims& d = dp.dims;
     d.vocab = g.n_vocab;
     d.rms_eps = g.rms_eps;
     d.rope_base = g.rope_base;
@@ -141,7 +141,7 @@ model::Result dfly_plan(const Pack& pack, core::LoadPlan& reads, int file, int d
     auto w = std::make_unique<DflyWeights>();
     if (!w->allocate(d, err)) return {model::Status::Error, "hy4flash: " + err};
     for (const DflySpec& s : dfly_specs(d)) {
-        const DflyTensor& t = dp.tensors.at(s.name);
+        const dfly2::Tensor& t = rec.tensors.at(s.name);
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;
@@ -165,8 +165,8 @@ std::unique_ptr<DflyTap> DflyTap::create(const DflyDims& d, int sel_cap, std::st
     t->cap_ = sel_cap;
     t->layers_ = d.layers;
     t->idx_layers_ = d.idx_layers;
-    if (cudaMalloc(&t->hid_, (size_t) kDflyTapRows * d.E * 4) != cudaSuccess ||
-        cudaMalloc(&t->sel_, (size_t) d.layers * kDflyTapRows * sel_cap * 4) != cudaSuccess) {
+    if (cudaMalloc(&t->hid_, (size_t) dfly2::kTapRows * d.E * 4) != cudaSuccess ||
+        cudaMalloc(&t->sel_, (size_t) d.layers * dfly2::kTapRows * sel_cap * 4) != cudaSuccess) {
         err = "out of device memory for the drafter's tap";
         return nullptr;
     }
@@ -187,23 +187,23 @@ void DflyTap::begin_window(int64_t pos0) {
 void DflyTap::invalidate() { pos0_ = -1; hid_ok_ = 0; std::fill(std::begin(sel_ok_), std::end(sel_ok_), 0u); }
 
 void DflyTap::hidden(int row, const float* fin, void* stream) {
-    if (row < 0 || row >= kDflyTapRows) return;
+    if (row < 0 || row >= dfly2::kTapRows) return;
     cudaMemcpyAsync(hid_ + (size_t) row * E_, fin, (size_t) E_ * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
     hid_ok_ |= 1u << row;
 }
 
 void DflyTap::selection(int layer, int row, const int32_t* cells, int n, void* stream) {
-    if (row < 0 || row >= kDflyTapRows || n > cap_) return;
+    if (row < 0 || row >= dfly2::kTapRows || n > cap_) return;
     for (int i = 0; i < layers_; ++i) {
         if (idx_layers_[(size_t) i] != layer) continue;
         n_[row][i] = n;
         if (n > 0)
-            cudaMemcpyAsync(sel_ + ((size_t) i * kDflyTapRows + row) * cap_, cells, (size_t) n * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+            cudaMemcpyAsync(sel_ + ((size_t) i * dfly2::kTapRows + row) * cap_, cells, (size_t) n * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
         sel_ok_[row] |= 1u << i;
     }
 }
 
-int DflyTap::source_row(int64_t pos) const { return dfly_source_row(pos0_, hid_ok_, sel_ok_, layers_, pos); }
+int DflyTap::source_row(int64_t pos) const { return dfly2::source_row(pos0_, hid_ok_, sel_ok_, layers_, pos); }
 
 // ---- the block pass -----------------------------------------------------------------------------------------------------
 
@@ -290,7 +290,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.g = p.dev(R * d.ffn, ok); p.u = p.dev(R * d.ffn, ok); p.h = p.dev(R * d.ffn, ok);
     p.ctx = (uint16_t*) p.dev((size_t) (env.sel_cap + kDflyBlock) * kDflyRowWidth / 2 + 1, ok);
     if (env.fp8) p.blk8 = (uint8_t*) p.dev((size_t) kDflyBlock * kFp8RowBytes / 4, ok);
-    p.meta_d = (int32_t*) p.dev(kDflyMaxLayers * 16, ok);
+    p.meta_d = (int32_t*) p.dev(dfly2::kMaxLayers * 16, ok);
     const size_t attw = mla_attend_work_bytes((int) H, env.sel_cap + kDflyBlock, kDflyBlock);
     p.attw = p.dev((attw + 3) / 4, ok);
     if (ok) cudaMemset(p.attw, 0, attw);
@@ -304,7 +304,7 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
     p.pick = (int32_t*) p.dev(1, ok);
     p.h_emb = p.host(R * E, ok); p.h_pe = p.host(E, ok); p.h_conf = p.host(1, ok);
     p.h_tok = (int32_t*) p.host(1, ok);
-    p.meta_h = (int32_t*) p.host(kDflyMaxLayers * 16, ok);
+    p.meta_h = (int32_t*) p.host(dfly2::kMaxLayers * 16, ok);
     if (!ok) {
         err = "out of memory for the drafter's scratch";
         return nullptr;
@@ -361,7 +361,7 @@ bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, i
         const int QW = 256;
         // the rows each layer attends: nctx of the target's (the cells its row selected, or every position before the anchor),
         // then the block's rows up to the query's own
-        int nctxs[kDflyMaxLayers];
+        int nctxs[dfly2::kMaxLayers];
         for (int i = 0; i < d.layers; ++i) {
             const int cnt = tap.count(i, row);
             nctxs[i] = cnt < 0 ? (int) pos : cnt;
@@ -500,7 +500,7 @@ bool DflyRunner::finish(int32_t* ids, float* conf, int& made, void* stream, std:
         chance = 1.0f / (1.0f + std::exp(-(*p.h_conf + p.bias)));
         return true;
     };
-    if (!dfly_draft_loop(p.n, p.anchor, step, ids, conf, made)) {
+    if (!dfly2::draft_loop(p.n, p.anchor, step, ids, conf, made)) {
         err = why.empty() ? "dfly: the heads failed" : why;
         return false;
     }
@@ -536,7 +536,7 @@ model::Result DflyHook::draft_begin(int32_t anchor, int64_t pos, int n, const st
     pending_ = 0;
     const int row = tap_->source_row(pos);
     if (row < 0 || pos + kDflyBlock > ctx_) return {};   // no hidden state to draft from (a prompt's end): the window goes plain
-    const void* caches[kDflyMaxLayers];
+    const void* caches[dfly2::kMaxLayers];
     for (int i = 0; i < w_->dims.layers; ++i) caches[i] = cache[(size_t) w_->dims.kv_layers[(size_t) i]];
     n = std::clamp(n, 1, kDflyDrafts);
     std::string err;

@@ -1,4 +1,5 @@
-// tests/program/grammar_guard_test.cpp - the pack vocabulary reader and the per-request window check (CPU only).
+// tests/program/grammar_guard_test.cpp - the pack vocabulary reader, the per-request window check and the drafts the
+// grammar forces (CPU only).
 #include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/guard.hpp"
 
@@ -51,6 +52,137 @@ static PackVocab load() {
     std::string err;
     CHECK(vocab_from_pack(kVocab, kTypes, 14, {8}, pv, err));
     return pv;
+}
+
+// a vocabulary for drafts: ids 0 { 1 } 2 {" 3 a" 4 : 5 1 6 <think> 7 </think> 8 <|im_end|> 9 "\n" 10 <tool_call>
+// 11 <function 12 =f 13 ">\n" 14 <parameter 15 =flag 16 true 17 "\n</" 18 parameter 19 function 20 </tool_call> 21 </
+// 22 hello 23 " 24 =
+static const char* kDraftVocab =
+    R"({"{": 0, "}": 1, "{\"": 2, "a\"": 3, ":": 4, "1": 5, "<think>": 6, "</think>": 7, "<|im_end|>": 8, "Ċ": 9, )"
+    R"("<tool_call>": 10, "<function": 11, "=f": 12, ">Ċ": 13, "<parameter": 14, "=flag": 15, "true": 16, )"
+    R"("Ċ</": 17, "parameter": 18, "function": 19, "</tool_call>": 20, "</": 21, "hello": 22, "\"": 23, "=": 24})";
+static const char* kDraftTypes = "[1, 1, 1, 1, 1, 1, 4, 4, 3, 1, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1]";
+
+static std::vector<int32_t> drafts(const Guard& g, int n) {
+    std::vector<int32_t> out = {-7};   // replaced, not appended to
+    g.draft(n, out);
+    return out;
+}
+
+// the guard's drafts pass its own scan (on a copy: asking for them leaves the guard where it was)
+static bool drafts_pass(const Guard& g, int n) {
+    const std::vector<int32_t> d = drafts(g, n);
+    Guard copy = g;
+    return (int) d.size() <= n && copy.scan(d.data(), (int) d.size(), 0) == -1;
+}
+
+// The drafts the grammar forces: where the guard gives them, where it gives none, and that it stays as it was.
+static void test_drafts() {
+    using Ids = std::vector<int32_t>;
+    PackVocab pv;
+    std::string err;
+    CHECK(vocab_from_pack(kDraftVocab, kDraftTypes, 26, {8}, pv, err));
+    const std::string schema = R"({"kind":"json_schema","schema":{"type":"object","properties":{"a":{"type":"boolean"}},)"
+                               R"("required":["a"],"additionalProperties":false}})";
+    {   // a JSON schema: the brace (a space may follow it, so not `{"`), then the key once its quote is written
+        Guard g(pv);
+        CHECK(drafts(g, 8).empty());                 // not begun: off
+        CHECK(g.begin(schema, nullptr, 0, err) && g.on());
+        CHECK(drafts(g, 8) == Ids{0} && drafts(g, 8) == Ids{0});
+        CHECK(drafts(g, 0).empty() && drafts(g, -1).empty());
+        CHECK(drafts_pass(g, 8) && g.windows() == 0);
+        const int32_t open[] = {2};
+        CHECK(g.scan(open, 1, 0) == -1);
+        CHECK(drafts(g, 8) == Ids{3} && drafts_pass(g, 8));
+        const int32_t key[] = {3, 4};                // the guard goes on from where it was, not from the drafts
+        CHECK(g.scan(key, 2, 0) == -1 && g.misses() == 0);
+        CHECK(drafts(g, 8).empty());                 // a space, true or false
+    }
+    {   // inside a thinking block the grammar waits, and so do its drafts
+        Guard g(pv);
+        const int64_t prompt[] = {22, 6};
+        CHECK(g.begin(schema, prompt, 2, err));
+        CHECK(drafts(g, 8).empty());
+        const int32_t think[] = {22, 7};
+        CHECK(g.scan(think, 2, 0) == -1 && drafts(g, 8) == Ids{0});
+    }
+    {   // tools: nothing before the trigger; behind it the call's layout up to the first value, and from the value on
+        Guard g(pv);
+        CHECK(g.begin(kTools, nullptr, 0, err) && g.on());
+        CHECK(drafts(g, 8).empty());
+        const int32_t text[] = {22, 9};
+        CHECK(g.scan(text, 2, 0) == -1 && drafts(g, 8).empty());
+        const int32_t call[] = {10};
+        CHECK(g.scan(call, 1, 0) == -1);
+        const Ids layout = {9, 11, 12, 13, 14, 15, 13};   // "\n<function=f>\n<parameter=flag>\n"
+        CHECK(drafts(g, 16) == layout && drafts(g, 7) == layout && drafts(g, 3) == Ids({9, 11, 12}));
+        CHECK(drafts_pass(g, 16) && drafts_pass(g, 3));
+        CHECK(g.scan(layout.data(), (int) layout.size(), 0) == -1);
+        CHECK(drafts(g, 16).empty());                // true or false
+        const int32_t value[] = {16, 17};            // the value, and the newline that ends it
+        CHECK(g.scan(value, 2, 0) == -1);
+        const Ids close = {18, 13, 21, 19, 13, 20};  // "parameter>\n</function>\n</tool_call>"
+        CHECK(drafts(g, 16) == close && drafts_pass(g, 16));
+        CHECK(g.scan(close.data(), (int) close.size(), 0) == -1);
+        CHECK(drafts(g, 16).empty());                // the reply may end, or call again
+        CHECK(g.misses() == 0);
+    }
+    {   // off: no drafts
+        Guard g(pv);
+        CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"f","parameters":{}}],"tool_choice":"none"})", nullptr, 0, err));
+        CHECK(!g.on() && drafts(g, 8).empty());
+    }
+    {   // a value that spells a tag of the reply: the drafts end before the tag
+        Guard g(pv);
+        CHECK(g.begin(R"({"kind":"json_schema","schema":{"const":"<think>"}})", nullptr, 0, err));
+        CHECK(drafts(g, 8) == Ids{23} && drafts_pass(g, 8));
+        const int32_t quote[] = {23};
+        CHECK(g.scan(quote, 1, 0) == -1 && drafts(g, 8).empty());
+    }
+    {   // a reply of blocks: drafts only inside the answer block, where the grammar holds
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"json_object"})", nullptr, 0, err));
+        CHECK(drafts(g, 8).empty());                 // a header comes first
+        const int32_t think[] = {5, 6, 10};
+        CHECK(g.scan(think, 3, 0) == -1 && drafts(g, 8).empty());
+        const int32_t next[] = {8, 5};
+        CHECK(g.scan(next, 2, 0) == -1 && drafts(g, 8).empty());   // a tag or the value's first text
+        const int32_t answer[] = {7};
+        CHECK(g.scan(answer, 1, 0) == -1 && drafts(g, 8) == Ids{0} && drafts_pass(g, 8));
+        const int32_t value[] = {0, 1};
+        CHECK(g.scan(value, 2, 0) == -1 && drafts(g, 8).empty());
+        const int32_t end[] = {8};
+        CHECK(g.scan(end, 1, 0) == -1 && drafts(g, 8).empty());   // answered: only the reply's end
+    }
+    {   // thinking off, a call that opens with the block's header: the token behind the header is the header rule's,
+        // so the drafts start one token later
+        ReplyForm rf;
+        rf.header = "<|message_model|>";
+        rf.think_open = "<|content_thinking|>";
+        rf.think_close = "<|end_message|>";
+        rf.answer_open = "<|content_text|>";
+        set_reply_form(rf);
+        PackVocab bv;
+        CHECK(vocab_from_pack(kBlockVocab, "[1, 1, 1, 1, 1, 4, 3, 3, 3, 3, 1, 4]", 12, {9}, bv, err));
+        set_reply_form(ReplyForm());
+        ToolForm tf;
+        tf.call_open = tf.trigger = "<|message_model|>";
+        tf.fn_mid = ":";
+        tf.call_close = "}";
+        tf.param_open = "<p=";
+        tf.param_mid_text = tf.param_mid_value = ">";
+        tf.param_close = tf.text_end = "</p>";
+        set_tool_form(tf);
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err) && g.on());
+        const int32_t header[] = {5};
+        CHECK(g.scan(header, 1, 0) == -1 && drafts(g, 8).empty());
+        const int32_t name[] = {10};
+        CHECK(g.scan(name, 1, 0) == -1 && drafts(g, 8) == Ids({3, 1}) && drafts_pass(g, 8));
+        set_test_tool_form();
+    }
 }
 
 // the refused row's draws: `tokens` are returned in turn (the last repeats); the masks they were drawn under are kept
@@ -391,6 +523,7 @@ int main() {
         Guard g(pv);
         CHECK(!g.begin("{", nullptr, 0, err));
     }
+    test_drafts();
     if (g_fail == 0) std::printf("grammar_guard_test: ok\n");
     return g_fail == 0 ? 0 : 1;
 }

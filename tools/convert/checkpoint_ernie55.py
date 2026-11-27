@@ -33,6 +33,7 @@ import numpy as np
 
 import checkpoint as C
 import model_sections as S
+from mxfp4 import mxfp4_rows
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -159,24 +160,6 @@ METHODS = {
 def scale_name_for(weight_name: str) -> str:
     """Block-FP8 companion scale name for `weight_name` (handles both `*.weight` and `linear_o_group_proj`)."""
     return weight_name + "_scale_inv"
-
-
-def mxfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    """Repack HF MXFP4 rows (codes [rows, cols // 2] uint8: value 2i in low nibble, 2i+1 in high nibble;
-    E8M0 scales [rows, cols // 32] uint8) into ggml MXFP4 (type 39): per 32 values, 1 E8M0 scale byte then
-    16 bytes whose low nibble is value j and high nibble is value j + 16."""
-    rows, half = codes.shape
-    cols = half * 2
-    if cols % 32 != 0 or scales.shape != (rows, cols // 32):
-        raise S.ConvertError(f"mxfp4_rows: shape mismatch codes={codes.shape} scales={scales.shape}")
-    v = np.empty((rows, cols), np.uint8)
-    v[:, 0::2] = codes & 0x0F
-    v[:, 1::2] = codes >> 4
-    v = v.reshape(rows, cols // 32, 2, 16)
-    out = np.empty((rows, cols // 32, 17), np.uint8)
-    out[..., 0] = scales
-    out[..., 1:] = v[:, :, 0, :] | (v[:, :, 1, :] << 4)
-    return out.reshape(-1)
 
 
 def mxfp4_dequant(raw: np.ndarray, cols: int) -> np.ndarray:

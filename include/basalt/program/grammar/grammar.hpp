@@ -3,8 +3,9 @@
 // Grammar::parse reads GBNF text (rules, literals, [] classes, groups, * + ? {m,n}, '.', comments, token references
 // <[id]> / !<[id]> / <name>). A GrammarState holds
 // the set of live parse stacks and answers: does this token's byte string keep the output inside the language
-// (allows), advance over it (accept), and which vocabulary entries are allowed next (fill_mask). A state is a small
-// value: copying it is the clone/rewind. Lazy states stay inactive, allowing everything, until a trigger string is seen
+// (allows), advance over it (accept), which vocabulary entries are allowed next (fill_mask), and which bytes can only
+// come next (forced, and forced_tokens for drafts of them). A state is a small value: copying it is the clone/rewind.
+// Lazy states stay inactive, allowing everything, until a trigger string is seen
 // or a trigger token is accepted or a trigger pattern (regex) matches; the trigger text itself is then fed to the grammar.
 //
 // The vocabulary comes from the caller as token id -> UTF-8 bytes (empty for tokens that never appear as text).
@@ -153,6 +154,18 @@ public:
     ///  false always walks the vocabulary.
     void fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool use_cache = true) const;
 
+    /// The bytes the grammar forces next: the longest string, at most `max_bytes` long, that every continuation of
+    /// the output starts with. It ends where a second byte is allowed, where the output may end, or where a token
+    /// reference may match, so it may stop inside a UTF-8 sequence whose first bytes alone are forced. Empty while
+    /// inactive or dead. The state is not changed. A grammar can force without end: `max_bytes` is what stops it.
+    std::string forced(size_t max_bytes) const;
+    /// Draft tokens that spell the start of forced(): at most `max_tokens`, each the longest vocabulary entry whose
+    /// bytes are forced whole after the ones before it (of entries with the same bytes, the highest id), until no
+    /// entry fits; none runs past the forced bytes. End tokens and entries without text are never among them, as in
+    /// fill_mask. The grammar allows every other split of the same bytes too, so these are drafts to verify, not the
+    /// tokens that must come. `out` is replaced; the state is not changed.
+    void forced_tokens(const Vocab& vocab, size_t max_tokens, std::vector<int32_t>& out) const;
+
     /// A copy to rewind to: the arena of interned stacks is shared, so this is cheap.
     GrammarState clone() const { return *this; }
     /// Back to the start (inactive again if there are triggers).
@@ -170,6 +183,7 @@ private:
     };
     bool feed(const std::string_view& bytes, int32_t& set_id, Utf8& u) const;
     bool advance(int32_t& set_id, Utf8& u, std::string_view bytes, int32_t token_id) const;
+    bool forced_byte(int32_t& set_id, Utf8& u, char& byte) const;
     int32_t root_set() const;
     bool fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes);
     void walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const;
