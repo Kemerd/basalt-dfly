@@ -74,22 +74,27 @@ A run drafts with one of them, chosen once at start. No flag selects it: the sta
 - **Context after a restore:** a conversation restored from RAM or disk starts with no drafter context; it fills as the turn
   is read and generated. A turn that continues or rewinds the live conversation keeps what still applies.
 - **Long prompts with `gpu-mode peer`:** a part read as a pipeline over the cards gives context from its last chunk only.
-- **Speed against the MTP:** even on code and structured output, 5-10% behind on prose and conversation. One RTX 5090 at 546 W, the expert tiers pinned, greedy, each mode
-  in a fresh engine, block / MTP / none alternated; an NVFP4 pack of a fine-tune of the model (the drafter was trained on
-  the original):
+- **Speed against the MTP:** 1-2% ahead on code and JSON, level on long structured output, 5-8% behind on prose and
+  conversation. One RTX 5090 at 546 W; an NVFP4 DQ6_K pack of a fine-tune of the model (the drafter was trained on the
+  original); `--kv int8 --resident-experts`, the expert tiers pinned at 9,000 slots; greedy, thinking off; each mode in a
+  fresh engine, block / MTP / none / none / MTP / block, the mean of two runs (each pair within 2.2%):
 
-  | text | none | MTP | block | block tokens per window (MTP) |
-  | --- | --- | --- | --- | --- |
-  | code (chat prompt, 578 tokens) | 67.8 tok/s | 96.4 | 96.6 | 3.80 (3.75) |
-  | JSON (chat prompt, 737 tokens) | 54.9 | 88.9 | 89.3 | 5.12 (5.46) |
-  | prose (chat prompt, 517 tokens) | 69.0 | 95.4 | 90.0 | 2.32 (2.46) |
-  | `basalt-bench` conv | 98.3 | 126.1 | 118.1 | 2.35 (2.41) |
-  | `basalt-bench` struct | 53.1 | 85.4 | 84.8 | 7.63 (7.76) |
-  | `basalt-bench` prose | 82.0 | 111.6 | 100.4 | 2.24 (2.37) |
+  | text | none | MTP | block | tokens per window, block (MTP) | drafts accepted, block (MTP) |
+  | --- | --- | --- | --- | --- | --- |
+  | code (chat prompt, 578 tokens) | 67.4 tok/s | 96.9 | 98.4 | 3.80 (3.75) | 83% (76%) |
+  | JSON (chat prompt, 737 tokens) | 54.7 | 88.7 | 89.6 | 5.12 (5.46) | 93% (86%) |
+  | prose (chat prompt, 517 tokens) | 68.8 | 96.1 | 90.9 | 2.32 (2.46) | 72% (70%) |
+  | `basalt-bench` conv | 98.5 | 126.3 | 119.5 | 2.35 (2.41) | 71% (69%) |
+  | `basalt-bench` struct | 53.1 | 85.4 | 84.7 | 7.63 (7.76) | 99% (98%) |
+  | `basalt-bench` prose | 82.1 | 110.9 | 101.7 | 2.24 (2.37) | 72% (72%) |
 
-  Its drafts are accepted more often than the MTP's (72-99% of those offered against 69-98%), but it offers fewer, and its
-  pass costs about 1.7 ms a window against the MTP's 0.5-0.9 ms. Compare on another pack by benchmarking it with the drafter
-  attached and again after `--roll-back`.
+  Its drafts are accepted more often, but it offers fewer, and its pass costs 1.7-1.8 ms a window against the MTP's
+  0.5-0.9 ms. At three drafts a window (`--spec 4`, the drafter's published setting) the two make about the same tokens
+  per window (code 3.19 against 3.11, prose 2.31 against 2.37, JSON 3.56 against 3.63), where the drafter's card reports
+  it 6-17% ahead of the MTP on the original model (FP8, sampled, thinking on); the fine-tune is one suspect, not
+  confirmed. Sampled at temperature 1.0, the block drafter made 2.27-5.34 tokens per window against the MTP's
+  2.29-5.71 on the same replies. Compare on another pack by benchmarking it with the drafter attached and again after
+  `--roll-back`.
 
 ## Teacher export
 

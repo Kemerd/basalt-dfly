@@ -176,10 +176,12 @@ at any width, and a rejected row leaves no trace.
   the token. A biased request accepts fewer drafts.
 - **Block drafter:** the same rule holds by construction: its drafts fill a window's later rows and the target checks each one.
   It adds one kernel after each of five layers to every window (the mean of the residual's streams, read only by the
-  drafter), which writes nothing a window reads. The figures above are the MTP's. With the block drafter the comparison
-  (`--spec 0` against the default, tiers pinned, tokens and logit rows) is not measured yet; the GPU test
-  `draft_identity_test` runs it (configure with `-DBASALT_DRAFT_IDENTITY_MODEL=PACK.basalt`). Its drafts are its best
-  path for sampled requests too.
+  drafter), which writes nothing a window reads. The figures above are the MTP's. With the block drafter, on the NVFP4
+  DQ6_K pack of a fine-tune of the model, tiers pinned: the GPU test `draft_identity_test` (configure with
+  `-DBASALT_DRAFT_IDENTITY_MODEL=PACK.basalt`) passes, six requests from a new conversation to a 16,647-token prompt,
+  303 of 413 drafts accepted, all 481 logit rows of the `--spec 0` session among the drafter session's; three greedy chat
+  replies (517 to 737 tokens) were `--spec 0`'s tokens in every run. Its drafts are its best path for sampled requests
+  too: at temperature 1.0 with a fixed seed, six replies were the same with the block drafter as with the MTP.
 
 ## Request grammar
 
