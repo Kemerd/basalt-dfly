@@ -27,7 +27,7 @@ NativeHead::~NativeHead() {
     if (weights_) cudaFree(weights_);
 }
 
-bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err) {
+bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err, int* type) {
     try {
         const basalt::GgufModel model(shards);
         const basalt::TensorInfo* tensor = model.find("output.weight");
@@ -39,6 +39,7 @@ bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& ou
                                                         (int) tensor->shape[1]);
         if (tensor->type == 14 && basalt::kernels::q6k_vhead_supported((int) tensor->shape[0], (int) tensor->shape[1], 1))
             out += basalt::kernels::q6k_vproxy_bytes((int64_t) tensor->shape[1]);
+        if (type != nullptr) *type = (int) tensor->type;
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();

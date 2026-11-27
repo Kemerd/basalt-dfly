@@ -25,8 +25,9 @@ public:
     /// Once the rows have landed: the forms some kernels read are made from them (a Q8_0 head's bit planes, a Q6_K
     /// head's 2-bit copy).
     bool finish(std::string& err);
-    /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
-    static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
+    /// The bytes `load` uploads for `output.weight`, from the GGUF headers only; `type`, when given, gets its ggml type,
+    /// which decides the head's kernels before the head is loaded.
+    static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err, int* type = nullptr);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     /// Rows [0, n) of the head rows at `w` (weights(), or a copy of a run of its rows on the stream's device) against
     /// T q8_1 columns of the head's input width: T rows of n logits in `y`, each the bits of the whole head's.  The
