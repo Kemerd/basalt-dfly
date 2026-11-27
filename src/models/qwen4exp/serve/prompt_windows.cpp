@@ -43,6 +43,8 @@ bool QfnRequest::read_windows(int64_t a, int64_t b, std::string& e) {
             return false;
         }
         if (!runtime_.ver.commit(T, e) || (runtime_.mtp_on && !runtime_.mtp.prefill(runtime_.ver.final_R_all(), nxt.data(), T, q, e))) return false;
+        // the block drafter's context of these rows, read from the window's kept rows before the next window writes them
+        if (runtime_.block.on() && (!runtime_.block.window_rows(T, q, e) || !runtime_.block.settle(e))) return false;
         q += T;
         runtime_.pp_reached = q;
     }

@@ -368,7 +368,10 @@ int sessions(Context& context) {
     // refuse the draft weights after mapping tens of GiB of host pages.
     basalt::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
-        if (o.spec < 2) o.mtp.clear();
+        if (o.spec < 2) {
+            o.mtp.clear();
+            o.draft_source = DraftSource::None;
+        }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (o.batch > 0) mtp.set_stores(o.batch, slot_cap);   // a draft K/V per batch slot
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
@@ -433,6 +436,19 @@ int sessions(Context& context) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    // The pack's block drafter, where the run drafts with it: like the head it is held before the expert cache is
+    // sized, its weights, its rings and its working memory, so the cache is sized around all of it.
+    serve::BlockDraft block;
+    if (o.draft_source == DraftSource::Block) {
+        if (!block.load(o.native_shards, g.n_layers, g.n_embd, n_vocab, *context.reads, err)) {
+            basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+        context.after->push_back([&block](std::string& e) {
+            const basalt::core::OnDevice on(0);
+            return block.finish(e);
+        });
+    }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
@@ -458,6 +474,7 @@ int sessions(Context& context) {
     context.grammar_vocab = &grammar_vocab;
     context.native_head = &native_head;
     context.mtp_head = &mtp_head;
+    context.block = &block;
     context.d_logits = &d_logits;
     return sources(context);
 }

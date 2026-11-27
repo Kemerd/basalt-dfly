@@ -7,6 +7,7 @@
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
+#include "block_draft.hpp"
 
 #include <functional>
 #include <optional>
@@ -67,6 +68,7 @@ struct Context {
     std::optional<basalt::program::grammar::PackVocab>& grammar_vocab;
     basalt::core::NativeHead& native_head;
     basalt::core::NativeHead& mtp_head;
+    BlockDraft& block;   ///< the pack's block drafter; on() when the run drafts with it
     basalt::core::FileExpertSource& src;
     basalt::core::ExpertSource*& srcp;
     basalt::core::ExpertCache& xcache;

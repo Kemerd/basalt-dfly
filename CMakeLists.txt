@@ -168,6 +168,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/prefill.cpp
   src/models/qwen4exp/load/decode.cpp
   src/models/qwen4exp/serve/batch.cpp
+  src/models/qwen4exp/serve/block_draft.cpp
   src/models/qwen4exp/serve/qfn_commands.cpp
   src/models/qwen4exp/serve/qfn_restore.cpp
   src/models/qwen4exp/serve/qfn_image.cpp
@@ -197,13 +198,18 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/qfn_run.cpp)
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec dflash window_gemm ${_gpu_runtime_target})
 if(BUILD_TESTING)
   # which --kv formats run with batch slots, and the refusal for the rest (host only)
   add_executable(qwen4exp_kv_batch_test tests/models/qwen4exp/cli/kv_batch_test.cpp)
   target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+  # which of a pack's drafters a run drafts with, and where each runs (host only)
+  add_executable(qwen4exp_draft_source_test tests/models/qwen4exp/draft_source_test.cpp)
+  target_include_directories(qwen4exp_draft_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(qwen4exp_draft_source_test PRIVATE warnings)
+  basalt_cpu_test(NAME qwen4exp_draft_source_test COMMAND qwen4exp_draft_source_test)
   # the teacher export's writer: pieces in, shards out, a restart and the settings file (host only)
   add_executable(qwen4exp_dfly2_shard_queue_test tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp
                  src/models/qwen4exp/load/dfly2_shard_queue.cpp)
@@ -383,7 +389,7 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
-if(BASALT_MODEL_QWEN35)
+if(BASALT_MODEL_QWEN35 OR BASALT_MODEL_QWEN4EXP)
 # What the DFlash 2 block drafters of the models share (src/dflash): the drafter's shape and tensors, and its context and
 # draft passes on the window gemm. meta.cpp and seq.cpp need no device: a CPU test lists one as a source.
 add_library(dflash STATIC src/dflash/meta.cpp src/dflash/seq.cpp src/dflash/forms.cpp src/dflash/context.cpp src/dflash/draft.cpp)
@@ -399,6 +405,9 @@ if(BUILD_TESTING)
   target_link_libraries(dflash_meta_test PRIVATE artifact)
   basalt_cpu_test(NAME dflash_meta_test COMMAND dflash_meta_test)
 endif()
+endif()
+
+if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
@@ -1041,6 +1050,16 @@ if(BASALT_BATCH_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/batch_spec_identity_test.py
                           $<TARGET_FILE:basalt> ${BASALT_BATCH_IDENTITY_MODEL} ${BASALT_BATCH_IDENTITY_ARGS})
   set_tests_properties(batch_spec_identity_test PROPERTIES TIMEOUT 1500)
+endif()
+
+# a Flash-Next pack's drafter changes no token and no logit row: `--serve` with the drafter against `--spec 0` over new,
+# continued, rewound, chunked and long prompts (configure with -DBASALT_DRAFT_IDENTITY_MODEL=/path/to/model.basalt and
+# -DBASALT_DRAFT_IDENTITY_ARGS=<engine args>: a fixed tier, `--expert-cache;N`, and `--drafter;block` to require that drafter)
+if(BASALT_MODEL_QWEN4EXP AND BASALT_DRAFT_IDENTITY_MODEL AND Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME draft_identity_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/draft_identity_test.py
+                          $<TARGET_FILE:basalt> ${BASALT_DRAFT_IDENTITY_MODEL} ${BASALT_DRAFT_IDENTITY_ARGS})
+  set_tests_properties(draft_identity_test PROPERTIES TIMEOUT 1800)
 endif()
 
 # a batch slot stopped by its client holds what the client saw, so the conversation continues without a re-read (same model

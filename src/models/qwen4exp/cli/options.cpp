@@ -34,7 +34,7 @@ std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
     // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
     // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
     // of a server on one card runs a round every window.  An explicit flag always wins.
-    if (!o.spec_given && !o.mtp.empty()) o.spec = 8;
+    if (!o.spec_given && o.draft_source != DraftSource::None) o.spec = 8;
     if (!o.prefill_given) {
         o.prefill_auto = o.prefill_auto_fit = true;
         o.prefill_auto_max = 32768;
@@ -156,9 +156,10 @@ bool normalize_speculation_options(Options& o) {
     if (no_spec) {
         o.spec = 1;   // one-token windows; the verifier is still sized for 2 or more tokens
         o.suffix_draft = 0;
+        o.draft_source = DraftSource::None;
         o.mtp.clear();
     }
-    // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
+    // Prompt lookup (the suffix drafter, on by default): the drafter keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer (at most the verifier width); the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
     // --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {

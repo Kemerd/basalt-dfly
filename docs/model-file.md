@@ -106,8 +106,8 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-NVFP4.basalt --check
 ## Flash-Next block drafter
 
 `--drafter` with `--into` adds a DFlash 2 block drafter
-([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)) to a Flash-Next pack that
-exists, as `--dspark` does: no other section moves, the MTP sections stay, and `--roll-back` restores the pack bit for bit.
+([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)) to a Flash-Next pack that exists, as `--dspark` does: no other section
+moves, the MTP sections stay, and `--roll-back` restores the pack bit for bit. The runs that draft with it: [drafting](models/qwen38-flash-next.md#drafting).
 
 ```sh
 python3 tools/convert/convert.py --drafter Qwen3.8-Flash-Next-DFlash2 --into PACK.basalt --undo-dir DIR

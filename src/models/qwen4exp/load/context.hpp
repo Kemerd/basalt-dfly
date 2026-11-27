@@ -80,6 +80,7 @@ struct Context {
     std::optional<basalt::program::grammar::PackVocab>* grammar_vocab = nullptr;
     basalt::core::NativeHead* native_head = nullptr;
     basalt::core::NativeHead* mtp_head = nullptr;
+    serve::BlockDraft* block = nullptr;   ///< the pack's block drafter, loaded when the run drafts with it
     float ** d_logits = nullptr;
     basalt::core::FileExpertSource* src = nullptr;
     basalt::core::ArenaExpertSource* arena_src = nullptr;

@@ -1,6 +1,7 @@
 // basalt/models/qwen4exp/options.hpp - Flash-Next's flags on top of the common ones.
 #pragma once
 
+#include "basalt/models/qwen4exp/draft_source.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/program/options.hpp"
 
@@ -82,7 +83,10 @@ struct Options : CommonOptions {
     int64_t relax_special_from = 248044;
     int64_t relax_call_open = 248058, relax_call_close = 248059;
     int spec_corrupt = 0;         // --spec-corrupt N > 0 replaces every Nth draft with a wrong token
-    /// Names the model's draft layer when it has one (the file); empty means no drafter.
+    /// The drafter this run's windows are filled by: decided once, when the pack is opened (run_engine), from what the
+    /// pack carries and how the run was asked for (choose_draft_source); None again when --spec turns drafting off.
+    DraftSource draft_source = DraftSource::None;
+    /// Names the model's draft layer (the file) when the run drafts with it; empty otherwise.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
@@ -116,7 +120,8 @@ struct Options : CommonOptions {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
-    /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
+    /// The drafter's own window cap, whichever drafter runs (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows
+    /// come from suffix matches.
     int mtp_max_t = 0;
     /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range

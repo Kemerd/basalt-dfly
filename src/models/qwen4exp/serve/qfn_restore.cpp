@@ -156,6 +156,8 @@ Flow QfnRequest::restore_image() {
         bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp,
                 runtime_.g, runtime_.mtp_kv, runtime_.err) == basalt::core::ConversationRestore::restored;
         if (restored && runtime_.mtp_on) runtime_.mtp.wrote(0, (int64_t) incoming->live.ids.size());
+        // the block drafter's rings are not part of an image: they hold nothing of the conversation now in the session
+        runtime_.block.forget();
         int failed_stage = -1;
         for (size_t i = 0; restored && i < runtime_.stages.size(); ++i) {   // the later stages' parts
             const basalt::core::OnDevice on(runtime_.stages[i]->dev);
@@ -228,6 +230,9 @@ void QfnRequest::draft_begin() {
         runtime_.mtp.set_prompt_len(n);
         runtime_.mtp.begin_request(ids.data(), (int64_t) ids.size());
     }
+    // the block drafter's context ends where this request goes on from: a rewind (a checkpoint, an edited turn) drops
+    // the rows past it, a new conversation all of them
+    runtime_.block.begin(resume, n);
 }
 
 void QfnRequest::prompt_parts_reset() {
