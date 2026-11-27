@@ -1401,37 +1401,71 @@ bool GrammarState::allows(std::string_view bytes, int32_t token_id) const {
     return copy.accept(bytes, token_id);
 }
 
+// The one byte that can follow `set_id` and `u`, which then advance over it. False, with both unchanged, where a second
+// byte is allowed, none is, the output may end, or a token reference may match.
+bool GrammarState::forced_byte(int32_t& set_id, Utf8& u, char& byte) const {
+    const Arena& a = *arena_;
+    // an end of the output here, or a token taken by its id, is a continuation no byte spells
+    if (set_id == 0 || a.set_has_token(set_id) || (u.n_remain == 0 && a.set_accepts(set_id))) return false;
+    // inside a character only its continuation bytes can follow; at its start, ASCII or a lead byte
+    const int lo = u.n_remain > 0 ? 0x80 : 0x00, hi = u.n_remain > 0 ? 0xBF : 0xF4;
+    int32_t only_set = 0;
+    Utf8 only_u;
+    int allowed = 0;
+    for (int b = lo; b <= hi && allowed < 2; ++b) {
+        const char c = (char) b;
+        int32_t s = set_id;
+        Utf8 v = u;
+        if (!feed(std::string_view(&c, 1), s, v)) continue;
+        ++allowed;
+        byte = c;
+        only_set = s;
+        only_u = v;
+    }
+    if (allowed != 1) return false;
+    set_id = only_set;
+    u = only_u;
+    return true;
+}
+
 std::string GrammarState::forced(size_t max_bytes) const {
     std::string out;
     if (!g_ || !arena_ || !active_) return out;
-    const Arena& a = *arena_;
     int32_t set = set_id_;
     Utf8 u = utf8_;
-    while (out.size() < max_bytes) {
-        // an end of the output here, or a token taken by its id, is a continuation no byte spells
-        if (set == 0 || a.set_has_token(set) || (u.n_remain == 0 && a.set_accepts(set))) break;
-        // inside a character only its continuation bytes can follow; at its start, ASCII or a lead byte
-        const int lo = u.n_remain > 0 ? 0x80 : 0x00, hi = u.n_remain > 0 ? 0xBF : 0xF4;
-        int32_t only_set = 0;
-        Utf8 only_u;
-        char only = 0;
-        int allowed = 0;
-        for (int b = lo; b <= hi && allowed < 2; ++b) {
-            const char c = (char) b;
-            int32_t s = set;
-            Utf8 v = u;
-            if (!feed(std::string_view(&c, 1), s, v)) continue;
-            ++allowed;
-            only = c;
-            only_set = s;
-            only_u = v;
-        }
-        if (allowed != 1) break;
-        out.push_back(only);
-        set = only_set;
-        u = only_u;
-    }
+    char byte = 0;
+    while (out.size() < max_bytes && forced_byte(set, u, byte)) out.push_back(byte);
     return out;
+}
+
+void GrammarState::forced_tokens(const Vocab& vocab, size_t max_tokens, std::vector<int32_t>& out) const {
+    out.clear();
+    if (!g_ || !arena_ || !active_) return;
+    const Vocab::Node* nodes = vocab.nodes_.data();
+    const size_t n_nodes = vocab.nodes_.size();
+    int32_t set = set_id_;   // where the drafts so far end
+    Utf8 u = utf8_;
+    while (out.size() < max_tokens) {
+        // down the trie along the forced bytes, as far as an entry goes; the deepest entry passed is the draft
+        int32_t walk_set = set, pick = -1;
+        Utf8 walk_u = u;
+        uint32_t node = 0;
+        char byte = 0;
+        while (node < n_nodes && forced_byte(walk_set, walk_u, byte)) {
+            // a node's children follow it in byte order, each one's subtree skipped in one step
+            const uint32_t end = nodes[node].skip, b = (unsigned char) byte;
+            uint32_t child = node + 1;
+            while (child < end && (nodes[child].depth_byte & 0xFFu) < b) child = nodes[child].skip;
+            if (child >= end || (nodes[child].depth_byte & 0xFFu) != b) break;
+            node = child;
+            if (nodes[node].first_token < 0) continue;
+            pick = nodes[node].first_token;
+            set = walk_set;
+            u = walk_u;
+        }
+        if (pick < 0) break;
+        out.push_back(pick);
+    }
 }
 
 void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const {

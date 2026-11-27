@@ -1,10 +1,11 @@
 // tests/program/grammar_test.cpp - GBNF parse, accept/reject, UTF-8 across tokens, clone/rewind, lazy triggers, the
-// vocabulary mask against a token-by-token check, and the forced continuation against its definition. Ends with a
-// timing line for allows() and fill_mask().
+// vocabulary mask against a token-by-token check, and the forced continuation and its draft tokens against their
+// definitions. Ends with a timing line for allows() and fill_mask().
 #include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/grammar.hpp"
 #include "basalt/program/grammar/schema.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -647,6 +648,173 @@ static void test_forced() {
     }
 }
 
+// A vocabulary for drafts: JSON and tool-call pieces of several lengths, whole and partial multi-byte characters, one
+// text under two ids, an end token that has text, and no entry at all for most single bytes.
+static Vocab draft_vocab() {
+    std::vector<std::string> v = {"{", "\"", "{\"", "name", "\":", "\": \"", "\": \"x", " ", "na", "me", "}", "\"}", "count",
+                                  "\n", "<tool_call>", "<", "function", "=", "f", ">", ">\n", "<function=", "parameter",
+                                  "<parameter=", "text", "</", "</parameter>", "</function>", "</tool_call>", "\n</", "ok",
+                                  ":", "/c>", "\xC3\xA9", "\xC3", "\xE4\xB8\xAD", "\xE4\xB8", "\xB8\xAD", "hi", "b", "a",
+                                  "x", ",", "-", "1", "2", "\\", "n", "na"};
+    const int32_t eos = (int32_t) v.size();
+    v.push_back("");                           // the end token
+    v.push_back("");                           // a special token
+    v.push_back("}");                          // an end token with text: never a draft
+    return Vocab(v, {eos, eos + 2});
+}
+
+// The ids of `texts`: of two entries with the same bytes the higher id, never an end token.
+static std::vector<int32_t> ids_of(const Vocab& voc, std::initializer_list<const char*> texts) {
+    std::vector<int32_t> out;
+    for (const char* text : texts) {
+        int32_t id = -1;
+        for (size_t t = 0; t < voc.size(); ++t) {
+            const auto& ends = voc.end_ids();
+            if (voc.bytes((int32_t) t) == text && std::find(ends.begin(), ends.end(), (int32_t) t) == ends.end()) id = (int32_t) t;
+        }
+        CHECK(id >= 0);
+        out.push_back(id);
+    }
+    return out;
+}
+
+static std::vector<int32_t> drafts(const GrammarState& s, const Vocab& voc, size_t max_tokens) {
+    std::vector<int32_t> out = {-7};           // replaced, not appended to
+    s.forced_tokens(voc, max_tokens, out);
+    return out;
+}
+
+// forced_tokens() by its definition, through forced() and a search of the whole vocabulary: entry after entry, the
+// longest one that is a prefix of the forced bytes left.
+static std::vector<int32_t> drafts_by_search(const GrammarState& s, const Vocab& voc, size_t max_tokens) {
+    std::vector<int32_t> out;
+    std::string rest = s.forced(4096);
+    const auto& ends = voc.end_ids();
+    while (out.size() < max_tokens) {
+        int32_t best = -1;
+        for (size_t t = 0; t < voc.size(); ++t) {
+            const std::string& b = voc.bytes((int32_t) t);
+            if (b.empty() || std::find(ends.begin(), ends.end(), (int32_t) t) != ends.end()) continue;
+            if (rest.compare(0, b.size(), b) != 0) continue;
+            if (best < 0 || b.size() >= voc.bytes(best).size()) best = (int32_t) t;
+        }
+        if (best < 0) break;
+        out.push_back(best);
+        rest.erase(0, voc.bytes(best).size());
+    }
+    return out;
+}
+
+// The drafts at `s` are what the definition gives, spell a prefix of the forced bytes, and are accepted in turn.
+static void check_drafts(const GrammarState& s, const Vocab& voc, size_t max_tokens) {
+    const GrammarState before = s.clone();
+    const std::vector<int32_t> d = drafts(s, voc, max_tokens);
+    CHECK(same_state(s, before));
+    CHECK(d.size() <= max_tokens && d == drafts_by_search(s, voc, max_tokens));
+    GrammarState fed = s.clone();
+    std::string spelled;
+    for (int32_t t : d) {
+        CHECK(t >= 0 && (size_t) t < voc.size() && !voc.bytes(t).empty());
+        if (t < 0 || (size_t) t >= voc.size()) return;
+        CHECK(fed.accept(voc.bytes(t), t));
+        spelled += voc.bytes(t);
+    }
+    CHECK(s.forced(spelled.size()) == spelled);
+}
+
+// Draft tokens for the forced continuation: the longest entries, the bounds, the stops and the states that force none.
+static void test_forced_tokens() {
+    const Vocab voc = draft_vocab();
+    // a literal run: the longest entry at each step, none past the run's end (`": "x` is allowed there, not forced)
+    auto lit = parse("root ::= \"{\\\"name\\\": \\\"\" [a-z]+ \"\\\"}\"");
+    {
+        GrammarState s(lit);
+        CHECK(drafts(s, voc, 8) == ids_of(voc, {"{\"", "name", "\": \""}));
+        CHECK(s.allows("{\"name\": \"x"));
+        CHECK(drafts(s, voc, 2) == ids_of(voc, {"{\"", "name"}) && drafts(s, voc, 1) == ids_of(voc, {"{\""}));
+        CHECK(drafts(s, voc, 0).empty());
+        CHECK(drafts(after(lit, "{\"nam"), voc, 8).empty());               // `e": "`: no entry starts it
+        CHECK(drafts(after(lit, "{\"n"), voc, 8) == ids_of(voc, {"a", "me", "\": \""}));
+        CHECK(drafts(after(lit, "{\"name\": \"ab"), voc, 8).empty());      // a choice
+        // the brace that ends the output has two ids: the end token is not the one drafted
+        CHECK(drafts(after(lit, "{\"name\": \"ab\""), voc, 8) == ids_of(voc, {"}"}));
+        CHECK(drafts(after(lit, "{\"name\": \"ab\"}"), voc, 8).empty());   // complete
+        CHECK(drafts(GrammarState(), voc, 8).empty());                     // no grammar
+        for (size_t n = 0; n <= 4; ++n) check_drafts(s, voc, n);
+    }
+    // a run that stops at a choice: the entry may not reach past the shared prefix (`na`, of two ids the higher)
+    auto alt = parse("root ::= \"{\\\"\" (\"name\" | \"nail\") \"\\\"}\"");
+    CHECK(drafts(GrammarState(alt), voc, 8) == ids_of(voc, {"{\"", "na"}));
+    CHECK(drafts(after(alt, "{\"nam"), voc, 8).empty());                   // `e"}`: no entry for `e`
+    CHECK(drafts(after(alt, "{\"name"), voc, 8) == ids_of(voc, {"\"}"}));
+    // where the output may end nothing is drafted
+    auto tail = parse("root ::= \"{\" \"}\"*");
+    CHECK(drafts(GrammarState(tail), voc, 8) == ids_of(voc, {"{"}) && drafts(after(tail, "{"), voc, 8).empty());
+    // a step without an entry ends the drafts there
+    auto gap = parse("root ::= \"{\\\"q\\\": 1}\"");
+    CHECK(drafts(GrammarState(gap), voc, 8) == ids_of(voc, {"{\""}) && drafts(after(gap, "{\""), voc, 8).empty());
+    // classes of one character are forced like literals
+    auto cls = parse("root ::= [n] [a] \"me\" [\":] [^x]");
+    CHECK(drafts(GrammarState(cls), voc, 8) == ids_of(voc, {"name"}));
+    // multi-byte characters: whole ones, the first byte two characters share, and the rest of one half read
+    auto utf = parse("root ::= \"\xC3\xA9\xE4\xB8\xAD\" [\xC3\xA9\xC3\xA8] \"x\"");
+    {
+        GrammarState s(utf);
+        CHECK(drafts(s, voc, 8) == ids_of(voc, {"\xC3\xA9", "\xE4\xB8\xAD", "\xC3"}));
+        CHECK(s.accept("\xC3\xA9\xE4") && drafts(s, voc, 8) == ids_of(voc, {"\xB8\xAD", "\xC3"}));
+        check_drafts(s, voc, 8);
+        CHECK(s.accept("\xB8") && drafts(s, voc, 8).empty());              // no entry starts with the last byte
+        CHECK(s.accept("\xAD\xC3") && drafts(s, voc, 8).empty());          // a choice inside the character
+        CHECK(s.accept("\xA8") && drafts(s, voc, 8) == ids_of(voc, {"x"}));
+    }
+    // a token reference is not spelled by bytes
+    auto ref = parse("root ::= \"{\" <[300]> \"}\"");
+    CHECK(drafts(GrammarState(ref), voc, 8) == ids_of(voc, {"{"}) && drafts(after(ref, "{"), voc, 8).empty());
+    // a lazy grammar: nothing before its trigger, the run behind it, nothing once complete
+    auto call = parse("root ::= \"<c>\" \"ok:\" [a-z]+ \"</c>\"");
+    {
+        Triggers tr;
+        tr.words = {"<c>"};
+        GrammarState s(call, tr);
+        CHECK(drafts(s, voc, 8).empty() && s.accept("text <") && drafts(s, voc, 8).empty() && !s.active());
+        CHECK(s.accept("c>") && s.active() && drafts(s, voc, 8) == ids_of(voc, {"ok", ":"}));
+        check_drafts(s, voc, 8);
+        CHECK(s.accept("ok:b<") && drafts(s, voc, 8) == ids_of(voc, {"/c>"}));
+        CHECK(s.accept("/c>") && !s.active() && drafts(s, voc, 8).empty());
+    }
+    // a grammar that forces without end gives as many drafts as asked
+    auto loop = parse("root ::= \"na\" \"me\" root");
+    CHECK(drafts(GrammarState(loop), voc, 5) == ids_of(voc, {"name", "name", "name", "name", "name"}));
+    // an empty vocabulary has no drafts
+    CHECK(drafts(GrammarState(lit), Vocab({}, {}), 8).empty());
+    // a JSON schema and a tool call: at every prefix of a sentence, the drafts the definition gives
+    std::string err;
+    auto schema = Grammar::parse(json_schema_to_gbnf(R"({"type":"object","properties":{"name":{"type":"string"},)"
+                                                     R"("count":{"type":"integer"}},"required":["name","count"],)"
+                                                     R"("additionalProperties":false})", err), err);
+    auto tools = Grammar::parse(tool_call_gbnf(R"([{"name":"f","parameters":{"properties":{"text":{"type":"string"}},"required":["text"]}}])", {}, err), err);
+    CHECK(schema && tools);
+    if (!schema || !tools) return;
+    CHECK(drafts(GrammarState(schema), voc, 8) == ids_of(voc, {"{"}));   // not `{"`: a space may come first
+    CHECK(drafts(after(schema, "{\""), voc, 8) == ids_of(voc, {"name", "\""}));
+    CHECK(drafts(after(schema, "{\"name\": \"a\", \""), voc, 8) == ids_of(voc, {"count", "\""}));
+    CHECK(drafts(GrammarState(tools), voc, 8) ==
+          ids_of(voc, {"<tool_call>", "\n", "<function=", "f", ">\n", "<parameter=", "text", ">\n"}));
+    CHECK(drafts(GrammarState(tools), voc, 3) == ids_of(voc, {"<tool_call>", "\n", "<function="}));
+    const struct { std::shared_ptr<const Grammar> g; std::string text; } sentences[] = {
+        {schema, "{\"name\": \"a\\n\xC3\xA9\",\n  \"count\": -12}"},
+        {tools, "<tool_call>\n<function=f>\n<parameter=text>\nhi <b>\n</parameter>\n</function>\n</tool_call>"},
+    };
+    for (const auto& c : sentences) {
+        CHECK(full(c.g, c.text));
+        GrammarState s(c.g);
+        for (size_t i = 0; i <= c.text.size(); ++i) {
+            for (size_t n : {(size_t) 1, (size_t) 3, (size_t) 8}) check_drafts(s, voc, n);
+            if (i < c.text.size()) CHECK(s.accept(std::string_view(&c.text[i], 1)));
+        }
+    }
+}
+
 static double now_us() {
     using namespace std::chrono;
     return (double) duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1000.0;
@@ -764,6 +932,7 @@ int main() {
     test_patterns();
     test_partial_utf8();
     test_forced();
+    test_forced_tokens();
     if (std::getenv("BASALT_GRAMMAR_BENCH")) bench();
     if (g_fail) { std::printf("grammar_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_test: ok\n");
