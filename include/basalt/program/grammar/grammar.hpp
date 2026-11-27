@@ -4,7 +4,8 @@
 // <[id]> / !<[id]> / <name>). A GrammarState holds
 // the set of live parse stacks and answers: does this token's byte string keep the output inside the language
 // (allows), advance over it (accept), which vocabulary entries are allowed next (fill_mask), and which bytes can only
-// come next (forced, and forced_tokens for drafts of them). A state is a small value: copying it is the clone/rewind. Lazy states stay inactive, allowing everything, until a trigger string is seen
+// come next (forced, and forced_tokens for drafts of them). A state is a small value: copying it is the clone/rewind.
+// Lazy states stay inactive, allowing everything, until a trigger string is seen
 // or a trigger token is accepted or a trigger pattern (regex) matches; the trigger text itself is then fed to the grammar.
 //
 // The vocabulary comes from the caller as token id -> UTF-8 bytes (empty for tokens that never appear as text).
