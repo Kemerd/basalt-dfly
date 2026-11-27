@@ -203,15 +203,20 @@ endif()
 endif()
 
 # What the DFly2 drafters of the models share (src/dfly2). record.cpp needs no device: a CPU test lists it as a source
-# and links `core` alone.
-if(BASALT_MODEL_HY4FLASH OR BASALT_MODEL_DEEPSEEK41)
-add_library(dfly2 STATIC src/dfly2/record.cpp)
-target_include_directories(dfly2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(dfly2 PUBLIC core)
+# and links `core` alone. The device steps (ops.cpp, kernels.cu) are chains of the shared kernels.
+if(BASALT_MODEL_HY4FLASH OR BASALT_MODEL_DEEPSEEK41 OR BASALT_MODEL_QWEN4EXP)
+add_library(dfly2 STATIC src/dfly2/record.cpp src/dfly2/ops.cpp src/dfly2/kernels.cu)
+target_include_directories(dfly2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dfly2 PUBLIC kernels core ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(dfly2_record_test tests/dfly2/record_test.cpp src/dfly2/record.cpp)
   target_link_libraries(dfly2_record_test PRIVATE core)
   basalt_cpu_test(NAME dfly2_record_test COMMAND dfly2_record_test)
+  # the shared device steps against a CPU double reference (GPU, synthetic, no model)
+  add_executable(dfly2_ops_parity tests/dfly2/ops_parity.cpp)
+  target_include_directories(dfly2_ops_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(dfly2_ops_parity PRIVATE dfly2 kernels core ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dfly2_ops_parity COMMAND dfly2_ops_parity)
 endif()
 endif()
 
