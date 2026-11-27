@@ -160,11 +160,29 @@ int QfnRuntime::init_verify() {
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
     // the block drafter reads each window's rows after its target layers: the windows keep their stream means
     if (block.on()) ver.keep_stream_means(block.target_layers());
-    if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
+    // the DFly2 drafter reads each window's head rows and its paired layers' selections: the windows keep those
+    if (dfly.loaded()) ver.keep_selections(dfly.dims().target_layers);
+    const int win_t = std::max({o.spec, o.batch, 2});
+    if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, win_t, err) ||
         (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err)) ||
         (block.on() && !block.bind(&native_head, ver, err))) {
         basalt::log::error("basalt serve", "%s", err.c_str());
         return 1;
+    }
+    if (dfly.loaded()) {
+        // bound to the window's kept rows at their fixed addresses (the graph is captured here), with the solo session's
+        // paired layers as its one sequence
+        const int layers = dfly.dims().layers;
+        std::vector<const int32_t*> sel((size_t) layers);
+        for (int k = 0; k < layers; ++k) sel[(size_t) k] = ver.selection(k);
+        std::vector<basalt::kernels::QsaAttnPools> pools((size_t) layers);
+        const basalt::core::OnDevice on(0);
+        if (!dfly.bind(wt, &native_head, ver.head_rows(), sel.data(), ver.selection_cap(), win_t, err) ||
+            !basalt::core::dfly_session_pools(ss, g, dfly.dims(), dfly.kv_int8(), pools.data(), err) ||
+            (dfly_seq = dfly.add_sequence(pools.data(), err)) < 0) {
+            basalt::log::error("basalt serve", "the DFly2 drafter: %s", err.c_str());
+            return 1;
+        }
     }
     if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
         basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());

@@ -18,6 +18,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     std::string& ppl_out = o.ppl_out;
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
+    DraftRun draft_run;   // what of the run decides its drafter (model() confirms a DFly2 choice once the rope is known)
     {
         std::string merr;
         if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
@@ -31,8 +32,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");
         }
         // the drafter this run's windows are filled by, of those the pack carries: decided here, once (a teacher export
-        // runs none)
-        const DraftRun draft_run{o.serve, o.batch, o.gpus.mode == basalt::program::GpuMode::Split, !o.dfly2_export.empty()};
+        // runs none). DFly2 is taken only where asked for, until its speed is measured against the others
+        draft_run = DraftRun{o.serve, o.batch, o.gpus.mode == basalt::program::GpuMode::Split, !o.dfly2_export.empty(),
+                             basalt::core::exp_flag("dfly2", 0) != 0};
         o.draft_source = choose_draft_source(draft_pack(model_file), draft_run);
         if (o.draft_source == DraftSource::Mtp) o.mtp = o.model;
         // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
@@ -279,6 +281,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     context.pipe_want = &pipe_want;
     context.kPairMibLater = &kPairMibLater;
     context.no_spec = &no_spec;
+    context.draft_run = &draft_run;
     context.rope_cfg = &rope_cfg;
     context.err = &err;
     context.main_link_gbps = &main_link_gbps;

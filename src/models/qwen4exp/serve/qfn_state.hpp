@@ -288,6 +288,7 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    int dfly_seq{-1};   // the solo session's sequence in the DFly2 drafter
     // --diag-fixed-experts: the windows' residency tables, no expert in VRAM (the host's, and one per card), so the CPU
     // pool computes every row of a window whatever the cards hold
     std::vector<int32_t> fixed_res{};

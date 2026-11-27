@@ -31,6 +31,10 @@ struct Context {
     const bool* pipe_want = nullptr;
     const int* kPairMibLater = nullptr;
     const bool* no_spec = nullptr;
+    const DraftRun* draft_run = nullptr;   ///< what of the run decided its drafter
+    /// The pack's DFly2 drafter, read and checked where the run drafts with it (o.draft_source Dfly)
+    basalt::core::DflyPack* dfly_pack = nullptr;
+    int dfly_rows = 0;   ///< rows of its blocks: the anchor and its drafts
     basalt::kernels::RopeScaling* rope_cfg = nullptr;
     std::string* err = nullptr;
     double* main_link_gbps = nullptr;
@@ -81,6 +85,7 @@ struct Context {
     basalt::core::NativeHead* native_head = nullptr;
     basalt::core::NativeHead* mtp_head = nullptr;
     serve::BlockDraft* block = nullptr;   ///< the pack's block drafter, loaded when the run drafts with it
+    basalt::core::DflyDrafter* dfly = nullptr;   ///< the pack's DFly2 drafter, loaded when the run drafts with it
     float ** d_logits = nullptr;
     basalt::core::FileExpertSource* src = nullptr;
     basalt::core::ArenaExpertSource* arena_src = nullptr;

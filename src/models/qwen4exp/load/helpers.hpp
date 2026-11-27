@@ -63,6 +63,13 @@ int refill_lent(Context& context, const LentSlots& lent, double& ms);
 /// exit code once the failure is logged.
 int window_init(Context& context, basalt::core::Verifier& ver, int max_t);
 
+/// The DFly2 drafter where the run chose it (o.draft_source Dfly), once the rotary configuration `rope` is resolved:
+/// reads the record of `file` into `pack` and the rows of its blocks into `rows`, and checks the drafter against the
+/// start. A start that cannot run it says why in one warning and takes the pack's next drafter (`pack` stays empty).
+/// False with `err` for a record the drafter does not run, or when no drafter is left for the windows --spec asks for.
+bool dfly_confirm(Options& o, const basalt::core::ModelFile& file, const DraftRun& run,
+                  const basalt::kernels::RopeScaling& rope, basalt::core::DflyPack& pack, int& rows, std::string& err);
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves

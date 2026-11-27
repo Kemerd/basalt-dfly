@@ -72,6 +72,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
+#include "basalt/models/qwen4exp/decode/dfly.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/native_dense.hpp"

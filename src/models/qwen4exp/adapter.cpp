@@ -78,6 +78,7 @@ DraftPack draft_pack(const core::ModelFile& file) {
     DraftPack pack;
     pack.mtp = !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty();
     pack.block = file.find(kBlockDrafterSection) != nullptr;
+    pack.dfly = file.find(kDflyDrafterSection) != nullptr;
     return pack;
 }
 

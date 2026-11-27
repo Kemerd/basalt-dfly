@@ -29,6 +29,14 @@ Flow QfnRequest::complete_begin() {
                      runtime_.drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
                                                      " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                      " ms/window for it)").c_str());
+        // the DFly2 drafter's blocks: those drafted, the host time from a block's launch to its drafts, and those the
+        // window gave no source row for
+        if (runtime_.dfly.loaded()) {
+            const int64_t nb = runtime_.dfly.rounds - dfly0_rounds;
+            basalt::log::info("basalt decode timing", "DFly2: %lld blocks, %.3f ms/block, %lld not drafted (no source row)",
+                              (long long) nb, nb > 0 ? (runtime_.dfly.ms_draft - dfly0_ms) / (double) nb : 0.0,
+                              (long long) (runtime_.dfly.skipped - dfly0_skipped));
+        }
         const std::string evr = basalt::core::decode_events().report();
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
         const std::string pr = runtime_.ver.profile_report();

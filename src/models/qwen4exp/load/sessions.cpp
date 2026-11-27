@@ -449,6 +449,14 @@ int sessions(Context& context) {
             return block.finish(e);
         });
     }
+    // The pack's DFly2 drafter, where the run drafts with it: its weights and working memory before the expert cache is
+    // sized too.  Its head copy is made at bind, out of the reserve (cache_size).
+    basalt::core::DflyDrafter dfly;
+    if (o.draft_source == DraftSource::Dfly &&
+        !dfly.load(*context.dfly_pack, o.model, context.dfly_rows, o.kv == "int8", *context.reads, err)) {
+        basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
+        return 1;
+    }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
@@ -475,6 +483,7 @@ int sessions(Context& context) {
     context.native_head = &native_head;
     context.mtp_head = &mtp_head;
     context.block = &block;
+    context.dfly = &dfly;
     context.d_logits = &d_logits;
     return sources(context);
 }

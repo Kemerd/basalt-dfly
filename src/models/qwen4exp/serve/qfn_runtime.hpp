@@ -7,6 +7,7 @@
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
+#include "basalt/models/qwen4exp/decode/dfly.hpp"
 #include "block_draft.hpp"
 
 #include <functional>
@@ -69,6 +70,7 @@ struct Context {
     basalt::core::NativeHead& native_head;
     basalt::core::NativeHead& mtp_head;
     BlockDraft& block;   ///< the pack's block drafter; on() when the run drafts with it
+    basalt::core::DflyDrafter& dfly;   ///< the pack's DFly2 drafter; loaded() when the run drafts with it
     basalt::core::FileExpertSource& src;
     basalt::core::ExpertSource*& srcp;
     basalt::core::ExpertCache& xcache;

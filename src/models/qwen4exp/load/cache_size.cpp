@@ -79,8 +79,11 @@ int cache_size(Context& context) {
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // the draft layer's head and logits are allocated when it binds, after this, so they come out of the reserve
         const basalt::core::NativeHead& draft_head = multi_gpu ? mtp_head : native_head;
+        // (the DFly2 drafter's copy of the head is made at its bind too)
         const int64_t mtp_bind = (!o.mtp.empty() && draft_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), draft_head.type(), n_vocab) : 0;
+                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), draft_head.type(), n_vocab)
+                                     : (context.dfly->loaded() && native_head.loaded())
+                                           ? (int64_t) basalt::core::DflyDrafter::bind_bytes(native_head.type(), n_vocab) : 0;
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;

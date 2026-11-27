@@ -41,6 +41,13 @@ int model(Context& context) {
         }
         basalt::kernels::rope_scaling_set(rope_cfg);
     }
+    // the DFly2 drafter, where the run chose it: checked once the rope is known, before anything is planned or loaded
+    basalt::core::DflyPack dfly_pack;
+    int dfly_rows = 0;
+    if (!dfly_confirm(o, *context.model_file, *context.draft_run, rope_cfg, dfly_pack, dfly_rows, err))
+        return fatal_start_error(o.model + ": " + err);
+    context.dfly_pack = &dfly_pack;
+    context.dfly_rows = dfly_rows;
     basalt::core::LoadPlan reads;
     std::vector<std::function<bool(std::string&)>> after;
     basalt::core::Loader loader;

@@ -84,6 +84,9 @@ void QfnRequest::decode_stats_begin() {
     dt_run = 0;
     dt_commit = 0;
     dt_draft = 0;
+    dfly0_rounds = runtime_.dfly.rounds;
+    dfly0_skipped = runtime_.dfly.skipped;
+    dfly0_ms = runtime_.dfly.ms_draft;
     dec_windows = 0;
     dec_T = 0;
     decode_hits0 = runtime_.drive.d.cache_hits;
@@ -112,7 +115,7 @@ void QfnRequest::decode_stats_begin() {
 
 inline int QfnRequest::draft_window() {
     // a block's drafts each state a chance: the window with the most expected tokens for its cost, within the cap
-    if (runtime_.block.on())
+    if (drafts_blocks(runtime_.o.draft_source))
         return std::min(runtime_.policy->window(dprob.data(), std::min(n_block, runtime_.S_mtp - 1)), runtime_.S_mtp);
     int T = 1;
         if (held.on) T = held.T;
@@ -125,7 +128,7 @@ inline void QfnRequest::lookup_window(int& T, bool& from_sfx, int& sfx_match) {
         if (runtime_.o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
             const int k = runtime_.sfx->propose(runtime_.S - 1, sbuf.data());
             sfx_match = runtime_.sfx->last_match();
-            if (runtime_.block.on()) {   // against the block's own window, priced from its chances
+            if (drafts_blocks(runtime_.o.draft_source)) {   // against the block's own window, priced from its chances
                 if (k > 0 && n_block > 0 && sbuf[0] == drafts[0]) {
                     const basalt::spec::DraftPolicy::Pick pk =
                         runtime_.policy->choose_window(dprob.data(), std::min(n_block, runtime_.S_mtp - 1), k, sfx_match);
@@ -401,7 +404,7 @@ inline bool QfnRequest::after_accept(int T, int& a, int e0, bool from_sfx, bool 
 
 inline void QfnRequest::note_draft_probs(bool from_sfx) {
     wprob_n = std::min(runtime_.S_mtp, 16);
-    if (runtime_.block.on())
+    if (drafts_blocks(runtime_.o.draft_source))
         for (int i = 0; i < basalt::spec::DraftPolicy::kMaxT; ++i) wchance[i] = i < n_block ? dprob[(size_t) i] : 0.0f;
     if (draft_log != nullptr)
         for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
@@ -423,6 +426,13 @@ inline bool QfnRequest::draft_block(bool will_draft, After& after_launch) {
     if (!will_draft || ppl != nullptr) return block.settle(runtime_.err);   // the rows are read before the next window writes them
     const int32_t anchor = outv[(size_t) kept_rows - 1];
     if (!block.draft_launch(anchor, p + kept_rows, runtime_.err)) return false;
+    prefetch_anchor_ple(anchor);
+    after_launch();
+    const int most = std::min({runtime_.S_mtp - 1, (int) drafts.size(), (int) dprob.size()});
+    return block.draft_read(drafts.data(), dprob.data(), most, n_block, runtime_.err);
+}
+
+inline void QfnRequest::prefetch_anchor_ple(int32_t anchor) {
     // the next window's first row is the anchor: its PLE rows are read while the block runs, and the window collects them
     basalt::core::SessionState& ss = runtime_.ss;
     if (ss.ple.ready() && ss.ple.table != nullptr) {
@@ -430,9 +440,40 @@ inline bool QfnRequest::draft_block(bool will_draft, After& after_launch) {
         basalt::kernels::ngram_rows(&anchor, ss.ple_prev, 1, ss.ple.consts, rows16);
         ss.ple.table->prefetch_rows(rows16);
     }
+}
+
+// The DFly2 drafter's round.  The block reads what the window left: the head row of the last kept row and its paired
+// layers' selections, and the session's K/V at those cells.  It is queued behind the window, the commit and the tokens
+// go out while it runs, and its drafts are read before the next window.
+template <class After>
+inline bool QfnRequest::draft_dfly(bool will_draft, After& after_launch) {
+    basalt::core::DflyDrafter& dfly = runtime_.dfly;
+    n_block = 0;
+    if (kept_rows < 1 || kept_rows > (int) outv.size()) {
+        runtime_.err = "DFly2 drafter: a window that kept " + std::to_string(kept_rows) + " rows";
+        return false;
+    }
+    // a quality gate forces every window, and a block past the context has no window to fill: no block
+    const int64_t pos = p + kept_rows;
+    if (!will_draft || ppl != nullptr || pos + dfly.rows() > runtime_.o.max_context) return true;
+    const int32_t anchor = outv[(size_t) kept_rows - 1];
+    bool queued = false;
+    if (!dfly.draft(runtime_.dfly_seq, anchor, pos, runtime_.ver.last_pos0(), 0, runtime_.ver.last_rows(), queued,
+                    runtime_.err))
+        return false;
+    // the window did not hold the row before the anchor: this round has no drafts
+    if (!queued) return true;
+    prefetch_anchor_ple(anchor);
     after_launch();
-    const int most = std::min({runtime_.S_mtp - 1, (int) drafts.size(), (int) dprob.size()});
-    return block.draft_read(drafts.data(), dprob.data(), most, n_block, runtime_.err);
+    if (!dfly.wait(runtime_.err)) return false;
+    // drafts() ids and their chances, within the drafter's window cap
+    if ((int) drafts.size() < dfly.drafts() || (int) dprob.size() < dfly.drafts()) {
+        runtime_.err = "DFly2 drafter: a block of " + std::to_string(dfly.drafts()) + " drafts outgrows the window";
+        return false;
+    }
+    dfly.read(runtime_.dfly_seq, drafts.data(), dprob.data());
+    n_block = std::min(dfly.drafts(), runtime_.S_mtp - 1);
+    return true;
 }
 
 template <class After>
@@ -441,6 +482,10 @@ inline bool QfnRequest::draft_next(int T, int a, int e0, int TB, bool from_sfx, 
     if (runtime_.block.on()) {
         draft_failed = false;
         return draft_block(will_draft, after_launch);
+    }
+    if (runtime_.dfly.loaded()) {
+        draft_failed = false;
+        return draft_dfly(will_draft, after_launch);
     }
     if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
     runtime_.mtp.set_cum_th(cum_adapt.th());

@@ -1,6 +1,8 @@
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "models/qwen4exp/adapter.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -182,5 +184,70 @@ int window_init(Context& context, basalt::core::Verifier& ver, int max_t) {
     return 0;
 }
 
+
+bool dfly_confirm(Options& o, const basalt::core::ModelFile& file, const DraftRun& run,
+                  const basalt::kernels::RopeScaling& rope, basalt::core::DflyPack& pack, int& rows, std::string& err) {
+    namespace bk = basalt::kernels;
+    rows = 0;
+    pack = basalt::core::DflyPack{};
+    if (o.draft_source != DraftSource::Dfly) return true;
+    // the target's head: its type decides the two-stage pick, its rows the vocabulary the record is checked against
+    uint64_t head_bytes = 0;
+    int head_type = -1;
+    if (!basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err, &head_type)) return false;
+    int64_t n_vocab = 0;
+    try {
+        const basalt::GgufModel model(o.native_shards);
+        const basalt::TensorInfo* wo = model.find("output.weight");
+        if (wo == nullptr || wo->shape.size() != 2) {
+            err = "the pack has no output.weight matrix";
+            return false;
+        }
+        n_vocab = (int64_t) wo->shape[1];
+    } catch (const std::exception& e) {
+        err = std::string("the pack's tensors: ") + e.what();
+        return false;
+    }
+    // a record that is not this target's is an error, not a reason to pass the drafter over
+    const bk::QsaShapes s = bk::qsa_real_shapes();
+    const basalt::core::DflyTarget target{n_vocab, (int) bk::qsa_selection_width(bk::kTopkMaxCells, s), (int) s.n_rot};
+    if (!basalt::core::dfly_read_pack(file, basalt::core::ModelGeometry{}, target, pack, err)) return false;
+    if (!pack.present) {
+        err = "the pack's dfly section has no DFly2 record";
+        return false;
+    }
+    // what of the start the drafter cannot run under
+    basalt::core::DflyConfig c;
+    c.serve = o.serve;
+    c.kv_q4 = o.kv == "q4_0";
+    c.kv_hybrid = o.kv == "k8v4";
+    c.kv_resident = o.kv_resident > 0;
+    c.layer_split = run.layer_split;
+    c.control_vector = !o.cvec_files.empty();
+    c.rope_scaled = rope.type != bk::RopeScalingType::None;
+    c.rope_base = (float) rope.freq_base;
+    c.head_two_stage = basalt::core::NativeHead::has_draft_top1(head_type);
+    const std::string why = basalt::core::dfly_pass_over(pack.dims, c);
+    if (why.empty()) {
+        // a block is the anchor and its drafts, within the drafter's window cap and the block it was trained with
+        const int cap = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        rows = std::min({cap, pack.dims.block, basalt::core::kDflyBlockMax});
+        if (rows >= 2) return true;
+        err = "a DFly2 block needs --spec 2 or more";
+        return false;
+    }
+    // passed over: the drafter the run takes without it
+    basalt::log::warn("basalt generate", "the pack's DFly2 drafter does not run: %s", why.c_str());
+    pack = basalt::core::DflyPack{};
+    DraftRun without = run;
+    without.dfly = false;
+    o.draft_source = choose_draft_source(draft_pack(file), without);
+    if (o.draft_source == DraftSource::Mtp) o.mtp = o.model;
+    if (o.draft_source == DraftSource::None) {
+        err = "no other drafter of the pack runs here; --spec 0 runs without one";
+        return false;
+    }
+    return true;
+}
 
 }  // namespace

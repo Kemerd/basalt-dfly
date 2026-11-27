@@ -59,19 +59,29 @@ On when the pack has a drafter. `--spec N` sets the window (default 8: the last 
 plain decoding's ([precision](../precision/qwen38-flash-next.md#drafting-does-not-change-output)). Structured output drafts best
 and prose least.
 
-A pack has the MTP drafter and may also carry a DFlash 2 block drafter ([attach it](../model-file.md#flash-next-block-drafter)).
-A run drafts with one of them, chosen once at start. No flag selects it: the start line `block drafter: ...` and the word
-`drafter=block`, `drafter=mtp` or `drafter=none` on the engine's `INFO` line say which.
+A pack has the MTP drafter and may also carry a DFlash 2 block drafter ([attach it](../model-file.md#flash-next-block-drafter))
+or a DFly2 drafter ([attach it](../model-file.md#flash-next-dfly2-drafter)). A run drafts with one of them, chosen once at
+start. No flag selects the first two: the start line (`block drafter: ...`, `basalt dfly: drafter: ...`) and the word
+`drafter=block`, `drafter=dfly2`, `drafter=mtp` or `drafter=none` on the engine's `INFO` line say which.
 
 - **Block drafter:** used when the pack has it, the run is `basalt serve` with one request at a time (`--parallel` 1, the
   default), and every layer is on one card (one card, or `gpu-mode peer`). Each round it takes the kept rows after layers
   5, 15, 25, 35 and 45 as context, keeps the last 2,048 positions, and drafts 7 tokens in one pass against the model's own
   embedding and head. Every draft states its chance; the window is as long as those chances pay for.
-- **MTP:** used otherwise: a pack without the block drafter, `--parallel` above 1, `gpu-mode split`, and `basalt generate`.
+- **DFly2 drafter:** used only with `--exp dfly2=1`, where the block drafter would run, ahead of it. Each round it drafts
+  7 tokens in one pass from what the verify window left: the head's input at the last kept row, and the cells each of
+  layers 31, 35, 39, 43 and 47 selected for that row, read from the session's own K/V cache (fp16 or `--kv int8`). It
+  writes nothing into the session, so it keeps no context and a restored conversation drafts at once. Every draft
+  states its chance, as the block drafter's do. A start it cannot run passes it over with one warning that says why:
+  `--kv q4_0`, `--kv k8v4`, `--kv-resident`, a control vector, rope scaling or another rope base, or a head type
+  without the two-stage pick.
+- **MTP:** used otherwise: a pack without a block drafter, `--parallel` above 1, `gpu-mode split`, and `basalt generate`.
 - **Memory:** its weights (the pack's `dflash` section, 726 MiB) and its working memory (the context, a prompt's rows and
   the passes' scratch), all on the main card and held before the expert cache is sized. The start line gives both
-  figures. The MTP layer is not loaded beside it.
-- **Context after a restore:** a conversation restored from RAM or disk starts with no drafter context; it fills as the turn
+  figures. The MTP layer is not loaded beside it. The DFly2 drafter takes about 610 MiB (its projections in Q8_0, its
+  working memory and a private K/V of 2,059 cells) before the cache is sized and 191 MiB after it for its copy of the
+  head that picks its drafts; the MTP layer is not loaded beside it either.
+- **Block drafter's context after a restore:** a conversation restored from RAM or disk starts with no drafter context; it fills as the turn
   is read and generated. A turn that continues or rewinds the live conversation keeps what still applies.
 - **Long prompts with `gpu-mode peer`:** a part read as a pipeline over the cards gives context from its last chunk only.
 - **Speed against the MTP:** 1-2% ahead on code and JSON, level on long structured output, 5-8% behind on prose and

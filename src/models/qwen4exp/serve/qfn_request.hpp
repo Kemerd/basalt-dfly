@@ -79,6 +79,11 @@ public:
     /// draft_next with the block drafter: the kept rows' context, then a block behind the last of them.
     template <class After>
     bool draft_block(bool will_draft, After& after_launch);
+    /// draft_next with the DFly2 drafter: a block behind the last kept row, over what the window left.
+    template <class After>
+    bool draft_dfly(bool will_draft, After& after_launch);
+    /// Starts the reads of the PLE rows of `anchor`, the next window's first row, while a block drafts.
+    void prefetch_anchor_ple(int32_t anchor);
     bool draft_fatal() const { return draft_failed; }
     void window_timing(int T, int a, bool from_sfx, Clock::time_point round0, Clock::time_point tw0,
                        Clock::time_point tw1, Clock::time_point tw2);
@@ -90,7 +95,7 @@ public:
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
         // a block's window was picked from its drafts' stated chances: the policy learns what such chances are worth
         // (a quality gate's windows are forced, not drafted)
-        if (runtime_.block.on() && !from_sfx) {
+        if (drafts_blocks(runtime_.o.draft_source) && !from_sfx) {
             if (ppl == nullptr) runtime_.policy->observe_window(wchance, T, a, ms);
             return;
         }
@@ -175,6 +180,8 @@ private:
     double dt_run{};
     double dt_commit{};
     double dt_draft{};
+    int64_t dfly0_rounds{}, dfly0_skipped{};   // the DFly2 drafter's counters when the decode began
+    double dfly0_ms{};
     int64_t dec_windows{};
     int64_t dec_T{};
     int64_t decode_hits0{};

@@ -48,6 +48,7 @@ int dispatch(Context& context) {
     auto& native_head = *context.native_head;
     auto& mtp_head = *context.mtp_head;
     auto& block = *context.block;
+    auto& dfly = *context.dfly;
     auto& src = *context.src;
     auto& arena_src = *context.arena_src;
     auto& srcp = *context.srcp;
@@ -188,6 +189,7 @@ int dispatch(Context& context) {
             .native_head = native_head,
             .mtp_head = mtp_head,
             .block = block,
+            .dfly = dfly,
             .src = src,
             .srcp = srcp,
             .xcache = xcache,
