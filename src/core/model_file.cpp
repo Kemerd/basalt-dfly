@@ -309,6 +309,7 @@ bool ModelFile::open(const std::string& path, std::string& err) {
         s.name.assign(e.name, strnlen(e.name, sizeof e.name));
         s.offset = e.offset;
         s.bytes = e.bytes;
+        std::memcpy(s.sha256, e.sha256, sizeof s.sha256);
         if (s.offset % kSectionAlign != 0 || s.offset < kHeaderBytes || s.offset > file_bytes_ ||
             s.bytes > file_bytes_ - s.offset) {
             err = path + ": section '" + s.name + "' lies outside the file or is misaligned";
