@@ -38,7 +38,6 @@ int decode(Context& context) {
     auto& host_res = *context.host_res;
     auto& res_put = context.res_put;
     auto& d_res = *context.d_res;
-    auto& thits = *context.thits;
     auto& ms_ple = *context.ms_ple;
     auto& ms_embed = *context.ms_embed;
     auto& ms_layers = *context.ms_layers;
@@ -59,35 +58,14 @@ int decode(Context& context) {
     if (spec_pos >= 0 && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;
-        if (thits.d_res == nullptr) {
-            basalt::log::error("basalt generate", "--spec needs the device residency table (an expert profile, "
-                                 "--expert-cache and the token graph)");
-            return 2;
-        }
         basalt::core::Verifier ver;
-        basalt::core::VerifyHits vh;
-        vh.d_res = thits.d_res;
-        vh.h_res = host_res.empty() ? nullptr : host_res.data();
-        vh.cache_base = thits.cache_base;
-        vh.blob = thits.blob;
-        vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
-        vh.n_slots = xcache.slots();
-        ver.set_cpu_warm(drive.d.pool, drive.d.src);
-        ver.set_route_tail_skip(o.route.tail_skip);
-        ver.set_route_prior(o.route.prior);
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
-            return fatal_start_error(err);
-        }
+        if (const int rc = window_init(context, ver, o.spec)) return rc;
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             return fatal_start_error(err);
         }
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
         if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
-        drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
-        if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
-        if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         const int64_t pcie0 = drive.d.pcie_experts;
         // CS-T: the file tier since the decode began (the prompt path's copies are before this)
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
