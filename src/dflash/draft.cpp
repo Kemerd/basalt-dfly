@@ -99,9 +99,11 @@ bool block_layers(const BlockDrafter& bd, const Scratch& sc, const wg::Workspace
             kernels::attn_qk_prepare(sc.bq + q0 * AQ, sc.bk + q0 * KV, sc.bv + q0 * KV, D.q_norm, D.k_norm, bd.eps, rope,
                                      sc.bpos + q0 * 3, B, bd.n_head, bd.n_kv, sc.bqo + q0 * AQ, st.k[l], st.v[l], pos[k], stream,
                                      bd.head_dim, false, st.cap);
-            const int64_t window = st.window(bd.window, pos[k]);   // context below the sequence's first position is gone
+            // each row sees the drafter's window behind it, but never below the sequence's first position: a context
+            // shorter than the window is seen whole by every row (the rows share the anchor's reach back to it)
+            const int64_t window = st.window(bd.window, pos[k]);
             kernels::gqa_window_attn(sc.bqo + q0 * AQ, st.k[l], st.v[l], bd.n_head, bd.n_kv, bd.head_dim, pos[k], B, pos[k] + B,
-                                     window, st.cap, sc.battn, st.cap, sc.bao + q0 * AQ, stream);
+                                     window, st.cap, sc.battn, st.cap, sc.bao + q0 * AQ, stream, window < bd.window);
         }
         prod(ws, D.o, act(sc, sc.bao, AQ, R, stream), sc.tmp, R, stream);
         conv(sc.tmp, sc.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);
