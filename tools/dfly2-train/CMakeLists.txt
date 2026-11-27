@@ -37,7 +37,13 @@ function(dfly2_test name)
   set_property(TEST dfly2_${name} APPEND PROPERTY LABELS cpu)
 endfunction()
 
+# The file formats, with no LibTorch in them: the safetensors checkpoints (the JSON reader is the model file's).
+add_library(dfly2_io STATIC src/safetensors.cpp)
+target_include_directories(dfly2_io PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
+target_link_libraries(dfly2_io PUBLIC model_file)
+
 if(BUILD_TESTING)
   # the teacher shard's writer and reader (include/basalt/artifact/dfly2_shard.hpp)
   dfly2_test(shard_test platform)
+  dfly2_test(safetensors_test dfly2_io)
 endif()
