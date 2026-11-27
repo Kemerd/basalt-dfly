@@ -363,15 +363,37 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 endif()
 
 if(BASALT_MODEL_QWEN35)
+# What the DFlash 2 block drafters of the models share (src/dflash): the drafter's shape and tensors, and its context and
+# draft passes on the window gemm. meta.cpp and seq.cpp need no device: a CPU test lists one as a source.
+add_library(dflash STATIC src/dflash/meta.cpp src/dflash/seq.cpp src/dflash/forms.cpp src/dflash/context.cpp src/dflash/draft.cpp)
+target_include_directories(dflash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dflash PUBLIC artifact kernels window_gemm core warnings ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # a sequence's context range: what a rewind keeps of a ring that wrapped, and its buffers' order (host only)
+  add_executable(dflash_seq_test tests/dflash/seq_test.cpp src/dflash/seq.cpp)
+  target_link_libraries(dflash_seq_test PRIVATE artifact)
+  basalt_cpu_test(NAME dflash_seq_test COMMAND dflash_seq_test)
+  # the drafter's shape from a pack's metadata, the shapes it refuses, and its tensors' pack names and sizes (host only)
+  add_executable(dflash_meta_test tests/dflash/meta_test.cpp src/dflash/meta.cpp)
+  target_link_libraries(dflash_meta_test PRIVATE artifact)
+  basalt_cpu_test(NAME dflash_meta_test COMMAND dflash_meta_test)
+endif()
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
 add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model dflash kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
 if(BUILD_TESTING)
+  # the dense stack's block drafter on seeded inputs at the 27B drafter's shape, no pack: prints the hashes of its
+  # features, context rings and drafts, which a change that must not move a bit leaves as they are (GPU)
+  add_executable(dense_block_drafter_hash tests/dense/block_drafter_hash.cpp)
+  target_include_directories(dense_block_drafter_hash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_gpu_include_directories})
+  target_link_libraries(dense_block_drafter_hash PRIVATE dense ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dense_block_drafter_hash COMMAND dense_block_drafter_hash)
+  set_tests_properties(dense_block_drafter_hash PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # the session's running state through the shared checkpoint transfer and back (a 27B pack: argument or
   # BASALT_QWEN35_PACK; skipped without one)
   add_executable(qwen35_checkpoint_round_trip tests/models/qwen35/checkpoint_round_trip.cpp)

@@ -44,7 +44,7 @@ if [[ -n "${hits}" ]]; then
 fi
 
 # 4. CMake: shared libraries do not link a model library
-hits=$(grep -nE 'target_link_libraries\((core|engine|kernels|kernels_cpu|prefill|spec|model|platform|artifact)[[:space:]].*model_(qwen4exp|deepseek41)' CMakeLists.txt || true)
+hits=$(grep -nE 'target_link_libraries\((core|engine|kernels|kernels_cpu|prefill|spec|model|platform|artifact|dflash)[[:space:]].*model_(qwen4exp|deepseek41)' CMakeLists.txt || true)
 if [[ -n "${hits}" ]]; then
   echo "model layering: a shared library links a model library:" >&2
   echo "${hits}" >&2
