@@ -6,7 +6,9 @@ selects the cells each row reads (Qwen3.8-Flash-Next, architecture `qwen4exp`). 
 
 **Status.** The trainer, its file formats and its tests are in the tree. It has trained a drafter on the GPU from
 the engine's teacher export ([`--dfly2-export`](models/qwen38-flash-next.md#teacher-export)) of a real pack:
-[a first run](#a-first-run). No trained drafter has run in the engine yet.
+[a first run](#a-first-run). That drafter runs in the engine (`--exp dfly2=1`,
+[drafting](models/qwen38-flash-next.md#drafting)) with output identical to plain decoding, but slower than not
+drafting: it needs more training.
 
 ## What is trained
 
@@ -243,7 +245,15 @@ The same drafter scores 5.45 on its training shards: the run is short of data. P
 numbers barely move and the confidence term grows, which raises the loss. Read as from an INT8 cache
 (`--kv-int8-share 1`), the held-out loss moves by under 0.01 and each accepted length by under 0.004.
 
+- **Served** (`--kv int8`, greedy, every window made to hold seven drafts): 0.35, 1.81 and 2.12 drafts accepted a block
+  on 512 tokens after the first 1,024 of three held-out files (Markdown, C++, Python), and 0.20 to 0.88 on chat replies
+  (prose, code, JSON). `eval` of the same three files with their replies, exported as above, gives 1.44 for the serving
+  chain; the engine's mean is 1.43. Its first drafts are accepted 69-72% of the time on the C++ and Python files,
+  29% on the Markdown one and 19-45% on the chat replies, while its confidence states 0.80-1.00 for them. With
+  windows priced from those chances it is slower than not drafting ([speed](models/qwen38-flash-next.md#drafting)).
+
 ## Not verified
 
-- A trained drafter has not run in the engine, so no served acceptance or speed exists.
+- A drafter trained on chat text, or on more than 1.45M tokens.
+- Sampled requests beyond one seed, thinking-on prompts, and contexts past the 8,192 tokens it was trained on.
 - The interrupt path is tested through the library's stop callback, not by sending a signal to the program.

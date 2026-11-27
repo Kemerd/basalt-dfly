@@ -105,6 +105,25 @@ start. No flag selects the first two: the start line (`block drafter: ...`, `bas
   confirmed. Sampled at temperature 1.0, the block drafter made 2.27-5.34 tokens per window against the MTP's
   2.29-5.71 on the same replies. Compare on another pack by benchmarking it with the drafter attached and again after
   `--roll-back`.
+- **DFly2's speed:** the first drafter trained here (360 steps on 1.45M tokens of source code and docs,
+  [a first run](../dfly2-training.md#a-first-run)) is slower than not drafting on every text measured. Same pack with it
+  attached, same setup, DFly2 / MTP / none / none / MTP / DFly2, `--exp dfly2=1`; every run gave the tokens of `--spec 0`:
+
+  | text | none | MTP | DFly2 | tokens per window, DFly2 (MTP) | drafts accepted, DFly2 (MTP) |
+  | --- | --- | --- | --- | --- | --- |
+  | code (chat prompt) | 67.8 tok/s | 96.7 | 56.9 | 1.46 (3.75) | 38% (76%) |
+  | JSON (chat prompt) | 54.8 | 88.7 | 52.3 | 1.66 (5.46) | 57% (86%) |
+  | prose (chat prompt) | 69.0 | 95.8 | 58.4 | 1.04 (2.46) | 16% (70%) |
+  | `basalt-bench` conv | 98.1 | 125.1 | 75.4 | 1.10 (2.41) | 29% (69%) |
+  | `basalt-bench` struct | 52.5 | 84.4 | 47.7 | 1.96 (7.76) | 64% (98%) |
+  | `basalt-bench` prose | 79.1 | 109.5 | 64.8 | 1.04 (2.37) | 19% (72%) |
+
+  Its pass costs 2.2 ms a window, whether or not the window takes its drafts, against the MTP's 0.5-0.9 ms, and its
+  drafts are rarely right: with every window made to hold all seven, it keeps 0.58 a block on the code prompt, 0.88 on
+  JSON and 0.20 on prose, and 0.35, 1.81 and 2.12 on a Markdown, a C++ and a Python file held out of its training
+  text. The trainer's `eval` of those three files with the replies gives 1.44 drafts a block, the engine's mean 1.43:
+  its training, not the engine, limits it. Sampled (temperature 1.0, top-p 0.95, top-k 20, seed 1) its replies were the
+  MTP's. The `basalt-bench` pairs of this session differ by up to 10% in every mode (CPU load 43-56%).
 
 ## Teacher export
 
