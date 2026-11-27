@@ -327,15 +327,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
         if (T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
-            (head_->type() == 13
-                 ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
-                                                   proxy_scratch_, cs)
-             : head_->type() == GGML_Q8_0
-                 ? basalt::kernels::q80_proxy_top1(proxy_, head_->weights(), xq_, (int) nv, n_tier1_, dvocab_, out_ids_,
-                                                   probs_, proxy_scratch_, cs, true)
-                 : basalt::kernels::q6k_proxy_top1(proxy_, rows_mapped_ ? head_->weights() : (const void*) dhead_, xq_,
-                                                   (int) nv, n_tier1_, dvocab_, out_ids_, probs_, proxy_scratch_, cs,
-                                                   rows_mapped_)))
+            head_->draft_top1(proxy_, rows_mapped_ ? head_->weights() : (const void*) dhead_, xq_, (int) nv, n_tier1_,
+                              dvocab_, out_ids_, probs_, proxy_scratch_, cs, rows_mapped_))
             return true;
         if (T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,

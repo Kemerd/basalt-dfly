@@ -7,6 +7,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -171,6 +172,18 @@ void NativeHead::score_rows(const void* w, const void* x_q8_1, float* y, int n, 
         q80p_mmvq(w, x_q8_1, y, n_in_, n, T, stream);
     else
         native_mmvq(type_, w, x_q8_1, y, n_in_, n, T, stream);
+}
+
+bool NativeHead::draft_top1(const void* proxy, const void* rows, const void* x_q8_1, int n_rows, int64_t n_cap, const int32_t* map,
+                            int* out_id, float* out_prob, void* scratch, void* stream, bool rows_by_map) const {
+    using namespace basalt::kernels;
+    // each type's kernel rescores the near-best rows with its own exact arithmetic
+    if (type_ == 13) return q5k_proxy_top1(proxy, rows, x_q8_1, n_rows, n_cap, map, out_id, out_prob, scratch, stream);
+    if (type_ == 8)
+        return q80_proxy_top1(proxy, rows, x_q8_1, n_rows, n_cap, map, out_id, out_prob, scratch, stream, rows_by_map);
+    if (type_ == 14)
+        return q6k_proxy_top1(proxy, rows, x_q8_1, n_rows, n_cap, map, out_id, out_prob, scratch, stream, rows_by_map);
+    return false;
 }
 
 // ================================ THE NATIVE EMBEDDING ================================
