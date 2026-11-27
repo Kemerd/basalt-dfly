@@ -112,6 +112,7 @@ with, and then takes the steps the uninterrupted run would have taken.
 | `--grad-clip X` | joint gradient norm clip (1) |
 | `--kl-topk`, `--dpace-alpha`, `--e2e-weight`, `--confidence-weight` | the loss (10, 0.5, 1, 1) |
 | `--prefix-weight X` | loss weight, 0 to 1, of a block whose anchor follows a prompt-path row (below); 0 leaves them out (1) |
+| `--kv-int8-share X` | share, 0 to 1, of the blocks that see the cache as a target serving with `--kv int8` hands it over (0) |
 
 Memory on the device is set by three options: `--blocks` bounds the layers' activations, `--loss-blocks` the logits
 (`blocks x (block - 1) x vocabulary`), and `--attention-blocks` the attention scores. The step's gradient does not

@@ -38,6 +38,7 @@ struct RunOptions {
     uint64_t queue_bytes = 4ull << 30; ///< host memory of the sequences read ahead
     uint64_t seed = 42;                ///< of the data order
     double prefix_weight = 1.0;        ///< loss weight of a block whose anchor follows a prompt-path row; 0 takes none
+    double kv_int8_share = 0.0;        ///< share of the blocks that read the cache as a target serving from INT8 does
     LossConfig loss;                   ///< its chunk_blocks is the blocks whose logits are alive at once
 };
 

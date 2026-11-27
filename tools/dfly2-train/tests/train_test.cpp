@@ -357,6 +357,9 @@ int main(int argc, char** argv) {
         EvalOptions bad_eval = eo;
         bad_eval.checkpoint = state_path(run_b, 120);
         refused(!evaluate(bad_eval, part, err), "a state file given as a drafter", err);
+        bad_eval = eo;
+        bad_eval.kv_int8_share = 0.5;
+        refused(!evaluate(bad_eval, part, err) && err.find("64") != std::string::npos, "INT8 blocks on a head width the INT8 rule does not divide", err);
     }
 
     std::printf("7. BF16 weights behind FP32 masters\n");

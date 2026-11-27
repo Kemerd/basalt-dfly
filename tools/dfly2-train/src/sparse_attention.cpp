@@ -47,9 +47,16 @@ torch::Tensor block_to_groups(const torch::Tensor& x, const Dims& d) {
     return x.permute({0, 2, 1, 3}).reshape({C * d.G, d.B, d.dh});
 }
 
+/// Gathered cells [C][W][G][dh], the blocks `int8` ([C] bool, or empty for none) marks read as an INT8 cache returns
+/// them.
+torch::Tensor as_cached(const torch::Tensor& cells, const torch::Tensor& int8, const Dims& d) {
+    if (int8.numel() == 0) return cells.to(d.type);
+    return torch::where(int8.view({-1, 1, 1, 1}), kv_int8_round(cells).to(d.type), cells.to(d.type));
+}
+
 /// Gathers and scores blocks [n0, n1): the probabilities and the output of the chunk.
 Chunk run_chunk(const torch::Tensor& q, const torch::Tensor& k_blk, const torch::Tensor& v_blk, const torch::Tensor& k_ctx,
-                const torch::Tensor& v_ctx, const torch::Tensor& idx, int64_t n0, int64_t n1, const Dims& d) {
+                const torch::Tensor& v_ctx, const torch::Tensor& idx, const torch::Tensor& int8, int64_t n0, int64_t n1, const Dims& d) {
     const int64_t C = n1 - n0;
     Chunk c;
     c.q = heads_to_rows(q.slice(0, n0, n1).to(d.type), d);
@@ -60,8 +67,9 @@ Chunk run_chunk(const torch::Tensor& q, const torch::Tensor& k_blk, const torch:
     const torch::Tensor ids = idx.slice(0, n0, n1);
     const torch::Tensor valid = ids.ge(0);
     const torch::Tensor flat = ids.clamp_min(0).reshape({-1});
-    c.k_ctx = k_ctx.index_select(0, flat).to(d.type).reshape({C, d.W, d.G, d.dh}).permute({0, 2, 1, 3}).reshape({C * d.G, d.W, d.dh});
-    c.v_ctx = v_ctx.index_select(0, flat).to(d.type).reshape({C, d.W, d.G, d.dh}).permute({0, 2, 1, 3}).reshape({C * d.G, d.W, d.dh});
+    const torch::Tensor marks = int8.numel() > 0 ? int8.slice(0, n0, n1) : int8;
+    c.k_ctx = as_cached(k_ctx.index_select(0, flat).reshape({C, d.W, d.G, d.dh}), marks, d).permute({0, 2, 1, 3}).reshape({C * d.G, d.W, d.dh});
+    c.v_ctx = as_cached(v_ctx.index_select(0, flat).reshape({C, d.W, d.G, d.dh}), marks, d).permute({0, 2, 1, 3}).reshape({C * d.G, d.W, d.dh});
 
     const double ninf = -std::numeric_limits<double>::infinity();
     // context scores: padding cells are out
@@ -82,7 +90,7 @@ Chunk run_chunk(const torch::Tensor& q, const torch::Tensor& k_blk, const torch:
 
 /// Checks the arguments and fills the sizes.
 Dims check_dims(const torch::Tensor& q, const torch::Tensor& k_blk, const torch::Tensor& v_blk, const torch::Tensor& k_ctx,
-                const torch::Tensor& v_ctx, const torch::Tensor& idx) {
+                const torch::Tensor& v_ctx, const torch::Tensor& idx, const torch::Tensor& int8) {
     const auto fail = [](const std::string& what) { throw std::invalid_argument("sparse_context_attention: " + what); };
     if (!q.defined() || !k_blk.defined() || !v_blk.defined() || !k_ctx.defined() || !v_ctx.defined() || !idx.defined()) fail("an argument is undefined");
     if (q.dim() != 4 || k_blk.dim() != 4 || v_blk.dim() != 4 || k_ctx.dim() != 3 || v_ctx.dim() != 3 || idx.dim() != 2) fail("an argument has the wrong rank");
@@ -99,6 +107,9 @@ Dims check_dims(const torch::Tensor& q, const torch::Tensor& k_blk, const torch:
     if (k_blk.size(0) != d.N || k_blk.size(1) != d.B || k_blk.size(3) != d.dh || !(v_blk.sizes() == k_blk.sizes())) fail("block keys or values do not match the queries");
     if (k_ctx.size(1) != d.G || k_ctx.size(2) != d.dh || !(v_ctx.sizes() == k_ctx.sizes())) fail("cached keys or values do not match the block's");
     if (idx.size(0) != d.N || idx.scalar_type() != torch::kLong) fail("cell ids are not [blocks][width] int64");
+    if (!int8.defined() || int8.dim() != 1 || int8.scalar_type() != torch::kBool || (int8.numel() != 0 && int8.size(0) != d.N))
+        fail("the INT8 marks are not [blocks] bool");
+    if (int8.numel() != 0 && d.dh % kKvInt8Group != 0) fail("an INT8 cache needs a head width that is a multiple of 64");
     if (!q.is_floating_point() || !k_blk.is_floating_point() || !v_blk.is_floating_point() || !k_ctx.is_floating_point() || !v_ctx.is_floating_point()) fail("a tensor is not floating point");
     if (d.W > 0 && k_ctx.size(0) == 0) fail("cell ids without a cache");
     if (d.W > 0) {
@@ -112,17 +123,18 @@ Dims check_dims(const torch::Tensor& q, const torch::Tensor& k_blk, const torch:
 
 struct SparseContextAttention : public torch::autograd::Function<SparseContextAttention> {
     static torch::Tensor forward(torch::autograd::AutogradContext* ctx, torch::Tensor q, torch::Tensor k_blk, torch::Tensor v_blk,
-                                 torch::Tensor k_ctx, torch::Tensor v_ctx, torch::Tensor idx, int64_t chunk_blocks) {
-        const Dims d = check_dims(q, k_blk, v_blk, k_ctx, v_ctx, idx);
+                                 torch::Tensor k_ctx, torch::Tensor v_ctx, torch::Tensor idx, torch::Tensor int8, int64_t chunk_blocks) {
+        const Dims d = check_dims(q, k_blk, v_blk, k_ctx, v_ctx, idx, int8);
         const int64_t step = std::max<int64_t>(1, chunk_blocks);
         std::vector<torch::Tensor> outs;
         for (int64_t n0 = 0; n0 < d.N; n0 += step) {
             const int64_t n1 = std::min(d.N, n0 + step);
-            outs.push_back(rows_to_heads(run_chunk(q, k_blk, v_blk, k_ctx, v_ctx, idx, n0, n1, d).out, n1 - n0, d));
+            outs.push_back(rows_to_heads(run_chunk(q, k_blk, v_blk, k_ctx, v_ctx, idx, int8, n0, n1, d).out, n1 - n0, d));
         }
         // the inputs only: the gathered cells and the scores are made again in backward
         ctx->save_for_backward({q, k_blk, v_blk, k_ctx, v_ctx, idx});
         ctx->saved_data["chunk"] = step;
+        ctx->saved_data["marks"] = int8;
         return torch::cat(outs, 0);
     }
 
@@ -130,16 +142,17 @@ struct SparseContextAttention : public torch::autograd::Function<SparseContextAt
         const auto saved = ctx->get_saved_variables();
         const torch::Tensor &q = saved[0], &k_blk = saved[1], &v_blk = saved[2], &k_ctx = saved[3], &v_ctx = saved[4], &idx = saved[5];
         const int64_t step = ctx->saved_data["chunk"].toInt();
+        const torch::Tensor int8 = ctx->saved_data["marks"].toTensor();
         const torch::Tensor& grad = grad_outputs[0];
-        // one slot per forward argument, the chunk size included; only the first three carry a gradient
-        torch::autograd::tensor_list grads(7);
+        // one slot per forward argument, the marks and the chunk size included; only the first three carry a gradient
+        torch::autograd::tensor_list grads(8);
         if (!grad.defined()) return grads;
         torch::NoGradGuard no_grad;
-        const Dims d = check_dims(q, k_blk, v_blk, k_ctx, v_ctx, idx);
+        const Dims d = check_dims(q, k_blk, v_blk, k_ctx, v_ctx, idx, int8);
         std::vector<torch::Tensor> dq, dk, dv;
         for (int64_t n0 = 0; n0 < d.N; n0 += step) {
             const int64_t n1 = std::min(d.N, n0 + step), C = n1 - n0;
-            const Chunk c = run_chunk(q, k_blk, v_blk, k_ctx, v_ctx, idx, n0, n1, d);
+            const Chunk c = run_chunk(q, k_blk, v_blk, k_ctx, v_ctx, idx, int8, n0, n1, d);
             const torch::Tensor g = heads_to_rows(grad.slice(0, n0, n1).to(d.type), d);
             const torch::Tensor p_ctx = c.probs.slice(2, 0, d.W), p_blk = c.probs.slice(2, d.W, d.W + d.B);
             // through the softmax: ds = p * (g . v - g . out)
@@ -160,10 +173,29 @@ struct SparseContextAttention : public torch::autograd::Function<SparseContextAt
 
 }  // namespace
 
+torch::Tensor kv_int8_round(const torch::Tensor& x) {
+    if (!x.defined() || x.dim() < 1 || x.size(-1) % kKvInt8Group != 0 || !x.is_floating_point())
+        throw std::invalid_argument("kv_int8_round: the last dimension is not whole groups of 64 values");
+    torch::NoGradGuard no_grad;
+    std::vector<int64_t> groups(x.sizes().begin(), x.sizes().end() - 1);
+    groups.push_back(x.size(-1) / kKvInt8Group);
+    groups.push_back(kKvInt8Group);
+    const torch::Tensor g = x.to(torch::kFloat32).reshape(groups);
+    // the divisors as tensors, so every device divides exactly rather than multiplying by a reciprocal
+    const torch::Tensor amax = g.abs().amax(-1, true);
+    const torch::Tensor scale = torch::div(amax, torch::full_like(amax, 127.0f)).to(torch::kFloat16).to(torch::kFloat32);
+    // the code against the stored scale, rounded half to even as the kernel's __float2int_rn; a zero scale codes 0
+    const torch::Tensor safe = torch::where(scale > 0, scale, torch::ones_like(scale));
+    const torch::Tensor code = torch::where(scale > 0, torch::round(torch::div(g, safe)).clamp(-127, 127), torch::zeros_like(g));
+    return (code * scale).to(torch::kFloat16).to(torch::kFloat32).reshape(x.sizes());
+}
+
 torch::Tensor sparse_context_attention(const torch::Tensor& q, const torch::Tensor& k_blk, const torch::Tensor& v_blk,
                                        const torch::Tensor& k_ctx, const torch::Tensor& v_ctx, const torch::Tensor& idx,
-                                       int64_t chunk_blocks) {
-    return SparseContextAttention::apply(q, k_blk, v_blk, k_ctx, v_ctx, idx, chunk_blocks);
+                                       int64_t chunk_blocks, const torch::Tensor& int8) {
+    // autograd takes no undefined argument: no marks are an empty list
+    const torch::Tensor marks = int8.defined() ? int8 : torch::empty({0}, torch::TensorOptions().dtype(torch::kBool).device(q.device()));
+    return SparseContextAttention::apply(q, k_blk, v_blk, k_ctx, v_ctx, idx, marks, chunk_blocks);
 }
 
 }  // namespace basalt::dfly2

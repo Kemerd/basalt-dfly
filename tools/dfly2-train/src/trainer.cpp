@@ -64,6 +64,7 @@ bool open_session(const RunOptions& o, const DrafterFile& file, torch::Dtype dty
     if (!s.pack.open(o.model, err) || !drafter_file_matches(file, s.pack.identity(), err)) return false;
     DataOptions data;
     data.prefix_weight = o.prefix_weight;
+    data.kv_int8_share = o.kv_int8_share;
     if (!s.shards.open(o.shards, file.shape, s.pack.identity(), data, err)) return false;
 
     // the drafter: every parameter from the file, then moved and rounded to the forward's type
@@ -104,6 +105,7 @@ SequenceContext to_device(const SequenceContext& c, const torch::Device& device)
 BlockBatch make_batch(const LoadedSequence& s, int64_t i0, int64_t i1, const torch::Device& device) {
     BlockBatch b;
     b.anchors = s.anchors.slice(0, i0, i1).to(device);
+    if (s.kv_int8.defined()) b.kv_int8 = s.kv_int8.slice(0, i0, i1).to(device);
     for (int64_t l = 0; l < s.selection.size(1); ++l) {
         const int64_t width = std::max<int64_t>(1, s.sel_count.slice(0, i0, i1).select(1, l).max().item<int32_t>());
         b.sel.push_back(s.selection.slice(0, i0, i1).select(1, l).slice(1, 0, width).to(device, torch::kLong));
@@ -268,11 +270,11 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
     const int64_t total = o.steps > 0 ? o.steps : std::max<int64_t>(1, (int64_t) std::ceil(o.epochs * (double) s.shards.blocks() / (double) o.blocks_per_step));
     if (resumed && (state.seed != o.seed || state.blocks_per_step != o.blocks_per_step || state.total_steps != total ||
                     state.dataset_blocks != s.shards.blocks() || state.dataset_sequences != s.shards.sequences().size() ||
-                    state.prefix_weight != o.prefix_weight)) {
-        char weight[32];
-        std::snprintf(weight, sizeof weight, "%g", state.prefix_weight);
+                    state.prefix_weight != o.prefix_weight || state.kv_int8_share != o.kv_int8_share)) {
+        char weights[96];
+        std::snprintf(weights, sizeof weights, "prefix weight %g, INT8 share %g", state.prefix_weight, state.kv_int8_share);
         err = "the run in " + o.run + " was started with seed " + std::to_string(state.seed) + ", " + std::to_string(state.blocks_per_step) + " blocks per step, " +
-              std::to_string(state.total_steps) + " steps, prefix weight " + weight + " and shards of " + std::to_string(state.dataset_blocks) + " blocks in " +
+              std::to_string(state.total_steps) + " steps, " + weights + " and shards of " + std::to_string(state.dataset_blocks) + " blocks in " +
               std::to_string(state.dataset_sequences) + " sequences; it resumes only with the same";
         return false;
     }
@@ -294,8 +296,9 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
                             "of a sequence are window rows)",
                       s.shards.shards(), s.shards.sequences().size(), short_count((double) s.shards.tokens()).c_str(), short_count(dataset_blocks).c_str(),
                       (long long) shape.block, short_count((double) s.shards.prefix_blocks()).c_str(), o.prefix_weight, (long long) s.shards.window_rows());
-    basalt::log::info(kTag, "%s at step %lld of %lld: %lld blocks per step in forwards of up to %lld, %s weights on %s", resumed ? "resuming" : "starting",
-                      (long long) opt.steps(), (long long) total, (long long) o.blocks_per_step, (long long) o.blocks, dtype_name.c_str(), o.device.c_str());
+    basalt::log::info(kTag, "%s at step %lld of %lld: %lld blocks per step in forwards of up to %lld, %s weights on %s, %g of the blocks read as from an INT8 cache",
+                      resumed ? "resuming" : "starting", (long long) opt.steps(), (long long) total, (long long) o.blocks_per_step, (long long) o.blocks,
+                      dtype_name.c_str(), o.device.c_str(), o.kv_int8_share);
 
     // the place the next step starts from; only a finished step moves it
     int64_t at_epoch = resumed ? state.epoch : 0;
@@ -329,6 +332,7 @@ bool train_impl(const TrainOptions& o, const std::function<bool()>& stop, TrainR
         st.dataset_blocks = s.shards.blocks();
         st.dataset_sequences = s.shards.sequences().size();
         st.prefix_weight = o.prefix_weight;
+        st.kv_int8_share = o.kv_int8_share;
         for (const auto& [name, t] : opt.buffers()) st.buffers[name] = snapshot(t);
         last_saved = opt.steps();
         return writer.submit(std::move(snap), std::move(st), e);

@@ -1,6 +1,8 @@
 // tools/dfly2-train/src/data.cpp - the shard set, the training order and the read-ahead thread (data.hpp).
 #include "data.hpp"
 
+#include "sparse_attention.hpp"
+
 #include "basalt/core/model_file.hpp"
 #include "basalt/dfly2/anchors.hpp"
 #include "basalt/platform/file.hpp"
@@ -124,6 +126,11 @@ bool ShardSet::open(const std::string& dir, const DrafterShape& shape, const Pac
     open_.clear();
     blocks_ = tokens_ = prefix_blocks_ = 0;
     if (!(options.prefix_weight >= 0.0 && options.prefix_weight <= 1.0)) { err = "the prefix anchors' weight is outside [0, 1]"; return false; }
+    if (!(options.kv_int8_share >= 0.0 && options.kv_int8_share <= 1.0)) { err = "the share of INT8 blocks is outside [0, 1]"; return false; }
+    if (options.kv_int8_share > 0.0 && shape.head_dim % kKvInt8Group != 0) {
+        err = "an INT8 cache scales " + std::to_string(kKvInt8Group) + " values at a time; the head width " + std::to_string(shape.head_dim) + " is not a multiple";
+        return false;
+    }
     if (!export_window_rows(dir, window_rows_, err)) return false;
     std::vector<platform::DirFile> files;
     if (!platform::list_files(dir, files)) { err = "cannot read the shard directory " + dir; return false; }
@@ -220,13 +227,21 @@ bool ShardSet::load(size_t ref_index, uint64_t seed, uint64_t first, LoadedSeque
         out.weight.data_ptr<float>()[i - first] = is_prefix ? (float) options_.prefix_weight : 1.0f;
     }
     out.anchors = anchors.to(torch::kLong).index_select(0, take);
+    // a block reads the cache as INT8 serving does by a draw of its own: the sequence's seed and its anchor
+    if (options_.kv_int8_share > 0.0) {
+        out.kv_int8 = torch::empty({(int64_t) (usable - first)}, torch::kBool);
+        for (int64_t i = 0; i < out.kv_int8.size(0); ++i) {
+            const uint64_t draw = mix64(seed ^ mix64((uint64_t) out.anchors.data_ptr<int64_t>()[i] + 0x2545f4914f6cdd1dull));
+            out.kv_int8.data_ptr<bool>()[i] = (double) (draw >> 11) * 0x1.0p-53 < options_.kv_int8_share;
+        }
+    }
     out.selection = selection.index_select(0, take);
     out.sel_count = counts.index_select(0, take);
     out.ctx.tokens = tokens.to(torch::kLong);
     out.ctx.pos0 = info->pos0;
     out.first = first;
     out.bytes = out.ctx.tokens.nbytes() + out.ctx.hidden.nbytes() + out.anchors.nbytes() + out.selection.nbytes() + out.sel_count.nbytes() +
-                out.weight.nbytes();
+                out.weight.nbytes() + (out.kv_int8.defined() ? out.kv_int8.nbytes() : 0);
     for (int64_t l = 0; l < layers; ++l) out.bytes += out.ctx.k[(size_t) l].nbytes() + out.ctx.v[(size_t) l].nbytes();
     return true;
 }

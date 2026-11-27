@@ -1,11 +1,14 @@
 // tools/dfly2-train/tests/attention_test.cpp - the drafter's attention function against a plain dense-masked attention
 // written with ordinary operations: the same output, the same gradients, and gradients that agree with central
-// differences in FP64. CPU only.
+// differences in FP64; and the INT8 cache's rule against the kernel's arithmetic. CPU only.
 #include "sparse_attention.hpp"
+
+#include "basalt/kernels/f16_bits.hpp"
 
 #include "test_util.hpp"
 #include "tiny.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 
@@ -145,6 +148,66 @@ int main() {
     check(throws([&] { sparse_context_attention(q, k_blk.slice(1, 0, 3), v_blk, k_ctx, v_ctx, idx); }), "block keys of another shape");
     check(throws([&] { sparse_context_attention(q.slice(2, 0, 3), k_blk, v_blk, k_ctx, v_ctx, idx); }), "query heads that are not a multiple of the key/value heads");
     check(throws([&] { sparse_context_attention(q, k_blk, v_blk, torch::Tensor(), v_ctx, idx); }), "an undefined cache");
+    check(throws([&] { sparse_context_attention(q, k_blk, v_blk, k_ctx, v_ctx, idx, 64, torch::ones({N}, torch::kBool)); }),
+          "INT8 marks on a head width that is not whole groups of 64");
+
+    std::printf("7. the INT8 cache's rule\n");
+    {
+        // the kernel's arithmetic, written out over the engine's own FP16 conversions
+        const auto by_hand = [](const torch::Tensor& x) {
+            const torch::Tensor xf = x.to(torch::kFloat32).contiguous();
+            torch::Tensor out = torch::empty_like(xf);
+            const float* in = xf.data_ptr<float>();
+            float* o = out.data_ptr<float>();
+            for (int64_t g0 = 0; g0 < xf.numel(); g0 += basalt::dfly2::kKvInt8Group) {
+                float amax = 0.0f;
+                for (int64_t i = 0; i < basalt::dfly2::kKvInt8Group; ++i) amax = std::max(amax, std::fabs(in[g0 + i]));
+                const float sf = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32(amax / 127.0f));
+                for (int64_t i = 0; i < basalt::dfly2::kKvInt8Group; ++i) {
+                    float code = 0.0f;
+                    if (sf > 0.0f) code = std::min(127.0f, std::max(-127.0f, std::nearbyint(in[g0 + i] / sf)));
+                    o[g0 + i] = basalt::kernels::f32_from_f16(basalt::kernels::f16_from_f32(code * sf));
+                }
+            }
+            return out;
+        };
+        const torch::Tensor cells = torch::randn({37, 2, 128}, torch::kFloat32) * torch::rand({37, 2, 1}) * 30.0;
+        check(max_abs_diff(basalt::dfly2::kv_int8_round(cells), by_hand(cells)) == 0.0, "random cells: the kernel's values bit for bit");
+        check(max_abs_diff(basalt::dfly2::kv_int8_round(cells.to(torch::kFloat16)), by_hand(cells.to(torch::kFloat16))) == 0.0,
+              "FP16 cells, as a shard holds them");
+        // halves round to even; a group of zeros stays zero
+        torch::Tensor ties = torch::zeros({2, 64});
+        ties[0][0] = 127.0f;
+        ties[0][1] = 2.5f;
+        ties[0][2] = 3.5f;
+        ties[0][3] = -2.5f;
+        const torch::Tensor tied = basalt::dfly2::kv_int8_round(ties);
+        check(tied[0][1].item<float>() == 2.0f && tied[0][2].item<float>() == 4.0f && tied[0][3].item<float>() == -2.0f &&
+                  tied[1].abs().max().item<float>() == 0.0f,
+              "2.5 and 3.5 against a scale of 1 code 2 and 4; zeros stay zero");
+        check(throws([&] { basalt::dfly2::kv_int8_round(torch::zeros({3, 48})); }), "a head width that is not whole groups");
+    }
+
+    std::printf("8. blocks that read an INT8 cache\n");
+    {
+        const int64_t W = 64;
+        torch::Tensor q8 = torch::randn({N, B, H, W}, f64).requires_grad_(true);
+        torch::Tensor kb8 = torch::randn({N, B, G, W}, f64).requires_grad_(true);
+        torch::Tensor vb8 = torch::randn({N, B, G, W}, f64).requires_grad_(true);
+        const torch::Tensor kc8 = torch::randn({L, G, W}).to(torch::kFloat16), vc8 = torch::randn({L, G, W}).to(torch::kFloat16);
+        const torch::Tensor marks = torch::tensor(std::vector<uint8_t>{1, 0, 1}).to(torch::kBool);
+        const torch::Tensor mixed = sparse_context_attention(q8, kb8, vb8, kc8, vc8, idx, 2, marks);
+        const torch::Tensor plain = sparse_context_attention(q8, kb8, vb8, kc8, vc8, idx);
+        const torch::Tensor rounded = sparse_context_attention(q8, kb8, vb8, basalt::dfly2::kv_int8_round(kc8), basalt::dfly2::kv_int8_round(vc8), idx);
+        const torch::Tensor want = torch::where(marks.view({N, 1, 1, 1}), rounded, plain);
+        check(max_abs_diff(mixed, want) < 1e-13 && max_abs_diff(mixed.select(0, 0), plain.select(0, 0)) > 1e-6,
+              "a marked block reads the cells as the INT8 rule returns them, the others as stored");
+        const auto ours8 = torch::autograd::grad({(mixed * torch::ones_like(mixed)).sum()}, {q8, kb8, vb8});
+        const auto ref8 = torch::autograd::grad({(want * torch::ones_like(want)).sum()}, {q8, kb8, vb8});
+        double worst8 = 0;
+        for (size_t i = 0; i < 3; ++i) worst8 = std::max(worst8, max_abs_diff(ours8[i], ref8[i]));
+        check(worst8 < 1e-12, "and its gradients are those of the attention over those cells");
+    }
     return dfly2_test::finish("attention_test");
     });
 }

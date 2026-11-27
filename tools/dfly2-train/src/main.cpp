@@ -73,10 +73,12 @@ void usage() {
         "  --kl-topk N  --dpace-alpha X  --e2e-weight X  --confidence-weight X      the loss (10, 0.5, 1, 1)\n"
         "  --prefix-weight X      loss weight, 0 to 1, of a block whose anchor follows a row of the target's prompt path\n"
         "                         rather than a verify window; 0 leaves them out (1)\n"
+        "  --kv-int8-share X      share, 0 to 1, of the blocks that read the target's cache and store their own keys and\n"
+        "                         values as a target serving with --kv int8 does (0)\n"
         "\n"
         "eval: the loss and the accepted-length metrics of a drafter over shards\n"
         "  --model, --shards, --device, --head-dtype, --blocks, --loss-blocks, --attention-blocks, --seed, --queue-gb,\n"
-        "  --kl-topk, --dpace-alpha, --e2e-weight, --confidence-weight, --prefix-weight as for train\n"
+        "  --kl-topk, --dpace-alpha, --e2e-weight, --confidence-weight, --prefix-weight, --kv-int8-share as for train\n"
         "  --checkpoint FILE      the drafter file to measure\n"
         "  --max-blocks N         measure this many blocks (default: all)\n",
         stdout);
@@ -159,6 +161,7 @@ bool run_flag(const std::string& a, Args& args, RunOptions& o) {
     else if (a == "--e2e-weight") o.loss.e2e_weight = args.real("--e2e-weight");
     else if (a == "--confidence-weight") o.loss.confidence_weight = args.real("--confidence-weight");
     else if (a == "--prefix-weight") o.prefix_weight = args.real("--prefix-weight");
+    else if (a == "--kv-int8-share") o.kv_int8_share = args.real("--kv-int8-share");
     else return false;
     return true;
 }

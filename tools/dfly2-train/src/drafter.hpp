@@ -40,15 +40,18 @@ struct SequenceContext {
 struct BlockBatch {
     torch::Tensor anchors;            ///< [N] int64 rows of the sequence
     std::vector<torch::Tensor> sel;   ///< per draft layer [N][W] int64 cell ids, -1 padded
+    torch::Tensor kv_int8;            ///< [N] bool: blocks served from an INT8 cache; undefined: every block from FP16
 };
 
 /// The attention of one draft layer (step 3 of the contract's forward).
 struct DraftAttentionImpl : torch::nn::Module {
     explicit DraftAttentionImpl(const DrafterShape& s);
     /// `y` [N][B][hidden] normed layer input, `pos` [N][B] int64 rotary positions; returns the layer's attention
-    /// output [N][B][hidden] in y's type.
+    /// output [N][B][hidden] in y's type. The block rows' own keys and values are read as the cache stores them:
+    /// FP16, or by the INT8 rule for the blocks `kv_int8` marks, which also read the cached cells that way; the
+    /// rounding passes the gradient straight through.
     torch::Tensor forward(const torch::Tensor& y, const torch::Tensor& pos, const torch::Tensor& k_ctx, const torch::Tensor& v_ctx,
-                          const torch::Tensor& idx, int64_t chunk_blocks);
+                          const torch::Tensor& idx, const torch::Tensor& kv_int8, int64_t chunk_blocks);
     /// Turns the first n_rot values of each head of `x` [N][B][heads][head_dim] by the rows' positions.
     torch::Tensor rope(const torch::Tensor& x, const torch::Tensor& pos) const;
 
@@ -70,7 +73,7 @@ TORCH_MODULE(SwiGlu);
 struct DraftLayerImpl : torch::nn::Module {
     explicit DraftLayerImpl(const DrafterShape& s);
     torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& pos, const torch::Tensor& k_ctx, const torch::Tensor& v_ctx,
-                          const torch::Tensor& idx, int64_t chunk_blocks);
+                          const torch::Tensor& idx, const torch::Tensor& kv_int8, int64_t chunk_blocks);
     RmsNorm input_layernorm{nullptr}, post_attention_layernorm{nullptr};
     DraftAttention self_attn{nullptr};
     SwiGlu mlp{nullptr};

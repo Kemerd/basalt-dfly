@@ -12,6 +12,10 @@
 // export.json) through verify windows, as served rows are read. An anchor whose row before is a prompt-path row (a
 // prefix anchor) carries that path's hidden row and selection, which serving never hands a drafter; its blocks weigh
 // `prefix_weight` in the loss, and none is taken at weight 0.
+//
+// A share `kv_int8_share` of the blocks is read as a target serving from an INT8 cache would hand it to the drafter
+// (contract item 14 of the export); which ones is a function of the run's seed, the epoch, the sequence and the
+// anchor.
 #pragma once
 
 #include "target_weights.hpp"
@@ -30,6 +34,7 @@ namespace basalt::dfly2 {
 /// How a shard set's blocks are taken.
 struct DataOptions {
     double prefix_weight = 1.0;   ///< loss weight of a prefix anchor's block, in [0, 1]; 0 takes none
+    double kv_int8_share = 0.0;   ///< share of the blocks, in [0, 1], that read the cache as INT8 serving does
 };
 
 /// A sequence of the set that has at least one trainable block.
@@ -48,6 +53,7 @@ struct LoadedSequence {
     torch::Tensor selection;             ///< [n][layers][sel_cap] int32, -1 padded
     torch::Tensor sel_count;             ///< [n][layers] int32: ids before the padding
     torch::Tensor weight;                ///< [n] float32: each block's loss weight
+    torch::Tensor kv_int8;               ///< [n] bool: blocks read as from an INT8 cache; undefined at a share of 0
     int64_t epoch = 0;
     uint64_t position = 0;               ///< place in the epoch's order
     uint64_t first = 0;                  ///< blocks of the sequence that came before anchors[0]
