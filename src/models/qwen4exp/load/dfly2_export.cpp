@@ -89,6 +89,56 @@ double f16_error(const uint16_t* a, const uint16_t* b, size_t n, double* cosine 
     return bb > 0 ? std::sqrt(dd / bb) : dd > 0 ? 1.0 : 0.0;
 }
 
+/// The anchors of document `line` of `n` rows whose windows start at row `m`: a prefix anchor follows a prompt-path
+/// row, a window anchor a window row, and every anchor has a whole block after it.
+std::vector<int32_t> document_anchors(uint64_t line, int64_t n, int64_t m) {
+    std::vector<int32_t> anchors = basalt::dfly2::sample_anchors(kSeed, line, 1, std::min(m, n - kBlock), kPrefixEvery);
+    const std::vector<int32_t> tail = basalt::dfly2::sample_anchors(kSeed, line, m + 1, n - kBlock, kWindowEvery);
+    anchors.insert(anchors.end(), tail.begin(), tail.end());
+    return anchors;
+}
+
+/// A document's rows, cells and selections as one number: each array is summed in the order a shard holds it, so
+/// the pieces a document arrives in do not change it and a sequence read back gives the same one.
+struct DocDigest {
+    uint64_t hidden, sel, k[kNPaired], v[kNPaired];
+    DocDigest() { reset(); }
+    void reset() {
+        hidden = sel = basalt::core::fnv1a64(nullptr, 0);
+        for (int l = 0; l < kNPaired; ++l) k[l] = v[l] = hidden;
+    }
+    static void add(uint64_t& sum, const void* at, size_t bytes) {
+        sum = basalt::core::fnv1a64((const uint8_t*) at, (uint64_t) bytes, sum);
+    }
+    /// One anchor's selection in one paired layer: its first `count` ids.
+    void selection(int64_t anchor, const int32_t* ids, size_t count) {
+        add(sel, &anchor, sizeof anchor);
+        add(sel, ids, count * sizeof(int32_t));
+    }
+    uint64_t value() const {
+        uint64_t sum = hidden;
+        add(sum, &sel, sizeof sel);
+        add(sum, k, sizeof k);
+        add(sum, v, sizeof v);
+        return sum;
+    }
+    /// The digest of a sequence as a shard holds it.
+    static uint64_t of(const basalt::dfly2::ShardHeader& h, const basalt::dfly2::SequenceData& d) {
+        DocDigest sum;
+        add(sum.hidden, d.hidden.data(), d.hidden.size());
+        for (uint32_t l = 0; l < h.n_layers && l < (uint32_t) kNPaired; ++l) {
+            add(sum.k[l], d.k[l].data(), d.k[l].size() * sizeof(uint16_t));
+            add(sum.v[l], d.v[l].data(), d.v[l].size() * sizeof(uint16_t));
+        }
+        for (size_t a = 0; a < d.anchors.size(); ++a)
+            for (uint32_t l = 0; l < h.n_layers; ++l) {
+                const size_t slot = a * h.n_layers + l;
+                sum.selection(d.anchors[a], d.selection.data() + slot * h.sel_cap, (size_t) d.sel_count[slot]);
+            }
+        return sum.value();
+    }
+};
+
 /// The documents file, a line at a time: a document may be longer than any fixed buffer.
 class DocsFile {
 public:
@@ -171,7 +221,7 @@ struct Export {
     std::vector<int32_t> anchors;
     bool writing = false;                ///< its pieces go to the writer (else they are only digested)
     bool digesting = false;
-    uint64_t digest = 0;
+    DocDigest digest;
     ShardQueue::Piece* cur = nullptr;    ///< the piece being filled
     uint32_t cur_layers = 0;             ///< the paired layers whose selections `cur` has
 
@@ -424,30 +474,25 @@ struct Export {
         return true;
     }
 
-    /// Adds the piece's rows, its own cells and its selections to the document's digest.
+    /// Adds the piece's rows, its own cells and its selections to the document's digest, each read from where the
+    /// target left it.
     void digest_piece(const ShardQueue::Piece& p) {
-        const auto add = [&](const void* at, size_t bytes) {
-            digest = basalt::core::fnv1a64((const uint8_t*) at, (uint64_t) bytes, digest);
-        };
-        add(&p.row0, sizeof p.row0);
-        add(&p.rows, sizeof p.rows);
-        add(p.hidden, (size_t) p.rows * (size_t) N * sizeof(uint16_t));
+        DocDigest::add(digest.hidden, p.hidden, (size_t) p.rows * (size_t) N * sizeof(uint16_t));
         const size_t heads = (size_t) g.n_head_kv, dim = (size_t) g.head_dim;
         for (int k = 0; k < kNPaired; ++k)
             for (int64_t r = 0; r < p.rows; ++r) {
                 const size_t cell = (size_t) (p.row0 + r), pg = cell / (size_t) page - (size_t) p.page0;
                 for (size_t h = 0; h < heads; ++h) {
                     const size_t from = ((pg * heads + h) * (size_t) page + cell % (size_t) page) * dim;
-                    add(p.k[k] + from, dim * sizeof(uint16_t));
-                    add(p.v[k] + from, dim * sizeof(uint16_t));
+                    DocDigest::add(digest.k[k], p.k[k] + from, dim * sizeof(uint16_t));
+                    DocDigest::add(digest.v[k], p.v[k] + from, dim * sizeof(uint16_t));
                 }
             }
         for (int i = 0; i < p.n_sel; ++i) {
             const int64_t a = anchors[(size_t) p.sel_anchor[i]];
-            add(&a, sizeof a);
             for (int k = 0; k < kNPaired; ++k)
-                add(p.sel + ((size_t) i * kNPaired + (size_t) k) * (size_t) cap,
-                    (size_t) std::min<int64_t>(a, cap) * sizeof(int32_t));
+                digest.selection(a, p.sel + ((size_t) i * kNPaired + (size_t) k) * (size_t) cap,
+                                 (size_t) std::min<int64_t>(a, cap));
         }
     }
 
@@ -583,10 +628,7 @@ struct Export {
     bool read_document(const std::vector<int64_t>& doc, uint64_t line, int64_t window_rows, bool write, std::string& e) {
         n = (int64_t) doc.size();
         m = basalt::dfly2::window_from(n, window_rows);
-        // prefix anchors follow a prompt-path row, window anchors a window row; every block is whole
-        anchors = basalt::dfly2::sample_anchors(kSeed, line, 1, std::min(m, n - kBlock), kPrefixEvery);
-        const std::vector<int32_t> tail = basalt::dfly2::sample_anchors(kSeed, line, m + 1, n - kBlock, kWindowEvery);
-        anchors.insert(anchors.end(), tail.begin(), tail.end());
+        anchors = document_anchors(line, n, m);
         writing = write;
         if (write) {
             std::vector<int32_t> ids(doc.size());
@@ -799,7 +841,7 @@ int dfly2_export(Context& context) {
         }
         // the run's first document is digested: it is read once more at the end
         x.digesting = documents == 0;
-        x.digest = 0;
+        x.digest.reset();
         if (!x.read_document(doc, at, window_rows, true, err)) return failed("line " + std::to_string(at + 1) + ": " + err);
         if (x.checking) x.compare();
         x.checking = false;
@@ -807,7 +849,7 @@ int dfly2_export(Context& context) {
         if (documents == 0) {
             first_doc = doc;
             first_line = at;
-            first_digest = x.digest;
+            first_digest = x.digest.value();
             basalt::log::info("basalt generate", "--dfly2-export: the first document's %lld prompt-path rows at %.0f rows/s, "
                                  "its %lld window rows at %.1f rows/s",
                          (long long) x.rows_prompt, rate(x.rows_prompt, x.ms_prompt), (long long) x.rows_window,
@@ -827,10 +869,10 @@ int dfly2_export(Context& context) {
     // and selections, the reset between documents leaves nothing behind
     if (documents > 0) {
         x.digesting = true;
-        x.digest = 0;
+        x.digest.reset();
         if (!x.read_document(first_doc, first_line, windows ? o.dfly2_window_rows : 0, false, err))
             return failed("reading the first document again: " + err);
-        if (x.digest == first_digest)
+        if (x.digest.value() == first_digest)
             basalt::log::info("basalt generate", "--dfly2-export: the first document read again after the last gave the "
                                  "same rows, cells and selections");
         else
@@ -840,7 +882,56 @@ int dfly2_export(Context& context) {
                          (unsigned long long) (first_line + 1));
     }
     if (!x.queue.close(err)) return failed(err);
-    const bool checked = check_every <= 0 || x.check_report();
+
+    // ---- every closed shard back through the format's reader, against the documents file: each sequence's tokens,
+    // the anchors drawn for it and the form of its selections, and this run's first document as it was computed
+    DocsFile docs_again;
+    if (!docs_again.open(o.dfly2_docs)) return failed("cannot read " + o.dfly2_docs + " again");
+    uint64_t line_again = 0, digest_back = 0;
+    const SequenceSource expected = [&](uint64_t seq, std::vector<int32_t>& ids, std::vector<int32_t>& anchors,
+                                        std::string& e) {
+        // sequence k is line k, cut as it was when it was read
+        if (seq != line_again || !docs_again.next(line_text)) {
+            e = "the documents file has no line for it";
+            return false;
+        }
+        ++line_again;
+        if (!cli::parse_i64_list(line_text.c_str(), doc, e)) return false;
+        if ((int64_t) doc.size() > o.max_context) doc.resize((size_t) o.max_context);
+        ids.resize(doc.size());
+        for (size_t i = 0; i < doc.size(); ++i) ids[i] = (int32_t) doc[i];
+        anchors = document_anchors(seq, (int64_t) doc.size(),
+                                   basalt::dfly2::window_from((int64_t) doc.size(), windows ? o.dfly2_window_rows : 0));
+        return true;
+    };
+    const SequenceSink seen = [&](uint64_t seq, const basalt::dfly2::SequenceData& data) {
+        if (documents > 0 && seq == first_line) digest_back = DocDigest::of(header, data);
+    };
+    ReadBack back;
+    const Clock::time_point t_back = Clock::now();
+    bool whole = shards_read_back(o.dfly2_export, header, shapes.idx_block, line, expected, seen, back, err);
+    if (!whole) {
+        basalt::log::error("basalt generate", "--dfly2-export: reading the shards back: %s", err.c_str());
+    } else {
+        const bool first_same = documents == 0 || digest_back == first_digest;
+        if (back.off_form != 0)
+            basalt::log::error("basalt generate", "--dfly2-export: %llu of %llu selections read back do not have the "
+                                  "form of the index's selection; the first: %s",
+                          (unsigned long long) back.off_form, (unsigned long long) back.selections,
+                          back.first_off_form.c_str());
+        if (!first_same)
+            basalt::log::error("basalt generate", "--dfly2-export: the first document (line %llu) read back from its "
+                                  "shard is not the rows, cells and selections that were computed",
+                          (unsigned long long) (first_line + 1));
+        basalt::log::info("basalt generate", "--dfly2-export: %llu shards read back in %.1f s: %llu sequences, %llu tokens "
+                             "and %llu anchors are the documents'%s",
+                     (unsigned long long) back.shards, std::chrono::duration<double>(Clock::now() - t_back).count(),
+                     (unsigned long long) back.sequences, (unsigned long long) back.tokens,
+                     (unsigned long long) back.anchors,
+                     documents > 0 && first_same ? "; this run's first document is as computed" : "");
+        whole = back.off_form == 0 && first_same;
+    }
+    const bool checked = (check_every <= 0 || x.check_report()) && whole;
     basalt::log::info("basalt generate", "--dfly2-export: %lld documents, %lld tokens (%lld documents cut to %lld tokens); "
                          "%lld prompt-path rows at %.0f rows/s, %lld window rows at %.1f rows/s; the lent cache slots "
                          "refilled %lld times in %.0f ms",

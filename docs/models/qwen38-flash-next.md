@@ -80,7 +80,10 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   is refused with its name and the stored value; when `--prefill auto` settles on another chunk, pass the stored one as
   `--prefill N`.
 - **Check:** at its end the run reads its first document once more and reports whether the rows, cells and selections are
-  the same as the first time.
+  the same as the first time. It then reads every closed shard back through the shard reader: each sequence's tokens
+  against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
+  4, the lowest cells of at most one more block, and the unfinished last block), and the first document's arrays against
+  what was computed. A difference is an error line and exit code 1; the shards stay.
 - **Refused:** `--serve`, `--kv` other than `fp16`, `--kv-resident`, `--prefill 0`, a control vector, a rope scaling and
   `gpu-mode split`.
 - **Memory:** VRAM as a one-shot run with `--spec 8`. RAM: two page-locked buffers of one prompt chunk's rows and cells each

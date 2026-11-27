@@ -1,6 +1,7 @@
 // src/models/qwen4exp/load/dfly2_shard_queue.hpp - the teacher export's writer (basalt/artifact/dfly2_shard.hpp): the
 // compute thread hands over sequences and their pieces in row order, one thread repacks and writes them. The piece
-// buffers are the only bound: a compute thread that outruns the disk waits for one. Host only.
+// buffers are the only bound: a compute thread that outruns the disk waits for one. And the pass that reads an
+// export's shards back. Host only.
 #pragma once
 
 #include "basalt/artifact/dfly2_shard.hpp"
@@ -8,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -118,5 +120,31 @@ private:
 
 /// The export's settings file in `dir`: written when absent, else compared key by key; false names the key that differs.
 bool manifest_check(const std::string& dir, const std::map<std::string, std::string>& settings, std::string& err);
+
+/// Whether `ids` (`count` cells) can be what the target's index selects for a row that reads among `n_kv` cells,
+/// when `block` cells share an index key and at most `cap` are selected: every cell while they fit. Past that,
+/// `cap` ascending cells, of each block its lowest ones, the unfinished last block whole and at most one other
+/// block in part. The scores decide which blocks, so they are not needed here.
+bool selection_form(const int32_t* ids, uint64_t count, int64_t n_kv, int64_t block, int64_t cap);
+
+/// What reading an export's shards back found.
+struct ReadBack {
+    uint64_t shards = 0, sequences = 0, tokens = 0, anchors = 0;
+    uint64_t selections = 0, off_form = 0;   ///< selections read, and those `selection_form` refuses
+    std::string first_off_form;              ///< where the first of those is
+};
+/// Sequence `seq` as an export hands it to the writer: its tokens and its anchors. False with `err`: it has none.
+using SequenceSource = std::function<bool(uint64_t seq, std::vector<int32_t>& tokens, std::vector<int32_t>& anchors,
+                                          std::string& err)>;
+/// A sequence that read back with its tokens and anchors.
+using SequenceSink = std::function<void(uint64_t seq, const dfly2::SequenceData& data)>;
+
+/// Reads the closed shards of `dir` back through the format's reader, in the export's order: every shard is of
+/// `geometry`, they hold `sequences` sequences, each starts at position 0 with the tokens and anchors `expected`
+/// gives for it, and every array passes the reader's checks. Selections that do not have the form of the
+/// target's index (`index_block` cells a key) are counted, not refused. `seen`, when given, gets each sequence.
+/// False with `err`, which names the shard and the sequence.
+bool shards_read_back(const std::string& dir, const dfly2::ShardHeader& geometry, int64_t index_block, uint64_t sequences,
+                      const SequenceSource& expected, const SequenceSink& seen, ReadBack& found, std::string& err);
 
 }  // namespace basalt::models::qwen4exp::generate
