@@ -6,6 +6,7 @@
 #include "basalt/dfly2/anchors.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
@@ -31,11 +32,14 @@ constexpr int kNPaired = (int) (sizeof kPaired / sizeof kPaired[0]);
 constexpr int64_t kCheckContext[] = {2051, 8192, 32768};   // rows are summed by cells of context: up to each, and above
 constexpr int kNCheckContext = (int) (sizeof kCheckContext / sizeof kCheckContext[0]) + 1;
 constexpr int64_t kCheckGather = 2048;                     // cells the check gathers from the cache at a time
-// where both paths read every cell, the head rows' mean cosine below this is a wrong row, not rounding
-constexpr double kCheckCosine = 0.999;
 // prefix anchors stand for window anchors past 2,051 cells when no layer differs in more of its selected cells than
-// this and the head rows' mean cosine is at least kCheckCosine
+// kGateDiffer and the head rows' mean cosine against the windows' is at least kGateCosine
+constexpr double kGateCosine = 0.999;
 constexpr double kGateDiffer = 0.01;
+// the prompt path's head rows against the decode's mix of the same residual rows differ by rounding only: a row whose
+// cosine is under this is a wrong mix
+constexpr double kMixCosine = 0.9999;
+constexpr int64_t kMixRun = 256;                           // rows the check mixes the decode's way per copy
 
 /// The index of `layer` in the paired layers, or -1.
 int paired_index(int64_t layer) {
@@ -75,6 +79,8 @@ struct TailRows {
 struct CheckSums {
     int64_t rows = 0;
     double cos_sum = 0, cos_min = 1, row_err_max = 0;           ///< the head's rows
+    int64_t off_rows = 0;
+    double off_cos_sum = 0;                                     ///< a prompt-path head row against the window row before
     int64_t selected[kNPaired] = {}, differ[kNPaired] = {};     ///< selected cells, and those only one path selected
     double k_err_sum[kNPaired] = {}, k_err_max[kNPaired] = {};  ///< a cell's relative error
     double v_err_sum[kNPaired] = {}, v_err_max[kNPaired] = {};
@@ -192,9 +198,20 @@ struct Export {
     std::vector<int32_t> gather_ids;
     int32_t* d_gather_ids = nullptr;
     uint16_t *d_gather_k = nullptr, *d_gather_v = nullptr;
+    // the prompt path's head rows against the decode's mix (lm_head_mix) of the same residual rows
+    basalt::core::BlockBuffers mix_bb;           ///< only R, mixed, inject and gr are set: what lm_head_mix reads
+    void* d_mix_ws = nullptr;                    ///< device: the mix's workspace and injection
+    float* d_mix = nullptr;                      ///< device: [kMixRun][N]
+    uint16_t* d_mix16 = nullptr;
+    std::vector<uint16_t> mix16;
+    int64_t mix_rows = 0;
+    double mix_cos_sum = 0, mix_cos_min = 1, mix_err_max = 0;
 
     ~Export() {
         if (d_rows16 != nullptr) cudaFree(d_rows16);
+        if (d_mix_ws != nullptr) cudaFree(d_mix_ws);
+        if (d_mix != nullptr) cudaFree(d_mix);
+        if (d_mix16 != nullptr) cudaFree(d_mix16);
         if (d_gather_ids != nullptr) cudaFree(d_gather_ids);
         if (d_gather_k != nullptr) cudaFree(d_gather_k);
         if (d_gather_v != nullptr) cudaFree(d_gather_v);
@@ -213,6 +230,53 @@ struct Export {
             cudaMalloc((void**) &d_gather_v, run * sizeof(uint16_t)) != cudaSuccess) {
             e = cuda_text("the check's gather buffers");
             return false;
+        }
+        // the decode's mix: its workspace, then the injection it may write, 16-byte aligned
+        const basalt::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+        const size_t ws_bytes = (basalt::kernels::gr_workspace_bytes(gs) + 15) / 16 * 16;
+        if (cudaMalloc(&d_mix_ws, ws_bytes + (size_t) g.hc * sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_mix, (size_t) kMixRun * (size_t) N * sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_mix16, (size_t) kMixRun * (size_t) N * sizeof(uint16_t)) != cudaSuccess) {
+            e = cuda_text("the check's mix buffers");
+            return false;
+        }
+        basalt::kernels::gr_workspace_init(gs, d_mix_ws, mix_bb.gr);
+        mix_bb.inject = (float*) ((char*) d_mix_ws + ws_bytes);
+        mix16.resize((size_t) kMixRun * (size_t) N);
+        return true;
+    }
+
+    /// The `T` head rows `hidden` the prompt path made from residual rows `R_rows` (device, [T][hc][n_embd]) against
+    /// the decode's mix of the same rows, rounded to fp16 as a window's are.
+    bool check_mix(const float* R_rows, int64_t T, const uint16_t* hidden, std::string& e) {
+        if (context.wt == nullptr || d_mix == nullptr) {
+            e = "the check's mix has no weights or buffers";
+            return false;
+        }
+        const size_t D = (size_t) (g.hc * g.n_embd);
+        for (int64_t r0 = 0; r0 < T; r0 += kMixRun) {
+            const int64_t run = std::min(kMixRun, T - r0);
+            for (int64_t i = 0; i < run; ++i) {
+                mix_bb.R = const_cast<float*>(R_rows + (size_t) (r0 + i) * D);
+                mix_bb.mixed = d_mix + (size_t) i * (size_t) N;
+                if (!basalt::core::lm_head_mix(*context.wt, g, mix_bb, cs, e)) return false;
+            }
+            basalt::kernels::f32_to_f16_bulk(d_mix, d_mix16, run * N, cs);
+            if (cudaMemcpyAsync(mix16.data(), d_mix16, (size_t) run * (size_t) N * sizeof(uint16_t), cudaMemcpyDeviceToHost,
+                                cs) != cudaSuccess ||
+                cudaStreamSynchronize(cs) != cudaSuccess) {
+                e = cuda_text("the check's mix of a chunk's rows");
+                return false;
+            }
+            for (int64_t i = 0; i < run; ++i) {
+                double cosine = 1;
+                const double err = f16_error(hidden + (size_t) (r0 + i) * (size_t) N, mix16.data() + (size_t) i * (size_t) N,
+                                             (size_t) N, &cosine);
+                ++mix_rows;
+                mix_cos_sum += cosine;
+                mix_cos_min = std::min(mix_cos_min, cosine);
+                mix_err_max = std::max(mix_err_max, err);
+            }
         }
         return true;
     }
@@ -302,6 +366,14 @@ struct Export {
             c.cos_sum += cosine;
             c.cos_min = std::min(c.cos_min, cosine);
             c.row_err_max = std::max(c.row_err_max, row_err);
+            // the same against the window's row before: what a head row one off would give
+            if (r > 0) {
+                double off = 1;
+                f16_error(by_prompt.hidden.data() + (size_t) r * (size_t) N, by_window.hidden.data() + (size_t) (r - 1) * (size_t) N,
+                          (size_t) N, &off);
+                ++c.off_rows;
+                c.off_cos_sum += off;
+            }
             const int64_t width = std::min(n_kv, cap);
             for (int k = 0; k < kNPaired; ++k) {
                 // both lists ascend: a cell of the prompt path's that the window's lacks
@@ -327,25 +399,37 @@ struct Export {
         ++check_documents;
     }
 
-    /// Logs the check's sums and whether prefix anchors pass the gate past 2,051 cells. False when, where every
-    /// cell is selected, the two paths selected other cells or their head rows' mean cosine is under kCheckCosine,
-    /// or when a piece's cells were not the cache's.
+    /// Logs the check's sums and whether prefix anchors pass the gate past 2,051 cells. False when a prompt-path
+    /// head row is not the decode's mix of its residual row (a cosine under kMixCosine), when, where every cell is
+    /// selected, the two paths selected other cells or the head rows match the window's row before as well as their
+    /// own, or when a piece's cells were not the cache's.
     bool check_report() const {
         bool ok = check_runs_differ == 0, gate = true;
         int64_t gate_rows = 0;
+        const double mix_mean = mix_rows > 0 ? mix_cos_sum / (double) mix_rows : 0.0;
+        basalt::log::info("basalt generate", "--dfly2-export check: %lld prompt-path head rows against the decode's mix of the "
+                             "same residual rows: cosine mean %.8f, least %.8f, largest relative error %.3g",
+                     (long long) mix_rows, mix_mean, mix_cos_min, mix_err_max);
+        if (mix_rows == 0 || !(mix_cos_min >= kMixCosine)) {
+            ok = false;
+            basalt::log::error("basalt generate", "--dfly2-export check: a prompt-path head row's cosine against the decode's "
+                                  "mix of its residual row is under %.4f: the head input is not the mix",
+                               kMixCosine);
+        }
         for (int b = 0; b < kNCheckContext; ++b) {
             const CheckSums& c = sums[b];
             if (c.rows == 0) continue;
             const double cos_mean = c.cos_sum / (double) c.rows;
-            if (b == 0 && !(cos_mean >= kCheckCosine)) {
+            const double off_mean = c.off_rows > 0 ? c.off_cos_sum / (double) c.off_rows : 0.0;
+            if (b == 0 && c.off_rows > 0 && !(cos_mean > off_mean)) {
                 ok = false;
                 basalt::log::error("basalt generate", "--dfly2-export check: where both paths read every cell, the head "
-                                      "rows' mean cosine %.6f is under %.3f: a head row is not the one the windows compute",
-                                   cos_mean, kCheckCosine);
+                                      "rows' mean cosine %.6f is not above %.6f, theirs against the window row before: the "
+                                      "rows are not aligned", cos_mean, off_mean);
             }
             if (b > 0) {
                 gate_rows += c.rows;
-                gate = gate && cos_mean >= kCheckCosine;
+                gate = gate && cos_mean >= kGateCosine;
                 for (int k = 0; k < kNPaired; ++k)
                     gate = gate && (double) c.differ[k] <= kGateDiffer * (double) c.selected[k];
             }
@@ -353,8 +437,9 @@ struct Export {
             if (b < kNCheckContext - 1) std::snprintf(range, sizeof range, "up to %lld", (long long) kCheckContext[b]);
             else std::snprintf(range, sizeof range, "above %lld", (long long) kCheckContext[b - 1]);
             basalt::log::info("basalt generate", "--dfly2-export check: %lld rows with %s cells of context, the prompt path "
-                                 "against verify windows: head rows' cosine mean %.6f, least %.6f, largest relative error %.3g",
-                         (long long) c.rows, range, cos_mean, c.cos_min, c.row_err_max);
+                                 "against verify windows: head rows' cosine mean %.6f (%.6f against the row before), least "
+                                 "%.6f, largest relative error %.3g",
+                         (long long) c.rows, range, cos_mean, off_mean, c.cos_min, c.row_err_max);
             for (int k = 0; k < kNPaired; ++k) {
                 basalt::log::info("basalt generate", "--dfly2-export check:   layer %d: %.4f%% of the selected cells differ "
                                      "(%lld of %lld); K relative error mean %.3g, largest %.3g; V mean %.3g, largest %.3g",
@@ -383,7 +468,7 @@ struct Export {
                                  "window rows (at most %.0f%% of a layer's selected cells differ, head rows' mean cosine at "
                                  "least %.3f): prefix anchors %s",
                               (long long) kCheckContext[0], gate ? "stand" : "do not stand", 100.0 * kGateDiffer,
-                              kCheckCosine, gate ? "may be trained on" : "are best left out of training");
+                              kGateCosine, gate ? "may be trained on" : "are best left out of training");
         return ok;
     }
 
@@ -519,6 +604,7 @@ struct Export {
         }
         // the head's rows last: its wait covers the copies queued before it
         if (!copy_cells(e) || !prefill.head_input(R_rows, T, cur->hidden, e)) return false;
+        if (checking && !check_mix(R_rows, T, cur->hidden, e)) return false;
         rows_prompt += T;
         return piece_done(e);
     }

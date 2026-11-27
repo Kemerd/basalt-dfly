@@ -104,6 +104,12 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
   4, the lowest cells of at most one more block, and the unfinished last block), and the first document's arrays against
   what was computed. A difference is an error line and exit code 1; the shards stay.
+- **Path check:** `--exp dfly2_export_check=N` also reads every Nth document's window rows by the prompt path. Every
+  prompt-path head row is compared with the decode's mix of the same residual row (the windows' mix), which differs by
+  rounding only: a cosine under 0.9999 is an error. The two paths' rows, cells and selections are reported by cells of
+  context, and the rows must match their own window row better than the window row before. The paths compute differently
+  (FP4 or int8 expert activations, a BF16 residual), so their rows are not equal: on this pack's 100k-token test set, head
+  rows' cosine 0.984 against 0.45 for the row before, and 5 to 8% of selected cells differ past 2,051 cells of context.
 - **Placement:** the windows run their experts where the load placed them, with or without `--diag-fixed-experts` (which
   fixes only the prompt path's: all on the GPU, no CPU share). Two runs give the same bytes when they also pass the same
   `--prefill N` and `--expert-cache N`.
