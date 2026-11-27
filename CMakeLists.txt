@@ -360,12 +360,16 @@ target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deeps
 endif()
 
 if(BASALT_MODEL_QWEN35)
-# What the DFlash 2 block drafters of the models share (src/dflash). meta.cpp needs no device: a CPU test lists it as a
-# source and links `artifact` alone.
-add_library(dflash STATIC src/dflash/meta.cpp)
-target_include_directories(dflash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(dflash PUBLIC artifact warnings)
+# What the DFlash 2 block drafters of the models share (src/dflash): the drafter's shape and tensors, and its context and
+# draft passes on the window gemm. meta.cpp and seq.cpp need no device: a CPU test lists one as a source.
+add_library(dflash STATIC src/dflash/meta.cpp src/dflash/seq.cpp src/dflash/forms.cpp src/dflash/context.cpp src/dflash/draft.cpp)
+target_include_directories(dflash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
+target_link_libraries(dflash PUBLIC artifact kernels window_gemm core warnings ${_gpu_runtime_target})
 if(BUILD_TESTING)
+  # a sequence's context range: what a rewind keeps of a ring that wrapped, and its buffers' order (host only)
+  add_executable(dflash_seq_test tests/dflash/seq_test.cpp src/dflash/seq.cpp)
+  target_link_libraries(dflash_seq_test PRIVATE artifact)
+  basalt_cpu_test(NAME dflash_seq_test COMMAND dflash_seq_test)
   # the drafter's shape from a pack's metadata, the shapes it refuses, and its tensors' pack names and sizes (host only)
   add_executable(dflash_meta_test tests/dflash/meta_test.cpp src/dflash/meta.cpp)
   target_link_libraries(dflash_meta_test PRIVATE artifact)

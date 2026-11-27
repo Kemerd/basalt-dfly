@@ -228,21 +228,23 @@ struct Fnv {
 };
 
 // ---- where a session keeps the drafter's state
-float* features(SessionState& st) { return st.dacc; }
-size_t ring_layers(const SessionState& st) { return st.dk.size(); }
-uint16_t* ring_k(SessionState& st, size_t l) { return st.dk[l]; }
-uint16_t* ring_v(SessionState& st, size_t l) { return st.dv[l]; }
-int64_t ring_cells(const SessionState& st) { return st.dctx_cap; }
-int32_t* draft_ids(SessionState& st) { return st.dids; }
-float* draft_conf(SessionState& st) { return st.dconf; }
-int32_t* drawn_ids(SessionState& st) { return st.dq_ids; }
-float* drawn_p(SessionState& st) { return st.dq_p; }
+float* features(SessionState& st) { return st.seq.acc; }
+size_t ring_layers(const SessionState& st) { return st.seq.k.size(); }
+uint16_t* ring_k(SessionState& st, size_t l) { return st.seq.k[l]; }
+uint16_t* ring_v(SessionState& st, size_t l) { return st.seq.v[l]; }
+int64_t ring_cells(const SessionState& st) { return st.seq.cap; }
+int32_t* draft_ids(SessionState& st) { return st.seq.ids; }
+float* draft_conf(SessionState& st) { return st.seq.conf; }
+int32_t* drawn_ids(SessionState& st) { return st.seq.q_ids; }
+float* drawn_p(SessionState& st) { return st.seq.q_p; }
 void set_draw(SessionState& st, float temperature, uint64_t seed) {
-    st.dtemp = temperature;
-    st.dseed = seed;
+    st.seq.temperature = temperature;
+    st.seq.seed = seed;
 }
 // the feature projection j of a window's rows into the session's features
-void tap(Model& m, SessionState& st, size_t j, const uint16_t* rows16, int n) { win_tap(m, j, rows16, features(st), n, st.stream); }
+void tap(Model& m, SessionState& st, size_t j, const uint16_t* rows16, int n) {
+    dflash::tap(m.bd_dec, m.bs, m.ws.w8, j, rows16, n, features(st), st.stream);
+}
 
 int g_bad = 0;
 

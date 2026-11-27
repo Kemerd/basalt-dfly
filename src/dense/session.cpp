@@ -41,7 +41,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     size_t blockbytes = 0;
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
-        blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
+        blockbytes = bd.layers.size() * 2 * dflash::ring_bytes(bd) +
                       (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
     }
     const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_format(), m.o.kv_resident, m.lb, m.le);
@@ -130,19 +130,8 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         }
     }
     if (block) {
-        const BlockDrafter& bd = m.w.dflash;
-        st.dctx_cap = bd.window + 256;
-        for (size_t l = 0; l < bd.layers.size(); ++l) {
-            st.dk.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
-            st.dv.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
-        }
-        st.dacc = st.arena.take<float>((size_t) kWindow * g.n_embd);
-        st.dids = st.arena.take<int32_t>(kWindow);
-        st.dconf = st.arena.take<float>(kWindow);
-        st.dq_ids = st.arena.take<int32_t>((size_t) kWindow * dflash::kDraftQ);
-        st.dq_p = st.arena.take<float>((size_t) kWindow * dflash::kDraftQ);
-        st.win_tok = st.arena.take<int32_t>(kWindow);
-        if (!st.win_tok) {
+        // its rings, a window's features, its drafts and their candidates
+        if (!dflash::take_seq(m.w.dflash, kWindow, [&](size_t n) { return st.arena.take_bytes(n); }, st.seq)) {
             err = m.o.arch + ": the block drafter's buffers do not fit the session's arena";
             return false;
         }
@@ -295,8 +284,8 @@ public:
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
-            if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
-                cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+            if (cudaMemcpyAsync(ids, st_.seq.ids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
+                cudaMemcpyAsync(conf, st_.seq.conf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
                 cudaStreamSynchronize(st_.stream) != cudaSuccess)
                 return fail(m_.o.arch + ": the block drafter failed");
             return {};
@@ -517,17 +506,17 @@ public:
     // same position finds every cell where it was; `valid` says how many cells below the position are this
     // conversation's.
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
-    size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
+    size_t block_ring_bytes() const { return dflash::ring_bytes(m_.w.dflash); }
     size_t running_bytes() const override {
         return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
-               (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
+               (block_ ? st_.seq.k.size() * 2 * block_ring_bytes() : 0);
     }
 
     Result running_state(int64_t pos, bool save, core::RunningState& s) override {
         if (save) {
             if (Result r = settle(pos); !r.ok()) return r;
-            const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0;
-            const int64_t valid = std::clamp<int64_t>(pos - st_.dctx_from, 0, std::min<int64_t>(W, pos));
+            const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.seq.cap) : 0;
+            const int64_t valid = std::clamp<int64_t>(pos - st_.seq.from, 0, std::min<int64_t>(W, pos));
             const int64_t head[4] = {st_.rope_delta, pos, st_.tail_cell, valid};
             s.head.assign((const uint8_t*) head, (const uint8_t*) head + sizeof head);
         } else {
@@ -537,9 +526,9 @@ public:
         if (const size_t n = (size_t) m_.n_gdn * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
         if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
         if (block_)
-            for (size_t l = 0; l < st_.dk.size(); ++l) {
-                s.regions.push_back({st_.dk[l], block_ring_bytes()});
-                s.regions.push_back({st_.dv[l], block_ring_bytes()});
+            for (size_t l = 0; l < st_.seq.k.size(); ++l) {
+                s.regions.push_back({st_.seq.k[l], block_ring_bytes()});
+                s.regions.push_back({st_.seq.v[l], block_ring_bytes()});
             }
         s.stream = st_.stream;
         s.peer_regions.clear();
@@ -555,14 +544,15 @@ public:
         pend_T_ = 0;
         int64_t h[4];
         std::memcpy(h, head, sizeof h);
-        const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.dctx_cap) : 0;
+        const int64_t W = block_ ? std::min<int64_t>(m_.w.dflash.window, st_.seq.cap) : 0;
         if (h[1] != pos || h[3] < 0 || h[3] > W || h[3] > pos) {
-            st_.dctx_from = pos;   // the block drafter's cells are not this conversation's
+            st_.seq.reset(pos);   // the block drafter's cells are not this conversation's
             return fail("restoring the state failed: its head does not match the position");
         }
         st_.rope_delta = h[0];
         st_.tail_cell = h[2];
-        st_.dctx_from = pos - h[3];
+        st_.seq.reset(pos - h[3]);   // the block drafter's context: the cells the state holds below the position
+        st_.seq.extend(pos - h[3], h[3]);
         return {};
     }
 
@@ -752,7 +742,7 @@ private:
             pend_T_ = 0;
             st_.rope_delta = 0;
             st_.tail_cell = -1;
-            st_.dctx_from = 0;
+            st_.seq.reset(0);
             wide_ = false;
             st_.alt_ready = false;
             if (m_.n_gdn &&
@@ -858,12 +848,12 @@ private:
         // the model's, and a drafter that spreads its guesses like the model keeps more of them than its best guesses would.
         // Greedy requests, the wide lists and a request with its own seed keep the drafter's best candidates and the
         // plain draws.
-        st_.dtemp = block_ && sampled && narrow && sampling_.draw_drafts ? sampling_.temperature : 0.0f;
-        st_.dseed = sampling_.seed;
-        if (r.drawn_drafts && st_.dtemp > 0.0f && r.n_tokens > 1) {
-            sampling_.drafts = st_.dids;
-            sampling_.q_ids = st_.dq_ids;
-            sampling_.q_p = st_.dq_p;
+        st_.seq.temperature = block_ && sampled && narrow && sampling_.draw_drafts ? sampling_.temperature : 0.0f;
+        st_.seq.seed = sampling_.seed;
+        if (r.drawn_drafts && st_.seq.temperature > 0.0f && r.n_tokens > 1) {
+            sampling_.drafts = st_.seq.ids;
+            sampling_.q_ids = st_.seq.q_ids;
+            sampling_.q_p = st_.seq.q_p;
             sampling_.q_n = m_.w.dflash.top_k;
             sampling_.n_drawn = r.n_tokens - 1;
         }

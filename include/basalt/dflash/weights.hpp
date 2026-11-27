@@ -31,6 +31,9 @@ struct Meta {
     int n_layers = 0, n_ff = 0;              ///< its own layers and their FFN width
 };
 
+/// Rows of a convolution's coefficient matrix: two taps before the sublayer and two after it, per group.
+inline int64_t conv_rows(const Meta& m) { return m.conv_group > 0 ? 2 * 2 * (int64_t) (m.n_embd / m.conv_group) : 0; }
+
 /// The drafter with its weights on the device.
 struct BlockDrafter : Meta {
     struct Layer {

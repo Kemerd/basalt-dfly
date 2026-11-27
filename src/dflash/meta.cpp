@@ -50,7 +50,7 @@ bool read_weights(BlockDrafter& d, int64_t n_vocab, const Loaders& load) {
     d.present = false;
     if (!load.floats || !load.bf16 || !load.linear || d.conv_group <= 0 || n_vocab <= 0) return false;
     const int64_t H = d.n_embd, AQ = (int64_t) d.n_head * d.head_dim, KV = (int64_t) d.n_kv * d.head_dim;
-    const int64_t conv = 2 * 2 * (H / d.conv_group);   // two taps before the sublayer and two after, per group
+    const int64_t conv = conv_rows(d);
     for (size_t j = 0; j < d.target_layers.size(); ++j) {
         d.fc.emplace_back();
         if (!load.linear("dflash.fc." + std::to_string(j), H, H, d.fc.back())) return false;

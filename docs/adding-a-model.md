@@ -52,6 +52,12 @@ The router then needs one config entry. Nothing in the server names a model.
   2 block drafter), images and video, and gives the session engine its sessions. See `src/models/qwen35/`.
 - A pack's DFlash 2 block drafter is read through `basalt/dflash/weights.hpp`: `read_meta` takes its `<arch>.dflash.*` keys and
   refuses the shapes the engine does not run, `read_weights` places its `dflash.*` tensors through the model's own loaders.
+  Its passes are `basalt/dflash/core.hpp`: `decode_forms` and `make_forms` lay the weights out for the window gemm at load,
+  `tap` and `context_rows` turn the target layers' rows into a sequence's context rings, and `block_tokens`, `block_layers`
+  and `block_select` draft a block. The model gives its own embedding of the block's ids and its own head over the normed
+  rows between them, a window gemm workspace (`workspace_need`), the scratch (`take_scratch`) and one `Seq` per sequence
+  (`take_seq`), whose context range it keeps true with `reset` and `truncate` (the passes record what they write). The dense stack is one
+  host (`src/dense`).
 - A Qwen chat model takes the shared pre-tokenizer, tool form and token names (`basalt/program/qwen_forms.hpp`) and the
   shared Qwen dialect (`serve/models/qwen.py`).
 - Kernels: shared kernels stay in `src/kernels/`. Every new kernel gets a parity test and a microbench line.

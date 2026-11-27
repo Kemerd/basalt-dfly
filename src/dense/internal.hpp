@@ -2,6 +2,7 @@
 #pragma once
 
 #include "basalt/dense/model.hpp"
+#include "basalt/dflash/core.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -22,7 +23,13 @@ class CudaEncoder;
 namespace basalt::dense {
 
 using dflash::BlockDrafter;
+using model::kTypeF8;
+using model::kTypeNvfp4Planes;
+using model::kTypeQ8P;
 using model::Linear;
+using model::on_wg;
+using model::wcall;
+using model::wmat;
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
@@ -30,9 +37,6 @@ constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
-constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
-constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
-constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type, nvfp4_planes.hpp)
 
 /// Device buffers carved from one allocation.
 class Arena {
@@ -80,10 +84,6 @@ struct WindowScratch {
     float* rq = nullptr;
     float* gab = nullptr;                        // its GDN gates (dec_gdn_gates): alpha [rows][h_v], then beta
     BatchTable* btab = nullptr;
-    // the block drafter's: its rows' q, k, v, attention and convolution coefficients, the selector's projection
-    float *bq = nullptr, *bk = nullptr, *bv = nullptr, *bqo = nullptr, *bao = nullptr, *dyn = nullptr, *bh = nullptr;
-    float *battn = nullptr, *blp = nullptr, *bsel = nullptr;
-    int32_t* bpos = nullptr;
 };
 
 /// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
@@ -151,10 +151,10 @@ public:
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
-    BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
-    std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
-    std::vector<std::function<bool(void*)>> drafter_steps;   // bd_dec's forms, made once the weights have landed (attach_drafter)
-    size_t drafter_tmp = 0;                      // the scratch they go through
+    BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products on the window gemm)
+    dflash::Forms bd_forms;                      // bd_dec's forms, made once the weights have landed (attach_drafter)
+    dflash::Scratch bs;                          // its passes' rows: its own, and the window's it shares (ws)
+    std::vector<void*> owned;                    // device buffers the model allocated (a wider workspace, the prompt copies)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
     StagePtr prompt_split;                       // the prompt split: a second card reading long prompts' last layers (null: none)
@@ -210,18 +210,9 @@ struct SessionState {
     float *dlogits = nullptr, *lp = nullptr;     // the drafter's head row and its picks [kWindow][kLogprobStride]
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
-    // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
-    // its picks and their confidence, and the proposal each pick came from ([kWindow][top_k] candidates and their q)
-    std::vector<uint16_t*> dk, dv;
-    int64_t dctx_cap = 0, dctx_from = 0;         // cells; the first position its context holds
-    float* dacc = nullptr;
-    int32_t* dids = nullptr;
-    float* dconf = nullptr;
-    int32_t* dq_ids = nullptr;
-    float* dq_p = nullptr;
-    // how the block drafter picks (temperature 0: its best candidates; above, drawn), set by the request's sampling
-    float dtemp = 0.0f;
-    uint64_t dseed = 0;
+    // the block drafter: its context rings, the last window's projected features, its picks, their confidence and the
+    // proposal each pick came from; how it picks is set by the request's sampling
+    dflash::Seq seq;
     // the layer split: the second card's state of this conversation (its layers' cells and recurrent state; null: none),
     // and the device a second card's state lives on
     std::unique_ptr<SessionState, PeerStateDeleter> peer;
@@ -291,12 +282,9 @@ bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 
-/// The block drafter's features of target layer j: its rows (`rows16`, the BF16 residual after it) through its block of the
-/// projection into `dacc` (j == 0 writes it, later ones add).
-void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cudaStream_t s);
-/// The block drafter's context from the last window's first n rows (st.dacc) at positions pos.. .
+/// The block drafter's context from the last window's first n rows (st.seq.acc) at positions pos.. .
 bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::string& err);
-/// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.dids / st.dconf.
+/// The block drafter's pass after `anchor` at `pos`: its picks for slots 1 .. block-1 into st.seq.ids / st.seq.conf.
 /// The block is `width` rows (the drafter's block or wider, up to kWindow: one anchor, then mask tokens).
 bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int width, std::string& err);
 /// The same pass for S sessions at once (session k's block of widths[k] rows, at least the drafter's block, at most kBatch rows
