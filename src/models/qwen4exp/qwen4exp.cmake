@@ -48,8 +48,17 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/mid_chain.cu
   src/models/qwen4exp/kernels/qsa_mid.cu
   src/models/qwen4exp/kernels/hc_fused.cu
-  src/models/qwen4exp/kernels/hc8_gr.cu)
+  src/models/qwen4exp/kernels/hc8_gr.cu
+  src/models/qwen4exp/kernels/dfly_kv.cu)
 target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
+if(BUILD_TESTING)
+  # a draft layer's context cells against a CPU copy through a permuted page table (GPU, synthetic, no model)
+  add_executable(qwen4exp_dfly_kv_parity tests/models/qwen4exp/kernels/dfly_kv_parity.cpp)
+  target_include_directories(qwen4exp_dfly_kv_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qwen4exp_dfly_kv_parity PRIVATE model_qwen4exp_kernels CUDA::cudart)
+  basalt_gpu_test(NAME qwen4exp_dfly_kv_parity COMMAND qwen4exp_dfly_kv_parity)
+  set_tests_properties(qwen4exp_dfly_kv_parity PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.
 add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
