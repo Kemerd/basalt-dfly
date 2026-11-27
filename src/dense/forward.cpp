@@ -57,17 +57,7 @@ const void* wact(Model& m, const float* x, int type, int64_t cols, int T, cudaSt
     prefill::mmq::quantize(x, nullptr, m.ws.x8, type, cols, cols, mmq_tile(T), s);
     return m.ws.x8;
 }
-// the RMS norm of x's rows into xn, readied for products of `type` (one kernel on the window gemm)
-const void* wnorm(Model& m, const float* x, const float* w, float* xn, int type, int64_t cols, int T, float eps,
-                  cudaStream_t s) {
-    if (on_wg(type)) {
-        wg::norm_pack(x, w, eps, cols, T, m.ws.xq, xn, s);
-        return m.ws.xq;
-    }
-    kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
-    return wact(m, xn, type, cols, T, s);
-}
-// the same for BF16 rows (the residual)
+// the RMS norm of x's rows (BF16: the residual) into xn, readied for products of `type` (one kernel on the window gemm)
 const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int type, int64_t cols, int T, float eps,
                   cudaStream_t s) {
     if (on_wg(type)) {
