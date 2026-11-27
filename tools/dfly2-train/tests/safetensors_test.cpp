@@ -10,6 +10,7 @@
 
 using namespace basalt::dfly2;
 using dfly2_test::check;
+using dfly2_test::refused;
 
 namespace {
 
@@ -45,10 +46,10 @@ int main() {
         {"scalar", "F32", {}, &scalar, 4},
     };
     const std::string path = dir.file("m.safetensors");
-    check(safetensors_write(path, meta, tensors, err), "write: " + err);
+    check(safetensors_write(path, meta, tensors, err), "write", err);
     {
         SafetensorsFile f;
-        check(f.open(path, err), "open: " + err);
+        check(f.open(path, err), "open", err);
         check(f.metadata() == meta, "the metadata reads back, escapes and UTF-8 included");
         check(f.tensors().size() == 5, "five tensors");
         bool same = true;
@@ -62,36 +63,36 @@ int main() {
         check(f.tensors()[0].name == "layers.0.weight" && f.tensors()[0].begin == 0, "tensors come in data order");
     }
     // a second write over the same path replaces it whole
-    check(safetensors_write(path, {}, {{"only", "U8", {3}, "abc", 3}}, err), "overwrite: " + err);
+    check(safetensors_write(path, {}, {{"only", "U8", {3}, "abc", 3}}, err), "overwrite", err);
     {
         SafetensorsFile f;
         check(f.open(path, err) && f.tensors().size() == 1 && f.metadata().empty() && std::memcmp(f.data(f.tensors()[0]), "abc", 3) == 0,
-              "the replaced file reads back: " + err);
+              "the replaced file reads back", err);
     }
     check(!std::filesystem::exists(std::filesystem::path(std::u8string(path.begin(), path.end())).concat(".tmp")), "no temporary file is left");
 
     std::printf("2. the writer's refusals\n");
-    check(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {2}, a.data(), 4}}, err), "bytes that do not match the shape: " + err);
-    check(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F99", {1}, a.data(), 4}}, err), "an unknown dtype: " + err);
-    check(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {1}, a.data(), 4}, {"a", "F32", {1}, a.data(), 4}}, err), "a repeated name: " + err);
-    check(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {1}, nullptr, 4}}, err), "missing data: " + err);
+    refused(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {2}, a.data(), 4}}, err), "bytes that do not match the shape", err);
+    refused(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F99", {1}, a.data(), 4}}, err), "an unknown dtype", err);
+    refused(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {1}, a.data(), 4}, {"a", "F32", {1}, a.data(), 4}}, err), "a repeated name", err);
+    refused(!safetensors_write(dir.file("x.safetensors"), {}, {{"a", "F32", {1}, nullptr, 4}}, err), "missing data", err);
 
     std::printf("3. the reader's refusals\n");
     {
         SafetensorsFile f;
         const std::string eight(8, 'x');
-        check(!f.open(dir.file("missing.safetensors"), err), "a missing file: " + err);
+        refused(!f.open(dir.file("missing.safetensors"), err), "a missing file", err);
         check(!f.open(raw_file(dir, "short.safetensors", "", ""), err) || f.tensors().empty(), "an empty header is refused or empty");
-        check(!f.open(raw_file(dir, "json.safetensors", "{\"a\":", ""), err), "broken JSON: " + err);
-        check(!f.open(raw_file(dir, "array.safetensors", "[1,2]", ""), err), "a header that is not an object: " + err);
-        check(!f.open(raw_file(dir, "range.safetensors", R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})", "1234"), err), "a tensor past the end of the data: " + err);
-        check(!f.open(raw_file(dir, "size.safetensors", R"({"a":{"dtype":"F32","shape":[3],"data_offsets":[0,8]}})", eight), err), "a shape that does not match its bytes: " + err);
-        check(!f.open(raw_file(dir, "gap.safetensors", R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})", eight), err), "a gap before the first tensor: " + err);
-        check(!f.open(raw_file(dir, "overlap.safetensors", R"({"a":{"dtype":"U8","shape":[6],"data_offsets":[0,6]},"b":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})", eight), err), "two tensors that overlap: " + err);
-        check(!f.open(raw_file(dir, "tail.safetensors", R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", eight), err), "bytes after the last tensor: " + err);
-        check(!f.open(raw_file(dir, "dtype.safetensors", R"({"a":{"dtype":"Q7","shape":[8],"data_offsets":[0,8]}})", eight), err), "an unknown dtype: " + err);
-        check(!f.open(raw_file(dir, "neg.safetensors", R"({"a":{"dtype":"U8","shape":[-8],"data_offsets":[0,8]}})", eight), err), "a negative dimension: " + err);
-        check(!f.open(raw_file(dir, "meta.safetensors", R"({"__metadata__":{"k":1}})", ""), err), "metadata that is not a string: " + err);
+        refused(!f.open(raw_file(dir, "json.safetensors", "{\"a\":", ""), err), "broken JSON", err);
+        refused(!f.open(raw_file(dir, "array.safetensors", "[1,2]", ""), err), "a header that is not an object", err);
+        refused(!f.open(raw_file(dir, "range.safetensors", R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})", "1234"), err), "a tensor past the end of the data", err);
+        refused(!f.open(raw_file(dir, "size.safetensors", R"({"a":{"dtype":"F32","shape":[3],"data_offsets":[0,8]}})", eight), err), "a shape that does not match its bytes", err);
+        refused(!f.open(raw_file(dir, "gap.safetensors", R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})", eight), err), "a gap before the first tensor", err);
+        refused(!f.open(raw_file(dir, "overlap.safetensors", R"({"a":{"dtype":"U8","shape":[6],"data_offsets":[0,6]},"b":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}})", eight), err), "two tensors that overlap", err);
+        refused(!f.open(raw_file(dir, "tail.safetensors", R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", eight), err), "bytes after the last tensor", err);
+        refused(!f.open(raw_file(dir, "dtype.safetensors", R"({"a":{"dtype":"Q7","shape":[8],"data_offsets":[0,8]}})", eight), err), "an unknown dtype", err);
+        refused(!f.open(raw_file(dir, "neg.safetensors", R"({"a":{"dtype":"U8","shape":[-8],"data_offsets":[0,8]}})", eight), err), "a negative dimension", err);
+        refused(!f.open(raw_file(dir, "meta.safetensors", R"({"__metadata__":{"k":1}})", ""), err), "metadata that is not a string", err);
         // a length that claims more header than the file holds
         const std::string p = dir.file("len.safetensors");
         {
@@ -100,8 +101,8 @@ int main() {
             out.write((const char*) &n, 8);
             out.write("{}", 2);
         }
-        check(!f.open(p, err), "a header length past the end of the file: " + err);
-        check(f.open(raw_file(dir, "ok.safetensors", R"({"a":{"dtype":"U8","shape":[2,4],"data_offsets":[0,8]}})", eight), err) && f.find("a") != nullptr, "a well-formed hand-built file opens: " + err);
+        refused(!f.open(p, err), "a header length past the end of the file", err);
+        check(f.open(raw_file(dir, "ok.safetensors", R"({"a":{"dtype":"U8","shape":[2,4],"data_offsets":[0,8]}})", eight), err) && f.find("a") != nullptr, "a well-formed hand-built file opens", err);
     }
     return dfly2_test::finish("safetensors_test");
 }

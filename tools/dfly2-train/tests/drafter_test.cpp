@@ -11,6 +11,7 @@
 
 using namespace basalt::dfly2;
 using dfly2_test::check;
+using dfly2_test::refused;
 using dfly2_test::max_abs_diff;
 
 int main() {
@@ -42,7 +43,7 @@ int main() {
         bad.n_head = 3;
         bool threw = false;
         try { Drafter d(bad); } catch (const std::invalid_argument&) { threw = true; }
-        check(threw && !drafter_check_shape(bad, err), "a shape the contract refuses does not build: " + err);
+        check(threw && !drafter_check_shape(bad, err), "a shape the contract refuses does not build", err);
     }
 
     std::printf("2. a fresh drafter: identity fusion and identity correction\n");
@@ -118,7 +119,7 @@ int main() {
         t.o = torch::randn({s.hidden, s.n_head * s.head_dim});
         t.q_norm = torch::rand({s.head_dim}) + 0.5;
         t.k_norm = torch::rand({s.head_dim}) + 0.5;
-        check(drafter->init_attention(1, t, err), "a paired layer's weights copy in: " + err);
+        check(drafter->init_attention(1, t, err), "a paired layer's weights copy in", err);
         DraftAttentionImpl& a = *drafter->layers->ptr<DraftLayerImpl>(1)->self_attn;
         check(max_abs_diff(a.q_proj->weight, t.q) == 0.0 && max_abs_diff(a.k_proj->weight, t.k) == 0.0 && max_abs_diff(a.v_proj->weight, t.v) == 0.0 &&
                   max_abs_diff(a.o_proj->weight, t.o) == 0.0 && max_abs_diff(a.q_norm->weight, t.q_norm) == 0.0 && max_abs_diff(a.k_norm->weight, t.k_norm) == 0.0,
@@ -135,8 +136,8 @@ int main() {
             check(max_abs_diff(own, cached) < 1e-12, "a block row's key is the cell the paired layer would cache for that input");
         }
         t.o = torch::randn({s.hidden, s.n_head * s.head_dim + 1});
-        check(!drafter->init_attention(0, t, err), "a misshapen target tensor is refused: " + err);
-        check(!drafter->init_attention(9, t, err), "a layer the drafter does not have is refused: " + err);
+        refused(!drafter->init_attention(0, t, err), "a misshapen target tensor is refused", err);
+        refused(!drafter->init_attention(9, t, err), "a layer the drafter does not have is refused", err);
     }
 
     std::printf("5. the backbone\n");

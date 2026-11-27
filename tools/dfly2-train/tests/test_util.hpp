@@ -17,6 +17,12 @@ inline void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
+/// A check of a call that should succeed: a failure's line ends with the error text the call left.
+inline void check(bool ok, const std::string& what, const std::string& err) { check(ok, ok ? what : what + ": " + err); }
+
+/// A check of a call that should be refused: the line ends with the reason it gave.
+inline void refused(bool was_refused, const std::string& what, const std::string& err) { check(was_refused, what + ": " + err); }
+
 /// Runs a test's body: its lines appear as they are printed, and an exception is a failed test with its message.
 template <class Body> int run(const char* name, Body&& body) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
