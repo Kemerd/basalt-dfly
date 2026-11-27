@@ -158,6 +158,30 @@ bool dfly_check_record(const Json& meta, const dfly2::Record& rec, const ModelGe
     return true;
 }
 
+bool dfly_read_pack(const ModelFile& file, const ModelGeometry& g, const DflyTarget& t, DflyPack& out, std::string& err) {
+    out = DflyPack{};
+    const ModelFile::Section* sec = file.find("dfly");
+    const Json* meta = file.meta().get("dfly2");
+    const bool has_meta = meta != nullptr && meta->is_object();
+    // neither: the pack has no drafter
+    if (sec == nullptr && !has_meta) return true;
+    if (sec == nullptr || !has_meta) {
+        err = "the dfly section and meta.dfly2 do not come together";
+        return false;
+    }
+    if (!dfly2::parse_record(*meta, sec->offset, out.rec, err) || !dfly_check_record(*meta, out.rec, g, t, out.dims, err))
+        return false;
+    // a tensor outside the section would be read from another section's bytes
+    for (const auto& [name, x] : out.rec.tensors) {
+        if (x.offset < sec->offset || x.bytes > sec->bytes || x.offset - sec->offset > sec->bytes - x.bytes) {
+            err = "meta.dfly2: " + name + " lies outside the dfly section";
+            return false;
+        }
+    }
+    out.present = true;
+    return true;
+}
+
 std::string dfly_pass_over(const DflyDims& d, const DflyConfig& c) {
     // the block pass is captured for the persistent engine's windows on one card
     if (!c.serve) return "it drafts only under --serve";

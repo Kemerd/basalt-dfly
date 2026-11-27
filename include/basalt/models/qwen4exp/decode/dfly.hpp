@@ -1,4 +1,5 @@
-// include/basalt/models/qwen4exp/decode/dfly.hpp - the DFly2 drafter of a pack: its record and shapes.
+// include/basalt/models/qwen4exp/decode/dfly.hpp - the DFly2 drafter of a pack: its record and shapes, its weights and the
+// block pass.
 //
 // A block is the anchor token (the last pick, at a position the target has not run) and up to seven mask tokens. The
 // drafter is dense with one residual stream; each of its layers is paired with one full-attention layer of the target and
@@ -21,13 +22,19 @@
 
 #include "basalt/core/model_file.hpp"
 #include "basalt/dfly2/record.hpp"
+#include "basalt/dfly2/ops.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/kernels/dfly_kv.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace basalt::core {
+
+class LoadPlan;
+class NativeHead;
 
 constexpr int kDflyBlockMax = 8;   ///< rows of the widest block: the anchor and seven masks
 
@@ -85,5 +92,129 @@ struct DflyConfig {
 };
 /// Why a start like `c` cannot run a drafter of `d`, as the words of the one warning; empty when it can.
 std::string dfly_pass_over(const DflyDims& d, const DflyConfig& c);
+
+/// A pack's drafter as read: `present` false when the pack carries none.
+struct DflyPack {
+    bool present = false;
+    DflyDims dims;
+    dfly2::Record rec;
+};
+/// Reads the drafter of `file` (its meta loaded) and checks it as dfly_check_record does, and that every tensor lies
+/// inside the `dfly` section. A pack with neither the section nor the record has no drafter, which is not an error.
+bool dfly_read_pack(const ModelFile& file, const ModelGeometry& g, const DflyTarget& t, DflyPack& out, std::string& err);
+
+/// The drafter on the main card: its weights, one captured graph of the block pass and the sequences that draft with
+/// it. A block is queued on the drafter's own stream and reads the last window's rows and the sequence's K/V pools; it
+/// keeps nothing between blocks.
+class DflyDrafter {
+public:
+    DflyDrafter() = default;
+    ~DflyDrafter();
+    DflyDrafter(const DflyDrafter&) = delete;
+    DflyDrafter& operator=(const DflyDrafter&) = delete;
+
+    /// The device bytes load() takes for a drafter of `d` whose blocks have `rows` rows: the weights as they are held
+    /// and the working memory, a private K/V pool in the cache's form among it.
+    static uint64_t plan_bytes(const DflyDims& d, int rows, bool kv_int8);
+    /// Allocates the weights of `pack` (read from `path`, their reads queued in `reads`: the caller's pass places and
+    /// rounds them) and the working memory for blocks of `rows` rows (2..kDflyBlockMax) over K/V of the given form.
+    /// On the current device; call before the expert tier is sized.
+    bool load(const DflyPack& pack, const std::string& path, int rows, bool kv_int8, LoadPlan& reads, std::string& err);
+    /// The device bytes bind() takes for a head of this type over `n_vocab` rows: the 2-bit copy of the head its drafts
+    /// are picked with, its scratch and its row map.
+    static uint64_t bind_bytes(int head_type, int64_t n_vocab);
+    /// The buffers the block pass reads: the last window's head rows (n_embd floats a row), each draft layer's kept
+    /// selections (rows of `cap` ids), and the head its drafts are picked with. Captures the graph.
+    bool bind(const WeightTable& wt, const NativeHead* head, const float* head_rows, const int32_t* const* selections,
+              int64_t cap, std::string& err);
+    /// What the block pass takes from the target beside the window's rows, as calls that only enqueue on `stream` and
+    /// read their per-block values from device memory: the embedding rows of `n` device token ids, and one q8_1
+    /// column's draft with its probability (false: no pick was queued).
+    struct Target {
+        std::function<void(const int32_t* tokens, int64_t n, float* out, void* stream)> embed;
+        std::function<bool(const void* x_q8_1, int* out_id, float* out_prob, void* stream)> pick;
+        int64_t n_vocab = 0;
+    };
+    /// bind() over the target's two calls as given: the form the parity programs bind, with rows of their own.
+    bool bind(const Target& target, const float* head_rows, const int32_t* const* selections, int64_t cap, std::string& err);
+
+    bool loaded() const { return weights_ != nullptr; }
+    bool bound() const { return exec_ != nullptr; }
+    const DflyDims& dims() const { return d_; }
+    int rows() const { return rows_; }            ///< rows of a block: the anchor and drafts()
+    int drafts() const { return rows_ - 1; }
+    uint64_t vram_bytes() const { return vram_; }
+
+    /// A sequence that drafts (the solo session, a batch slot): its page-locked record and output rows. Its id, or -1
+    /// with `err`.
+    int add_sequence(std::string& err);
+    /// Queues a block of sequence `seq`: the anchor at position `pos`, the source row `row` of the last window, and
+    /// the pools of the sequence's paired layers (dims().layers of them, in the record's order). Does not wait.
+    bool launch(int seq, int32_t anchor, int row, int64_t pos, const basalt::kernels::QsaAttnPools* pools, std::string& err);
+    /// Waits for every block queued so far.
+    bool wait(std::string& err);
+    /// After wait(): the drafts of the sequence's last block, drafts() ids with each one's confidence (the confidence
+    /// head's, a stated chance that the draft is accepted).
+    void read(int seq, int32_t* ids, float* conf) const;
+    /// The same block's confidence logits before the bias, and the draft head's own probability of each pick.
+    const float* raw_conf(int seq) const;
+    const float* head_prob(int seq) const;
+    /// The last block's rows after the final norm (rows() of n_embd) and its drafts' corrected rows (drafts() of
+    /// n_embd), on the device until the next block.
+    const float* block_rows() const { return b_.z; }
+    const float* corrected_rows() const { return b_.hp; }
+
+    double ms_draft = 0;      ///< host time of the rounds, launch to drafts
+    int64_t rounds = 0;       ///< rounds that drafted
+    int64_t skipped = 0;      ///< rounds without a source row in the last window: no drafts
+
+private:
+    struct Layer {
+        const void *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+        const float *in_ln = nullptr, *q_norm = nullptr, *k_norm = nullptr, *post_ln = nullptr;
+    };
+    // the working memory of a block, carved from one arena
+    struct Buffers {
+        uint8_t* rec = nullptr;      // the block's record: blk, steps, positions, the paired layers' pools
+        int32_t* out = nullptr;      // the block's output rows: ids, confidence logits, head probabilities
+        int32_t *iota = nullptr, *ident = nullptr, *mask_ids = nullptr;
+        float *mask_rows = nullptr, *hs = nullptr, *emb0 = nullptr, *cat = nullptr, *fused = nullptr;
+        float *x = nullptr, *y = nullptr, *o = nullptr, *z = nullptr, *hp = nullptr;
+        float *qfull = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr, *attn_gated = nullptr;
+        float *attn_scratch = nullptr, *g = nullptr, *u = nullptr, *h = nullptr;
+        float *pe = nullptr, *cg = nullptr, *cu = nullptr, *ch = nullptr, *delta = nullptr;
+        uint8_t *xq = nullptr, *cat_q8 = nullptr, *ch_q8 = nullptr, *hq = nullptr;
+        uint8_t *pk = nullptr, *pv = nullptr, *pks = nullptr, *pvs = nullptr;   // the private pool
+    };
+    struct Sequence {
+        uint8_t* rec = nullptr;   // page-locked, the record's layout
+        int32_t* out = nullptr;   // page-locked, the output rows' layout
+    };
+    static uint64_t carve(const DflyDims& d, int rows, bool kv_int8, uint8_t* base, Buffers& b);
+    static uint64_t record_bytes(const DflyDims& d, int rows);
+    static basalt::kernels::QsaShapes shapes_of(const DflyDims& d);   // the target's shapes with the drafter's heads
+    bool record(std::string& err);
+
+    DflyDims d_;
+    int rows_ = 0, device_ = -1;
+    bool kv_int8_ = false;
+    uint64_t vram_ = 0;
+    void *weights_ = nullptr, *arena_ = nullptr;
+    std::vector<Layer> layer_;
+    dfly2::FusionWeights fusion_;
+    dfly2::CorrectionWeights corr_;
+    const float *final_norm_ = nullptr, *conf_w_ = nullptr, *conf_b_ = nullptr;
+    float conf_bias_ = 0;                      // read at bind, once the weights have landed
+    Buffers b_;
+    // bind()
+    Target target_;
+    const float* head_rows_ = nullptr;
+    std::vector<const int32_t*> sel_;
+    int64_t sel_cap_ = 0;
+    void *proxy_ = nullptr, *proxy_scratch_ = nullptr;
+    int32_t* map_ = nullptr;
+    void *ds_ = nullptr, *exec_ = nullptr, *done_ = nullptr;   // the drafter's stream, its graph, the event after a round
+    std::vector<Sequence> seqs_;
+};
 
 }  // namespace basalt::core

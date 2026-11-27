@@ -109,10 +109,12 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
   src/models/qwen4exp/decode/dfly/meta.cpp
+  src/models/qwen4exp/decode/dfly/weights.cpp
+  src/models/qwen4exp/decode/dfly/block.cpp
   src/models/qwen4exp/conversation/conversation_snapshot.cpp
   src/models/qwen4exp/conversation/conversation_state.cpp)
 target_include_directories(model_qwen4exp_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(model_qwen4exp_engine PUBLIC core model tiers model_qwen4exp_kernels kernels_cpu ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp_engine PUBLIC core model tiers model_qwen4exp_kernels kernels_cpu dfly2 ${_gpu_runtime_target})
 if(BUILD_TESTING)
   # the DFly2 drafter's record, the starts that pass it over and a block's source row (host only)
   add_executable(qwen4exp_dfly_meta_test tests/models/qwen4exp/decode/dfly_meta_test.cpp
@@ -120,6 +122,13 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_dfly_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen4exp_dfly_meta_test PRIVATE core)
   basalt_cpu_test(NAME qwen4exp_dfly_meta_test COMMAND qwen4exp_dfly_meta_test)
+  # the DFly2 block pass against a CPU double reference of its equations (GPU, synthetic, no model)
+  add_executable(qwen4exp_dfly_parity tests/models/qwen4exp/decode/dfly_parity.cpp)
+  target_include_directories(qwen4exp_dfly_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qwen4exp_dfly_parity PRIVATE model_qwen4exp_engine CUDA::cudart)
+  basalt_embed_manifest(qwen4exp_dfly_parity)
+  basalt_gpu_test(NAME qwen4exp_dfly_parity COMMAND qwen4exp_dfly_parity)
+  set_tests_properties(qwen4exp_dfly_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 endif()
 
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
