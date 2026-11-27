@@ -192,6 +192,12 @@ hidden row and selection, which serving never hands a drafter; `--prefix-weight`
 export's `--exp dfly2_export_check` run says whether the prompt path's rows are close enough to the windows' past
 2,051 cells of context to train on.
 
+The export writes FP16 cells. A target serving with `--kv int8` stores each cell as codes with one FP16 scale per 64
+values of a head, and the drafter reads its context and stores its own rows the same way. `--kv-int8-share` reads that
+share of the blocks so: the selected cells and the block rows' keys and values go through the cache's rule, with the
+gradient passed straight through. The other blocks' own keys and values are rounded to FP16, as an FP16 cache stores
+them. Which blocks is drawn per epoch from the seed. `eval --kv-int8-share 1` measures a drafter as INT8 serving runs it.
+
 Per token a shard holds the hidden row and two cells per paired layer: 15,360 bytes for Flash-Next with FP16 hidden
 rows and five layers, plus about 41 KiB per anchor of selections.
 
