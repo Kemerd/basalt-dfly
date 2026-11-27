@@ -827,14 +827,17 @@ void run_native(Setup& st, int type) {
         // ---- each pick against the whole head: the exact logits of its corrected row over every row of the head
         float* d_logits = nullptr;
         void* d_xq = nullptr;
+        cudaStream_t score_stream = nullptr;   // the head's product takes a stream of its own
         ck(cudaMalloc((void**) &d_logits, (size_t) st.vocab * 4), "the logits");
         ck(cudaMalloc(&d_xq, bk::native_q8_1_bytes(N, 1)), "the q8_1 row");
+        ck(cudaStreamCreateWithFlags(&score_stream, cudaStreamNonBlocking), "the scoring stream");
         int agree = 0, worst_rank = 0;
         double worst_p = 0;
         try {
             for (int j = 0; in_vocab && j + 1 < R; ++j) {
-                bk::native_quantize_q8_1(drafter.corrected_rows() + (size_t) j * (size_t) N, d_xq, N, 1, nullptr);
-                head.score_rows(head.weights(), d_xq, d_logits, st.vocab, 1, nullptr);
+                bk::native_quantize_q8_1(drafter.corrected_rows() + (size_t) j * (size_t) N, d_xq, N, 1, score_stream);
+                head.score_rows(head.weights(), d_xq, d_logits, st.vocab, 1, score_stream);
+                ck(cudaStreamSynchronize(score_stream), "the head's logits");
                 const std::vector<float> logits = download(d_logits, (size_t) st.vocab);
                 const float mine = logits[(size_t) a.ids[(size_t) j]];
                 // the pick's place among the exact logits, and its exact softmax probability
@@ -857,6 +860,7 @@ void run_native(Setup& st, int type) {
         // The head is noise, where the 2-bit copy can leave the best row unscored; the copy's own test plants the
         // logits. A pick outside the head's best few rows means the copy, the map or the rows are not this head's.
         check(in_vocab && worst_rank < 8, "the picks are among the whole head's best rows");
+        cudaStreamDestroy(score_stream);
         cudaFree(d_logits);
         cudaFree(d_xq);
         core::set_native_embed(nullptr);
