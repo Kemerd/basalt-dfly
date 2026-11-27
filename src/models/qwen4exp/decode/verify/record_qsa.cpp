@@ -28,6 +28,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // ======================= QSA =======================
     const int64_t qi = qsa_idx[(size_t) l];
     const QsaState& st = ss.qsa_states[qi];
+    int32_t* const sel = v_.sel_at(l);   // this layer's selections: a kept layer has a buffer of its own
     const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
                     *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
                     *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
@@ -257,13 +258,13 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     bool attn_q8 = false;   // the merge wrote the q8_1 rows
     if (v_.batch_rec_) {   // each row selects and attends over its own slot's K/V, from the layer's table
         qsa_block_scores_seg(seg_tab, v_.qidx_, v_.step_, n, v_.max_blocks_, s, v_.scores_, cs, true);
-        qsa_block_topk(v_.scores_, v_.step_, n, v_.max_blocks_, v_.cap_, s, v_.sel_, cs);
+        qsa_block_topk(v_.scores_, v_.step_, n, v_.max_blocks_, v_.cap_, s, sel, cs);
         stamp(l, 11);
         // KV streaming: each streamed slot's selections resident in its own pool (device-side, in the graph)
-        if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
+        if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, sel, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
         attn_q8 = true;
-        qsa_dec_attn_seg(v_.qcur_, seg_tab, st.kv_int8, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs,
+        qsa_dec_attn_seg(v_.qcur_, seg_tab, st.kv_int8, sel, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs,
                          v_.qfull_, v_.attn32_, v_.xq_);
     } else {
     {
@@ -274,11 +275,11 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         }
         PdlScope pt(pdl);   // after the scores kernel
         qsa_block_topk(v_.scores_, v_.step_, n, v_.max_blocks_, v_.cap_, s,
-                       v_.sel_, cs);
+                       sel, cs);
     }
     stamp(l, 11);
     // KV streaming: the n selections' blocks resident (device-side, inside the graph)
-    qsa_kv_resolve(st, *v_.g_, v_.sel_, v_.step_, n, v_.cap_, cs);
+    qsa_kv_resolve(st, *v_.g_, sel, v_.step_, n, v_.cap_, cs);
     stamp(l, 12);
     const QsaAttnPools pools = qsa_attn_pools(st);
     // staged chunks and the gate in the merge, the same bits. A `--kv q4_0` cache has rotated keys, so its merge
@@ -289,12 +290,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     attn_q8 = gated_merge;
     PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
     if (chunk_attn)
-        qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s,
+        qsa_dec_attn(v_.qcur_, pools, sel, v_.step_, v_.cap_, s,
                      v_.attn_scratch_, v_.attn_, n, cs,
                      gated_merge ? v_.qfull_ : nullptr, gated_merge ? v_.attn32_ : nullptr,
                      attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
     else
-    qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
+    qsa_decode_attn_batch(v_.qcur_, pools, sel, v_.step_, v_.cap_,
                           s, v_.attn_scratch_, v_.attn_, n, cs);
     }
     stamp(l, 13);

@@ -85,6 +85,7 @@ public:
         std::string name;
         uint64_t offset = 0;
         uint64_t bytes = 0;
+        uint8_t sha256[32] = {};   ///< the digest the table records for the section's bytes
     };
 
     /// Opens `path`: checks the magic, the version, the size and every section's bounds, and reads the table.

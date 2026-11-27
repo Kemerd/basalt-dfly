@@ -366,6 +366,18 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// The head's input of every row of the last window (n_embd floats a row, device), valid until the next `run`.
+    const float* head_rows() const { return next_ ? next_->head_rows() : head_mixed_; }
+    /// Before init, on a verifier that runs every layer: these QSA layers (ascending) keep the selections of the last
+    /// window's rows, each in a buffer of its own (selection()).
+    void keep_selections(const std::vector<int>& layers) { keep_layers_ = layers; }
+    /// Kept layer number `k`'s ids (device): max_t rows of selection_cap(), row t's first
+    /// qsa_selection_width(pos0 + t + 1) valid and ascending, until the next `run`. nullptr: no such kept layer.
+    const int32_t* selection(int k) const;
+    int64_t selection_cap() const { return cap_; }
+    /// The last window's first position and its rows (0 before the first run).
+    int64_t last_pos0() const { return last_pos0_; }
+    int last_rows() const { return last_t_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -643,6 +655,10 @@ private:
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
+    std::vector<int> keep_layers_;                            // keep_selections
+    int32_t* sel_keep_ = nullptr;                             // per kept layer: max_t rows of cap_ ids
+    /// Where `layer`'s top-k writes its ids: its kept buffer, or the buffer the other QSA layers share.
+    int32_t* sel_at(int64_t layer) const;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block

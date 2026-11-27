@@ -22,6 +22,9 @@ option(WERROR "Treat compiler warnings as errors" OFF)
 # Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
 # allows a non-Blackwell card to serve as the expert tier, but adds build time.
 option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
+# The DFly2 drafter trainer (tools/dfly2-train) links LibTorch, which the build does not fetch: pass its location
+# with CMAKE_PREFIX_PATH or Torch_DIR when turning this on.
+option(BASALT_DFLY2_TRAIN "Build basalt-dfly2-train, the DFly2 drafter trainer (needs LibTorch)" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -147,6 +150,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/split.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
+  src/models/qwen4exp/load/dfly2_shard_queue.cpp
   src/models/qwen4exp/load/model.cpp
   src/models/qwen4exp/load/layer_plan.cpp
   src/models/qwen4exp/load/weights.cpp
@@ -199,6 +203,13 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+  # the teacher export's writer: pieces in, shards out, a restart and the settings file (host only)
+  add_executable(qwen4exp_dfly2_shard_queue_test tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp
+                 src/models/qwen4exp/load/dfly2_shard_queue.cpp)
+  target_include_directories(qwen4exp_dfly2_shard_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(qwen4exp_dfly2_shard_queue_test PRIVATE engine_session model_file platform warnings)
+  basalt_embed_manifest(qwen4exp_dfly2_shard_queue_test)
+  basalt_cpu_test(NAME qwen4exp_dfly2_shard_queue_test COMMAND qwen4exp_dfly2_shard_queue_test)
 endif()
 endif()
 
@@ -218,6 +229,13 @@ if(BUILD_TESTING)
   target_link_libraries(dfly2_ops_parity PRIVATE dfly2 kernels core ${_gpu_runtime_target})
   basalt_gpu_test(NAME dfly2_ops_parity COMMAND dfly2_ops_parity)
 endif()
+endif()
+if(BUILD_TESTING)
+  # a teacher export's anchors (include/basalt/dfly2/anchors.hpp): a header, so it builds whatever models are built
+  add_executable(dfly2_anchors_test tests/dfly2/anchors_test.cpp)
+  target_include_directories(dfly2_anchors_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(dfly2_anchors_test PRIVATE warnings)
+  basalt_cpu_test(NAME dfly2_anchors_test COMMAND dfly2_anchors_test)
 endif()
 
 if(BASALT_MODEL_HY4FLASH)
@@ -890,6 +908,10 @@ add_executable(basalt-bench src/program/bench_main.cpp)
 basalt_ship_to_bin(basalt-bench)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
+# the DFly2 drafter trainer, bin/basalt-dfly2-train (its own project, off unless asked for)
+if(BASALT_DFLY2_TRAIN)
+  add_subdirectory(tools/dfly2-train)
+endif()
 if(BASALT_MODEL_QWEN4EXP)
 target_link_libraries(model_qwen4exp PUBLIC vision_cuda)
 endif()

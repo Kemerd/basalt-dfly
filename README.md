@@ -107,7 +107,8 @@ How a request names a video, and the limits: [video](docs/running.md#video).
   [ERNIE-5.5-Flash](docs/models/ernie55.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
 - **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
-- **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),
+- **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md),
+  [training a DFly2 drafter](docs/dfly2-training.md), [community runs](docs/community.md),
   [changelog](docs/changelog/index.md), [contributing](CONTRIBUTING.md).
 
 ## Credits

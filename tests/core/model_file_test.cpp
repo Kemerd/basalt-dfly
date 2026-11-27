@@ -35,6 +35,9 @@ struct TempDir {
 
 struct Sec { std::string name; std::string data; };
 
+/// Byte `j` of the digest write_model records in the table for section number `i`.
+uint8_t table_digest_byte(size_t i, size_t j) { return (uint8_t) (i * 37 + j * 5 + 1); }
+
 /// Writes a model file with the given sections, each at a multiple of kSectionAlign.
 std::string write_model(const fs::path& path, const std::vector<Sec>& secs, bool truncate = false,
                         uint32_t version = kModelVersion) {
@@ -51,6 +54,7 @@ std::string write_model(const fs::path& path, const std::vector<Sec>& secs, bool
         std::memcpy(e.name, secs[i].name.data(), secs[i].name.size());
         e.offset = off;
         e.bytes = secs[i].data.size();
+        for (size_t j = 0; j < sizeof e.sha256; ++j) e.sha256[j] = table_digest_byte(i, j);
         std::memcpy(file.data() + sizeof h + i * sizeof e, &e, sizeof e);
     }
     h.file_bytes = file.size();
@@ -112,6 +116,13 @@ int main() {
     check(m.range("nothing").empty(), "an absent section is an empty range");
     std::vector<uint8_t> raw;
     check(m.read("gguf", raw, err) && raw.size() == gg.size() && raw[5] == 5, "read a section");
+    {
+        bool same = m.sections().size() == 4;
+        for (size_t i = 0; same && i < m.sections().size(); ++i)
+            for (size_t j = 0; j < sizeof m.sections()[i].sha256; ++j)
+                same = same && m.sections()[i].sha256[j] == table_digest_byte(i, j);
+        check(same, "a section carries the digest its table entry records");
+    }
     {
         ModelFile bad;
         std::string e2;
