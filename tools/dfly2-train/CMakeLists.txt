@@ -29,12 +29,20 @@ endif()
 
 set(DFLY2_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 
+# LibTorch is not fetched: CMAKE_PREFIX_PATH or Torch_DIR names an unpacked release.
+find_package(Torch REQUIRED)
+separate_arguments(_dfly2_torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+
 # A test of the trainer: tests/<name>.cpp, linked to the libraries named after it, labelled `cpu` (none needs a GPU).
+# Windows finds LibTorch's libraries through PATH, which the test's environment gets here.
 function(dfly2_test name)
   add_executable(dfly2_${name} tests/${name}.cpp)
   target_link_libraries(dfly2_${name} PRIVATE ${ARGN})
   add_test(NAME dfly2_${name} COMMAND dfly2_${name})
   set_property(TEST dfly2_${name} APPEND PROPERTY LABELS cpu)
+  if(WIN32)
+    set_property(TEST dfly2_${name} PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${TORCH_INSTALL_PREFIX}/lib")
+  endif()
 endfunction()
 
 # The file formats, with no LibTorch in them: the safetensors checkpoints (the JSON reader is the model file's).
@@ -42,8 +50,20 @@ add_library(dfly2_io STATIC src/safetensors.cpp)
 target_include_directories(dfly2_io PUBLIC ${CMAKE_CURRENT_LIST_DIR}/src)
 target_link_libraries(dfly2_io PUBLIC model_file)
 
+# The drafter and what trains it.
+add_library(dfly2_core STATIC src/sparse_attention.cpp src/drafter.cpp)
+target_compile_options(dfly2_core PUBLIC ${_dfly2_torch_flags})
+if(MSVC)
+  # LibTorch's headers instantiate standard-library templates with narrowing conversions and leave unreachable code
+  # behind constant conditions; both are reported in the file that includes them.
+  target_compile_options(dfly2_core PUBLIC /wd4267 /wd4702)
+endif()
+target_link_libraries(dfly2_core PUBLIC dfly2_io ${TORCH_LIBRARIES})
+
 if(BUILD_TESTING)
   # the teacher shard's writer and reader (include/basalt/artifact/dfly2_shard.hpp)
   dfly2_test(shard_test platform)
   dfly2_test(safetensors_test dfly2_io)
+  dfly2_test(attention_test dfly2_core)
+  dfly2_test(drafter_test dfly2_core)
 endif()
