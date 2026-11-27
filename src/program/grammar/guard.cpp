@@ -227,6 +227,20 @@ int Guard::scan(const int32_t* out, int rows, int first) {
     return miss;
 }
 
+void Guard::draft(int n, std::vector<int32_t>& out) const {
+    out.clear();
+    if (!on_ || !has_grammar_ || n <= 0 || !pv_.vocab) return;
+    // free text or one of the reply's own tags comes next, not the grammar's text
+    if (thinking_ || (ban_think_ && after_header_) || (blocks_ && phase_ != Phase::answer)) return;
+    st_.forced_tokens(*pv_.vocab, (size_t) n, out);
+    // a tag of the reply is the guard's to place: the drafts end before one
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] != pv_.think_open && out[i] != pv_.block_header && out[i] != pv_.answer_open) continue;
+        out.resize(i);
+        break;
+    }
+}
+
 void Guard::mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias) {
     const size_t n = pv_.vocab->size();
     const auto allow = [&](int32_t t) { if (t >= 0 && (size_t) t < n) mask_[(size_t) t] = 1; };

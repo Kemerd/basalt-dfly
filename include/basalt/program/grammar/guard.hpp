@@ -4,7 +4,8 @@
 // after each window, scans the sampled tokens in order: the first one the grammar does not allow is reported, and the
 // caller hands redraw() two callbacks to draw that row again under the grammar's mask and to read its logits. The guard
 // never switches itself off over a refused draw: it redraws under a fresh mask, then picks the likeliest token the
-// grammar accepts, and only a state with no allowed token at all ends the request. Nothing here knows a GPU or an OS.
+// grammar accepts, and only a state with no allowed token at all ends the request. Where the grammar forces the next
+// bytes, draft() spells them as tokens a window can verify. Nothing here knows a GPU or an OS.
 #pragma once
 
 #include <chrono>
@@ -70,6 +71,13 @@ public:
     /// mask built without the cache, then the token is the highest logit (plus user_bias) the grammar accepts. On
     /// drawn and fallback `token` is fed to the grammar; on dead the guard turns itself off and `token` is untouched.
     Redraw redraw(const std::vector<float>& user_bias, const DrawFn& draw, const LogitsFn& logits, int32_t& token);
+    /// Drafts for the next window from the grammar alone: the tokens that spell the bytes it forces next
+    /// (GrammarState::forced_tokens), at most `n`, in `out` (replaced). Empty while the guard is off or has no
+    /// grammar, inside a thinking block, where a reply of blocks takes one of its own tags, before a lazy grammar's
+    /// trigger and where the grammar leaves a choice; the reply's tags are never drafted. scan() passes every one of
+    /// them, but the model may write the same bytes as other tokens: they are drafts to verify, never tokens to
+    /// emit unverified. The guard is not changed.
+    void draft(int n, std::vector<int32_t>& out) const;
 
     int64_t windows() const { return windows_; }
     int64_t fallbacks() const { return fallbacks_; }
