@@ -1,9 +1,16 @@
 // tests/models/qwen4exp/decode/dfly_meta_test.cpp - CPU tests of the DFly2 drafter's host side: the pack's record to dims,
-// each record it refuses, the starts that pass it over, and the source row of a block in a solo and a batch window.
+// each record it refuses, the drafter read from a pack's section and record, the starts that pass it over, and the source
+// row of a block in a solo and a batch window.
+#include "basalt/core/model_format.hpp"
 #include "basalt/models/qwen4exp/decode/dfly.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -162,6 +169,120 @@ void test_refusals() {
     CHECK(!read(r, d, err) && !err.empty());
 }
 
+// A model file of the named sections at the section alignment, each its text and then `bytes` zero bytes. The last
+// section's zeros are only the file's length, so a drafter's section costs no write.
+struct Sec {
+    std::string name, text;
+    uint64_t bytes = 0;
+};
+bool write_pack(const std::filesystem::path& path, const std::vector<Sec>& secs) {
+    std::vector<char> file((size_t) kHeaderBytes, 0);
+    FileHeader h{};
+    std::memcpy(h.magic, kModelMagic, 8);
+    h.version = kModelVersion;
+    h.n_sections = (uint32_t) secs.size();
+    uint64_t tail = 0;
+    for (size_t i = 0; i < secs.size(); ++i) {
+        const uint64_t off = (file.size() + kSectionAlign - 1) / kSectionAlign * kSectionAlign;
+        file.resize((size_t) off, 0);
+        file.insert(file.end(), secs[i].text.begin(), secs[i].text.end());
+        if (i + 1 < secs.size()) file.resize(file.size() + (size_t) secs[i].bytes, 0);
+        else tail = secs[i].bytes;
+        SectionEntry e{};
+        std::memcpy(e.name, secs[i].name.data(), secs[i].name.size());
+        e.offset = off;
+        e.bytes = secs[i].text.size() + secs[i].bytes;
+        std::memcpy(file.data() + sizeof h + i * sizeof e, &e, sizeof e);
+    }
+    h.file_bytes = file.size() + tail;
+    std::memcpy(file.data(), &h, sizeof h);
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write(file.data(), (std::streamsize) file.size());
+        if (!f) return false;
+    }
+    std::error_code ec;
+    std::filesystem::resize_file(path, h.file_bytes, ec);
+    return !ec;
+}
+
+// the section's bytes: every tensor of the record, each on a 64-byte boundary
+uint64_t section_bytes(const Rec& r) {
+    uint64_t n = 0;
+    for (const DflySpec& t : dfly_specs(dims_of(r))) n += (t.elems() * 2 + 63) / 64 * 64;
+    return n;
+}
+
+void test_read_pack() {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() /
+        ("basalt-dfly-meta-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(dir);
+    // one draft layer with narrow inner widths keeps the section small; the checks are those of the full drafter
+    Rec r;
+    r.layers = 1;
+    r.inter = r.corr = 32;
+    r.kv = r.idx = {47};
+    const std::string rec = text(r), base = "{\"gguf_kv\":{}";
+    const uint64_t bytes = section_bytes(r);
+    auto open = [&](const char* name, const std::vector<Sec>& secs, ModelFile& file) {
+        const std::string path = (dir / name).string();
+        std::string err;
+        return write_pack(path, secs) && file.open(path, err) && file.load_meta(err);
+    };
+    const ModelGeometry g;
+    {   // the section and its record: the drafter, every tensor at its place in the file
+        ModelFile file;
+        DflyPack pack;
+        std::string err;
+        CHECK(open("with.basalt", {{"meta", base + ",\"dfly2\":" + rec + "}", 0}, {"dfly", "", bytes}}, file));
+        CHECK(dfly_read_pack(file, g, kTarget, pack, err) && pack.present);
+        CHECK(pack.dims.layers == 1 && pack.dims.ffn == 32 && pack.dims.target_layers == std::vector<int>({47}));
+        const ModelFile::Section* sec = file.find("dfly");
+        CHECK(sec != nullptr && pack.rec.tensors.size() == dfly_specs(pack.dims).size());
+        uint64_t end = 0;
+        bool inside = sec != nullptr;
+        for (const auto& [name, t] : pack.rec.tensors) {
+            inside = inside && t.offset >= sec->offset && t.offset + t.bytes <= sec->offset + sec->bytes;
+            end = std::max(end, t.offset + t.bytes);
+        }
+        CHECK(inside && sec != nullptr && end <= sec->offset + bytes && end + 64 > sec->offset + bytes);
+    }
+    {   // a pack with neither carries no drafter
+        ModelFile file;
+        DflyPack pack;
+        pack.present = true;
+        std::string err;
+        CHECK(open("without.basalt", {{"meta", base + "}", 0}}, file));
+        CHECK(dfly_read_pack(file, g, kTarget, pack, err) && !pack.present && err.empty());
+    }
+    // one without the other, a tensor past the section's end and a record the check refuses are load errors
+    struct Case {
+        const char* what;
+        std::vector<Sec> secs;
+    };
+    Rec wide = r;
+    wide.block = 9;
+    const std::vector<Case> bad = {
+        {"a record without the section", {{"meta", base + ",\"dfly2\":" + rec + "}", 0}}},
+        {"a section without the record", {{"meta", base + "}", 0}, {"dfly", "", bytes}}},
+        {"a tensor past the section's end", {{"meta", base + ",\"dfly2\":" + rec + "}", 0}, {"dfly", "", bytes - 64}}},
+        {"a record of another block", {{"meta", base + ",\"dfly2\":" + text(wide) + "}", 0}, {"dfly", "", bytes}}},
+    };
+    for (const Case& c : bad) {
+        ModelFile file;
+        DflyPack pack;
+        std::string err;
+        const bool opened = open("bad.basalt", c.secs, file);
+        if (!opened || dfly_read_pack(file, g, kTarget, pack, err) || err.empty() || pack.present) {
+            std::fprintf(stderr, "dfly_meta_test: FAILED a pack with %s was taken\n", c.what);
+            ++g_fail;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 void test_pass_over() {
     DflyDims d;
     d.rope_base = 1e7f;
@@ -218,6 +339,7 @@ void test_source_row() {
 int main() {
     test_record();
     test_refusals();
+    test_read_pack();
     test_pass_over();
     test_source_row();
     if (g_fail) {

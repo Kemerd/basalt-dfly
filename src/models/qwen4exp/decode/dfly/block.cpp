@@ -11,6 +11,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/native_qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/native_rope.hpp"
@@ -23,6 +24,8 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -74,7 +77,7 @@ bk::QsaShapes DflyDrafter::shapes_of(const DflyDims& d) {
 }
 
 bool DflyDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* head_rows, const int32_t* const* selections,
-                       int64_t cap, std::string& err) {
+                       int64_t cap, int win_rows, std::string& err) {
     if (!loaded()) { err = "dfly: bind before load"; return false; }
     if (bound() || proxy_ != nullptr) { err = "dfly: the drafter is already bound"; return false; }
     if (head == nullptr || !head->loaded()) { err = "dfly: the drafter needs the native head"; return false; }
@@ -111,15 +114,15 @@ bool DflyDrafter::bind(const WeightTable& wt, const NativeHead* head, const floa
         return head->draft_top1(proxy_, head->weights(), x_q8_1, (int) n_vocab, n_vocab, map_, out_id, out_prob, proxy_scratch_,
                                 stream, false);
     };
-    return bind(t, head_rows, selections, cap, err);
+    return bind(t, head_rows, selections, cap, win_rows, err);
 }
 
 bool DflyDrafter::bind(const Target& target, const float* head_rows, const int32_t* const* selections, int64_t cap,
-                       std::string& err) {
+                       int win_rows, std::string& err) {
     if (!loaded()) { err = "dfly: bind before load"; return false; }
     if (bound()) { err = "dfly: the drafter is already bound"; return false; }
     if (!target.embed || !target.pick || target.n_vocab <= d_.mask_id || head_rows == nullptr || selections == nullptr ||
-        cap < d_.sel_width) {
+        cap < d_.sel_width || win_rows < 1 || win_rows > dfly2::kTapRows) {
         err = "dfly: the drafter needs the target's embedding and pick, the window's head rows and its kept selections";
         return false;
     }
@@ -130,6 +133,7 @@ bool DflyDrafter::bind(const Target& target, const float* head_rows, const int32
     head_rows_ = head_rows;
     sel_.assign(selections, selections + d_.layers);
     sel_cap_ = cap;
+    win_rows_ = win_rows;
     const bk::QsaShapes s = shapes_of(d_);
     // ---- the constants of every block: the private pool's identity tables, the mask ids, the bias
     {
@@ -278,10 +282,46 @@ bool DflyDrafter::record(std::string& err) {
     return true;
 }
 
-int DflyDrafter::add_sequence(std::string& err) {
+bool dfly_session_pools(const SessionState& ss, const ModelGeometry& g, const DflyDims& d, bool kv_int8, bk::QsaAttnPools* out,
+                        std::string& err) {
+    if (out == nullptr || d.layers < 1 || (size_t) d.layers != d.target_layers.size() || ss.qsa_states == nullptr) {
+        err = "dfly: no session state for the drafter's paired layers";
+        return false;
+    }
+    for (int i = 0; i < d.layers; ++i) {
+        const int64_t l = d.target_layers[(size_t) i];
+        // the session's states are indexed by a full-attention layer's number among them
+        const int64_t ord = l / g.qsa_interval;
+        if (l < ss.layer_lo || l >= ss.layer_hi || !is_qsa_layer(g, l) || ord < ss.qsa_ord0 || ord >= ss.qsa_ord0 + ss.qsa_alloc) {
+            err = "dfly: the session does not run target layer " + std::to_string(l);
+            return false;
+        }
+        const QsaState& st = ss.qsa_states[ord];
+        // the gather copies cells as stored, through the page table of a cache that is whole in VRAM
+        const bool form = kv_int8 ? (st.kv_int8 && st.k_q && st.v_q && st.k_scale && st.v_scale) : (!st.kv_int8 && st.k_pool && st.v_pool);
+        if (st.kv_mode != 0 || st.kv_q4 || st.kv_hybrid || !form || st.page_table == nullptr) {
+            err = "dfly: target layer " + std::to_string(l) + "'s K/V is not whole in VRAM as " + (kv_int8 ? "int8" : "fp16");
+            return false;
+        }
+        out[i] = qsa_attn_pools(st);
+    }
+    return true;
+}
+
+int DflyDrafter::add_sequence(const bk::QsaAttnPools* pools, std::string& err) {
     if (!loaded()) { err = "dfly: a sequence before load"; return -1; }
+    if (pools == nullptr) { err = "dfly: a sequence needs its paired layers' K/V pools"; return -1; }
+    const RecLayout lay = layout_of(d_, rows_);
+    for (int i = 0; i < d_.layers; ++i) {
+        const bk::QsaAttnPools& p = pools[i];
+        const bool form = kv_int8_ ? (p.k_q && p.v_q && p.k_scale && p.v_scale) : (p.k_pool && p.v_pool);
+        if (!form || p.page_table == nullptr) {
+            err = "dfly: draft layer " + std::to_string(i) + "'s K/V pools are not in the form the drafter was loaded for";
+            return -1;
+        }
+    }
     Sequence q;
-    const size_t rb = layout_of(d_, rows_).bytes, ob = (size_t) 3 * kOut * 4;
+    const size_t rb = lay.bytes, ob = (size_t) 3 * kOut * 4;
     // page-locked, so a block's copies are queued without a staging copy
     if (cudaHostAlloc((void**) &q.rec, rb, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &q.out, ob, cudaHostAllocDefault) != cudaSuccess) {
@@ -292,20 +332,43 @@ int DflyDrafter::add_sequence(std::string& err) {
     }
     std::memset(q.rec, 0, rb);
     std::memset(q.out, 0, ob);
+    // the pools do not move, so the record names them once
+    std::memcpy(q.rec + lay.pools, pools, (size_t) d_.layers * sizeof(bk::QsaAttnPools));
     seqs_.push_back(q);
     return (int) seqs_.size() - 1;
 }
 
-bool DflyDrafter::launch(int seq, int32_t anchor, int row, int64_t pos, const bk::QsaAttnPools* pools, std::string& err) {
+bool DflyDrafter::draft(int seq, int32_t anchor, int64_t pos, int64_t win_pos0, int win_row0, int win_rows, bool& queued,
+                        std::string& err) {
+    queued = false;
     if (!bound()) { err = "dfly: a block before bind"; return false; }
-    if (seq < 0 || seq >= (int) seqs_.size() || pools == nullptr || row < 0 || row >= dfly2::kTapRows || pos < 1 ||
-        pos > INT32_MAX - kDflyBlockMax || anchor < 0 || anchor >= target_.n_vocab) {
-        err = "dfly: a block's sequence, anchor, source row or position is out of range";
+    if (seq < 0 || seq >= (int) seqs_.size() || win_row0 < 0 || win_rows < 0 || win_row0 + win_rows > win_rows_) {
+        err = "dfly: a block's sequence or its rows of the window are out of range";
         return false;
     }
+    // every row of a window keeps its head row and each paired layer's selection
+    unsigned sel_ok[dfly2::kTapRows] = {};
+    for (int r = 0; r < win_rows; ++r) sel_ok[r] = (1u << d_.layers) - 1u;
+    const int row = dfly2::source_row(win_pos0, (1u << win_rows) - 1u, sel_ok, d_.layers, pos);
+    if (row < 0) {
+        ++skipped;
+        return true;
+    }
+    if (!launch(seq, anchor, win_row0 + row, pos, err)) return false;
+    queued = true;
+    return true;
+}
+
+bool DflyDrafter::launch(int seq, int32_t anchor, int row, int64_t pos, std::string& err) {
+    Sequence& q = seqs_[(size_t) seq];
+    if (pos < 1 || pos > INT32_MAX - kDflyBlockMax || anchor < 0 || anchor >= target_.n_vocab) {
+        err = "dfly: a block's anchor or position is out of range";
+        return false;
+    }
+    // the copy of the record is queued, so the record is the block's until the round's wait
+    if (q.queued) { err = "dfly: the sequence's last block is not waited for"; return false; }
     const bk::QsaShapes s = shapes_of(d_);
     const RecLayout lay = layout_of(d_, rows_);
-    const Sequence& q = seqs_[(size_t) seq];
     // ---- the block's record: every value its kernels read
     int32_t* w = (int32_t*) q.rec;
     const int32_t nctx = (int32_t) bk::qsa_selection_width(pos, s);
@@ -322,27 +385,32 @@ bool DflyDrafter::launch(int seq, int32_t anchor, int row, int64_t pos, const bk
         for (int h = 0; h < d_.n_head; ++h) w[lay.pos_q + (size_t) r * (size_t) d_.n_head + (size_t) h] = (int32_t) pos + r;
         for (int h = 0; h < d_.n_head_kv; ++h) w[lay.pos_k + (size_t) r * (size_t) d_.n_head_kv + (size_t) h] = (int32_t) pos + r;
     }
-    for (int i = 0; i < d_.layers; ++i) {
-        const bk::QsaAttnPools& p = pools[i];
-        const bool form = kv_int8_ ? (p.k_q && p.v_q && p.k_scale && p.v_scale) : (p.k_pool && p.v_pool);
-        if (!form || p.page_table == nullptr) {
-            err = "dfly: draft layer " + std::to_string(i) + "'s K/V pools are not in the form the drafter was loaded for";
-            return false;
-        }
-        std::memcpy(q.rec + lay.pools + (size_t) i * sizeof(bk::QsaAttnPools), &p, sizeof(bk::QsaAttnPools));
-    }
     // ---- three queued operations: the record in, the graph, the output rows out
     const OnDevice on(device_);
     const cudaStream_t cs = (cudaStream_t) ds_;
-    return ok(cudaMemcpyAsync(b_.rec, q.rec, lay.bytes, cudaMemcpyHostToDevice, cs), "a block's record", err) &&
-           ok(cudaGraphLaunch((cudaGraphExec_t) exec_, cs), "a block's launch", err) &&
-           ok(cudaMemcpyAsync(q.out, b_.out, (size_t) 3 * kOut * 4, cudaMemcpyDeviceToHost, cs), "a block's drafts", err) &&
-           ok(cudaEventRecord((cudaEvent_t) done_, cs), "a block's event", err);
+    const std::chrono::steady_clock::time_point queued_at = std::chrono::steady_clock::now();
+    if (!ok(cudaMemcpyAsync(b_.rec, q.rec, lay.bytes, cudaMemcpyHostToDevice, cs), "a block's record", err) ||
+        !ok(cudaGraphLaunch((cudaGraphExec_t) exec_, cs), "a block's launch", err) ||
+        !ok(cudaMemcpyAsync(q.out, b_.out, (size_t) 3 * kOut * 4, cudaMemcpyDeviceToHost, cs), "a block's drafts", err) ||
+        !ok(cudaEventRecord((cudaEvent_t) done_, cs), "a block's event", err))
+        return false;
+    q.queued = true;
+    // a round is timed from its first block
+    if (!pending_) round0_ = queued_at;
+    pending_ = true;
+    return true;
 }
 
 bool DflyDrafter::wait(std::string& err) {
     if (!bound()) { err = "dfly: a wait before bind"; return false; }
-    return ok(cudaEventSynchronize((cudaEvent_t) done_), "a block", err);
+    if (!pending_) return true;
+    const bool done = ok(cudaEventSynchronize((cudaEvent_t) done_), "a block", err);
+    for (Sequence& q : seqs_) q.queued = false;
+    pending_ = false;
+    if (!done) return false;
+    ms_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - round0_).count();
+    ++rounds;
+    return true;
 }
 
 void DflyDrafter::read(int seq, int32_t* ids, float* conf) const {

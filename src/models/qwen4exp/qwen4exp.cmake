@@ -122,13 +122,25 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_dfly_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen4exp_dfly_meta_test PRIVATE core)
   basalt_cpu_test(NAME qwen4exp_dfly_meta_test COMMAND qwen4exp_dfly_meta_test)
-  # the DFly2 block pass against a CPU double reference of its equations (GPU, synthetic, no model)
+  # what the DFly2 drafter decides before it touches the card: a session's pools, the bytes charged, the calls refused
+  add_executable(qwen4exp_dfly_host_test tests/models/qwen4exp/decode/dfly_host_test.cpp)
+  target_include_directories(qwen4exp_dfly_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/core)
+  target_link_libraries(qwen4exp_dfly_host_test PRIVATE model_qwen4exp_engine core)
+  basalt_cpu_test(NAME qwen4exp_dfly_host_test COMMAND qwen4exp_dfly_host_test)
+  # the DFly2 block pass against a CPU double reference of its equations, over plain buffers and over a native head and
+  # embedding table read from a synthetic model file (GPU, no model)
   add_executable(qwen4exp_dfly_parity tests/models/qwen4exp/decode/dfly_parity.cpp)
-  target_include_directories(qwen4exp_dfly_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(qwen4exp_dfly_parity PRIVATE model_qwen4exp_engine CUDA::cudart)
+  target_include_directories(qwen4exp_dfly_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/core)
+  target_link_libraries(qwen4exp_dfly_parity PRIVATE model_qwen4exp_engine models CUDA::cudart)
   basalt_embed_manifest(qwen4exp_dfly_parity)
   basalt_gpu_test(NAME qwen4exp_dfly_parity COMMAND qwen4exp_dfly_parity)
   set_tests_properties(qwen4exp_dfly_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+  # the block pass of a pack's drafter against the trainer's forward in a fixture (GPU, a pack: a program, not a test)
+  add_executable(qwen4exp_dfly_real tests/models/qwen4exp/decode/dfly_real.cpp)
+  target_include_directories(qwen4exp_dfly_real PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qwen4exp_dfly_real PRIVATE model_qwen4exp_engine models CUDA::cudart)
+  basalt_embed_manifest(qwen4exp_dfly_real)
 endif()
 
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).

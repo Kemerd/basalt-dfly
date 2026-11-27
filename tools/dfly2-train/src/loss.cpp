@@ -189,6 +189,32 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z_in, const torch:
     return out;
 }
 
+ServedChain served_chain(Drafter& drafter, const torch::Tensor& z_in, const torch::Tensor& embedding, const torch::Tensor& head,
+                         const torch::Tensor& anchor_tokens) {
+    const DrafterShape& s = drafter->shape;
+    if (!z_in.defined() || z_in.dim() != 3 || z_in.size(1) != s.block || z_in.size(2) != s.hidden) throw std::invalid_argument("served chain: z is not [blocks][block][hidden]");
+    if (!anchor_tokens.defined() || anchor_tokens.dim() != 1 || anchor_tokens.scalar_type() != torch::kLong || anchor_tokens.size(0) != z_in.size(0))
+        throw std::invalid_argument("served chain: the anchor tokens do not match z");
+    if (!embedding.defined() || embedding.dim() != 2 || embedding.size(0) != s.vocab || !head.defined() || head.dim() != 2 || head.size(0) != s.vocab)
+        throw std::invalid_argument("served chain: the embedding or the head is not [vocab][hidden]");
+    const int64_t rows = s.block - 1;
+    torch::NoGradGuard no_grad;
+    const torch::Tensor z = z_in.detach();
+    const torch::Dtype dt = z.scalar_type(), ct = compute_dtype(z);
+    std::vector<torch::Tensor> corrected, confidence, drafts;
+    torch::Tensor prev = anchor_tokens;
+    for (int64_t k = 0; k < rows; ++k) {
+        // row k + 1 from the token the row before it drafted
+        const torch::Tensor h = drafter->hidden_correction->forward(z.select(1, k + 1), embedding.index_select(0, prev).to(dt));
+        const torch::Tensor draft = F::linear(h.to(head.scalar_type()), head).to(ct).argmax(-1);
+        corrected.push_back(h.to(dt));
+        confidence.push_back(drafter->confidence_head->forward(h).to(ct));
+        drafts.push_back(draft);
+        prev = draft;
+    }
+    return {torch::stack(corrected, 1), torch::stack(confidence, 1), torch::stack(drafts, 1)};
+}
+
 double served_chain_accept(Drafter& drafter, const torch::Tensor& z_in, const torch::Tensor& embedding, const torch::Tensor& head,
                            const SequenceContext& seq, const torch::Tensor& anchors, int64_t chunk_blocks) {
     const int64_t N = check_inputs(drafter, z_in, embedding, head, seq, anchors);
@@ -196,22 +222,16 @@ double served_chain_accept(Drafter& drafter, const torch::Tensor& z_in, const to
     const int64_t B = s.block, rows = B - 1, step = std::max<int64_t>(1, chunk_blocks);
     torch::NoGradGuard no_grad;
     const torch::Tensor z = z_in.detach();
-    const torch::Dtype dt = z.scalar_type(), ct = compute_dtype(z);
+    const torch::Dtype ct = compute_dtype(z);
     double accepted = 0;
     for (int64_t c0 = 0; c0 < N; c0 += step) {
         const int64_t c1 = std::min(N, c0 + step);
         const torch::Tensor a = anchors.slice(0, c0, c1);
         const torch::Tensor teacher = teacher_logits(seq, head, block_rows(a, 0, rows), ct).argmax(-1);   // [C][rows]
-        torch::Tensor prev = seq.tokens.index_select(0, a);                                              // the anchor token
-        torch::Tensor alive = torch::ones({c1 - c0}, torch::TensorOptions().dtype(torch::kBool).device(z.device()));
-        for (int64_t k = 0; k < rows; ++k) {
-            // row k + 1 from the token the row before it drafted
-            const torch::Tensor corrected = drafter->hidden_correction->forward(z.slice(0, c0, c1).select(1, k + 1), embedding.index_select(0, prev).to(dt));
-            const torch::Tensor draft = F::linear(corrected.to(head.scalar_type()), head).to(ct).argmax(-1);
-            alive = alive.logical_and(draft.eq(teacher.select(1, k)));
-            accepted += alive.sum().item<double>();
-            prev = draft;
-        }
+        const ServedChain chain = served_chain(drafter, z.slice(0, c0, c1), embedding, head, seq.tokens.index_select(0, a));
+        // a block's drafts count up to its first miss
+        const torch::Tensor alive = chain.drafts.eq(teacher).to(torch::kLong).cumprod(1);
+        accepted += alive.sum().item<double>();
     }
     return accepted;
 }

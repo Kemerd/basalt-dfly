@@ -26,6 +26,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/dfly_kv.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -35,6 +36,7 @@ namespace basalt::core {
 
 class LoadPlan;
 class NativeHead;
+struct SessionState;
 
 constexpr int kDflyBlockMax = 8;   ///< rows of the widest block: the anchor and seven masks
 
@@ -103,6 +105,12 @@ struct DflyPack {
 /// inside the `dfly` section. A pack with neither the section nor the record has no drafter, which is not an error.
 bool dfly_read_pack(const ModelFile& file, const ModelGeometry& g, const DflyTarget& t, DflyPack& out, std::string& err);
 
+/// The K/V pools of the target layers a drafter of `d` is paired with, in its layers' order, as session `ss` holds
+/// them: `out` gets d.layers of them. False with `err` unless the session holds each of those layers' caches whole in
+/// VRAM, as fp16 rows or (`kv_int8`) as int8 codes with their scales: the forms the block pass gathers.
+bool dfly_session_pools(const SessionState& ss, const ModelGeometry& g, const DflyDims& d, bool kv_int8,
+                        basalt::kernels::QsaAttnPools* out, std::string& err);
+
 /// The drafter on the main card: its weights, one captured graph of the block pass and the sequences that draft with
 /// it. A block is queued on the drafter's own stream and reads the last window's rows and the sequence's K/V pools; it
 /// keeps nothing between blocks.
@@ -123,10 +131,11 @@ public:
     /// The device bytes bind() takes for a head of this type over `n_vocab` rows: the 2-bit copy of the head its drafts
     /// are picked with, its scratch and its row map.
     static uint64_t bind_bytes(int head_type, int64_t n_vocab);
-    /// The buffers the block pass reads: the last window's head rows (n_embd floats a row), each draft layer's kept
-    /// selections (rows of `cap` ids), and the head its drafts are picked with. Captures the graph.
+    /// The buffers the block pass reads, which the verify window leaves at fixed addresses: its head rows (`win_rows`
+    /// rows of n_embd floats) and each draft layer's kept selections (`win_rows` rows of `cap` ids), and the head its
+    /// drafts are picked with. Captures the graph.
     bool bind(const WeightTable& wt, const NativeHead* head, const float* head_rows, const int32_t* const* selections,
-              int64_t cap, std::string& err);
+              int64_t cap, int win_rows, std::string& err);
     /// What the block pass takes from the target beside the window's rows, as calls that only enqueue on `stream` and
     /// read their per-block values from device memory: the embedding rows of `n` device token ids, and one q8_1
     /// column's draft with its probability (false: no pick was queued).
@@ -136,22 +145,29 @@ public:
         int64_t n_vocab = 0;
     };
     /// bind() over the target's two calls as given: the form the parity programs bind, with rows of their own.
-    bool bind(const Target& target, const float* head_rows, const int32_t* const* selections, int64_t cap, std::string& err);
+    bool bind(const Target& target, const float* head_rows, const int32_t* const* selections, int64_t cap, int win_rows,
+              std::string& err);
 
     bool loaded() const { return weights_ != nullptr; }
     bool bound() const { return exec_ != nullptr; }
     const DflyDims& dims() const { return d_; }
     int rows() const { return rows_; }            ///< rows of a block: the anchor and drafts()
     int drafts() const { return rows_ - 1; }
+    bool kv_int8() const { return kv_int8_; }     ///< the form of the K/V pools its sequences hold
     uint64_t vram_bytes() const { return vram_; }
 
-    /// A sequence that drafts (the solo session, a batch slot): its page-locked record and output rows. Its id, or -1
-    /// with `err`.
-    int add_sequence(std::string& err);
-    /// Queues a block of sequence `seq`: the anchor at position `pos`, the source row `row` of the last window, and
-    /// the pools of the sequence's paired layers (dims().layers of them, in the record's order). Does not wait.
-    bool launch(int seq, int32_t anchor, int row, int64_t pos, const basalt::kernels::QsaAttnPools* pools, std::string& err);
-    /// Waits for every block queued so far.
+    /// A sequence that drafts (the solo session, a batch slot) over the K/V pools of its paired layers (dims().layers
+    /// of them, in the record's order: dfly_session_pools), which must stay where they are while it drafts. It holds a
+    /// page-locked record and output rows. Its id, or -1 with `err`.
+    int add_sequence(const basalt::kernels::QsaAttnPools* pools, std::string& err);
+    /// Queues the block that follows a window for sequence `seq`, without waiting: `anchor` is the token at `pos`, the
+    /// pick of the window's row at pos - 1. The sequence's rows of the last window are `win_rows` rows from its row
+    /// `win_row0`, the first of them at position `win_pos0` (a window of one sequence: row 0 and every row). `queued`
+    /// is false, and no block is queued, when those rows do not hold the row at pos - 1: the round then has no drafts
+    /// for the sequence.
+    bool draft(int seq, int32_t anchor, int64_t pos, int64_t win_pos0, int win_row0, int win_rows, bool& queued,
+               std::string& err);
+    /// Waits for every block queued so far: one wait a round, whatever the sequences that drafted.
     bool wait(std::string& err);
     /// After wait(): the drafts of the sequence's last block, drafts() ids with each one's confidence (the confidence
     /// head's, a stated chance that the draft is accepted).
@@ -164,9 +180,9 @@ public:
     const float* block_rows() const { return b_.z; }
     const float* corrected_rows() const { return b_.hp; }
 
-    double ms_draft = 0;      ///< host time of the rounds, launch to drafts
+    double ms_draft = 0;      ///< host time of the rounds, from a round's first block queued to its wait's end
     int64_t rounds = 0;       ///< rounds that drafted
-    int64_t skipped = 0;      ///< rounds without a source row in the last window: no drafts
+    int64_t skipped = 0;      ///< blocks not queued: the last window did not hold their source row
 
 private:
     struct Layer {
@@ -187,13 +203,15 @@ private:
         uint8_t *pk = nullptr, *pv = nullptr, *pks = nullptr, *pvs = nullptr;   // the private pool
     };
     struct Sequence {
-        uint8_t* rec = nullptr;   // page-locked, the record's layout
+        uint8_t* rec = nullptr;   // page-locked, the record's layout: its pools are written once
         int32_t* out = nullptr;   // page-locked, the output rows' layout
+        bool queued = false;      // its block's copies are queued: the record is not rewritten before the wait
     };
     static uint64_t carve(const DflyDims& d, int rows, bool kv_int8, uint8_t* base, Buffers& b);
     static uint64_t record_bytes(const DflyDims& d, int rows);
     static basalt::kernels::QsaShapes shapes_of(const DflyDims& d);   // the target's shapes with the drafter's heads
     bool record(std::string& err);
+    bool launch(int seq, int32_t anchor, int row, int64_t pos, std::string& err);
 
     DflyDims d_;
     int rows_ = 0, device_ = -1;
@@ -211,6 +229,9 @@ private:
     const float* head_rows_ = nullptr;
     std::vector<const int32_t*> sel_;
     int64_t sel_cap_ = 0;
+    int win_rows_ = 0;                         // rows the bound window buffers hold
+    bool pending_ = false;                     // a block is queued and not yet waited for
+    std::chrono::steady_clock::time_point round0_;   // when the round's first block was queued
     void *proxy_ = nullptr, *proxy_scratch_ = nullptr;
     int32_t* map_ = nullptr;
     void *ds_ = nullptr, *exec_ = nullptr, *done_ = nullptr;   // the drafter's stream, its graph, the event after a round

@@ -3,6 +3,7 @@
 //   basalt-dfly2-train init  --model PACK --out FILE
 //   basalt-dfly2-train train --model PACK --shards DIR --run DIR [--init FILE]
 //   basalt-dfly2-train eval  --model PACK --shards DIR --checkpoint FILE
+//   basalt-dfly2-train fixture --model PACK --shards DIR --checkpoint FILE --out FILE
 #include "trainer.hpp"
 
 #include "basalt/log.hpp"
@@ -34,6 +35,7 @@ void usage() {
         "  basalt-dfly2-train init  --model PACK --out FILE [options]\n"
         "  basalt-dfly2-train train --model PACK --shards DIR --run DIR [--init FILE] [options]\n"
         "  basalt-dfly2-train eval  --model PACK --shards DIR --checkpoint FILE [options]\n"
+        "  basalt-dfly2-train fixture --model PACK --shards DIR --checkpoint FILE --out FILE [options]\n"
         "\n"
         "init: a new drafter, its attention copied from the target layers it pairs with\n"
         "  --model PACK           the target's pack\n"
@@ -80,7 +82,13 @@ void usage() {
         "  --model, --shards, --device, --head-dtype, --blocks, --loss-blocks, --attention-blocks, --seed, --queue-gb,\n"
         "  --kl-topk, --dpace-alpha, --e2e-weight, --confidence-weight, --prefix-weight, --kv-int8-share as for train\n"
         "  --checkpoint FILE      the drafter file to measure\n"
-        "  --max-blocks N         measure this many blocks (default: all)\n",
+        "  --max-blocks N         measure this many blocks (default: all)\n"
+        "\n"
+        "fixture: blocks of the shards and the drafter's forward over them, for a runtime's block pass to be checked against\n"
+        "  --model, --shards, --device, --head-dtype, --attention-blocks, --seed, --queue-gb as for eval\n"
+        "  --checkpoint FILE      the drafter file whose forward is written\n"
+        "  --out FILE             the safetensors file to write\n"
+        "  --count N              blocks to write, at most four from a sequence (1)\n",
         stdout);
 }
 
@@ -237,6 +245,22 @@ int run_train(Args& args) {
     return 0;
 }
 
+int run_fixture(Args& args) {
+    FixtureOptions o;
+    for (; args.i < args.argc && !args.bad; ++args.i) {
+        const std::string a = args.argv[args.i];
+        if (run_flag(a, args, o)) continue;
+        if (a == "--checkpoint") o.checkpoint = args.value("--checkpoint");
+        else if (a == "--out") o.out = args.value("--out");
+        else if (a == "--count") o.count = args.integer("--count", 1);
+        else return unknown("fixture", a);
+    }
+    if (args.bad) return 2;
+    std::string err;
+    if (!write_fixture(o, err)) { basalt::log::error(kTag, "%s", err.c_str()); return 1; }
+    return 0;
+}
+
 int run_eval(Args& args) {
     EvalOptions o;
     for (; args.i < args.argc && !args.bad; ++args.i) {
@@ -285,6 +309,7 @@ int main(int argc, char** argv) {
     if (command == "init") return run_init(args);
     if (command == "train") return run_train(args);
     if (command == "eval") return run_eval(args);
-    basalt::log::error(kTag, "'%s' is not init, train or eval (--help lists the options)", command.c_str());
+    if (command == "fixture") return run_fixture(args);
+    basalt::log::error(kTag, "'%s' is not init, train, eval or fixture (--help lists the options)", command.c_str());
     return 2;
 }

@@ -52,5 +52,15 @@ Configure with `-DBUILD_TESTING=ON`, build, and run `ctest --test-dir build`.
 - Kernel parity tests need the GPU. `expert_parity` and `pool_test` use a synthetic fixture; `--file experts.bin` checks real blobs.
 - Server tests: `python -m unittest discover -s serve/tests -t .` after `pip install -r requirements-test.txt`.
 - Tokenizer parity: register `tokenizer_parity` with `-DBASALT_TOKENIZER_DIR=<a pack's tokenizer/ directory>`.
+- The DFly2 drafter for Flash-Next is tested without a pack. On the CPU: `qwen4exp_dfly_meta_test` (the record, and a drafter
+  read from a pack file) and `qwen4exp_dfly_host_test` (a session's K/V pools, the bytes a start charges, the head's type).
+  On the GPU: `qwen4exp_dfly_parity [LAYERS [VOCAB]]`, the block pass against a CPU reference (each error held to twice the
+  reference's own spread under the roundings q8_1 leaves open, and to at least 2%), over plain buffers and over an
+  output head and embedding table read from a synthetic GGUF, for a Q8_0, a Q5_K and a Q6_K head. The defaults are 2 layers
+  and 4,096 rows; `5 248320` is the trained drafter's shape, which takes several GB of RAM, of VRAM and of the temporary
+  directory. With a pack and a checkpoint: `qwen4exp_dfly_real PACK FIXTURE` (a program, not a test) runs the blocks of
+  a trainer fixture ([`fixture`](dfly2-training.md#fixture)) through the pack's drafter and reports the error of `z`,
+  the corrected rows and the confidence logits, and the share of drafts that agree per position. It fails when the mean
+  error of `z` passes 10%: the Q8_0 projections and q8_1 inputs leave 3 to 6%.
 
 `basalt-bench` reads its prompts from `data/bench` (run from the repository root, or pass `--fixtures DIR`).

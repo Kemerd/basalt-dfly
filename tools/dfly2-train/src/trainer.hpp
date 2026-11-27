@@ -1,5 +1,5 @@
-// tools/dfly2-train/src/trainer.hpp - what basalt-dfly2-train's three commands do: make a drafter for a target, train
-// it on teacher shards, and measure a trained one.
+// tools/dfly2-train/src/trainer.hpp - what basalt-dfly2-train's commands do: make a drafter for a target, train
+// it on teacher shards, measure a trained one, and write the blocks a runtime's forward is checked against.
 #pragma once
 
 #include "loss.hpp"
@@ -87,5 +87,19 @@ struct EvalResult {
 
 /// Measures a drafter over the shards without changing it.
 bool evaluate(const EvalOptions& o, EvalResult& result, std::string& err);
+
+struct FixtureOptions : RunOptions {
+    std::string checkpoint;            ///< the drafter file whose forward is written
+    std::string out;                   ///< the safetensors file to write
+    int64_t count = 1;                 ///< blocks to write
+};
+
+/// `fixture`: blocks of the shards, in eval's order, as one safetensors file a runtime's block pass is checked
+/// against. Per block i, under "block.<i>.": what the pass reads (`anchor` the anchor's token, `pos` its position,
+/// `h_s` the head input of the row before it, `emb_anchor`, `emb_mask`, `emb_prev` the embeddings of each drafted
+/// row's previous token, and per draft layer l `layer.<l>.sel`, `.k_ctx`, `.v_ctx`: the selected cells' ids and
+/// their cached keys and values in that order) and what the drafter computed from it (`z` after the final norm,
+/// `h_corrected`, `conf_logit` with the bias, and `draft_ids`, each drafted row reading the draft before it).
+bool write_fixture(const FixtureOptions& o, std::string& err);
 
 }  // namespace basalt::dfly2
