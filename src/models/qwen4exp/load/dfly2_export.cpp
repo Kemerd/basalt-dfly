@@ -9,6 +9,7 @@
 #include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "dfly2_docs.hpp"
 #include "dfly2_shard_queue.hpp"
 
 #include <cmath>
@@ -26,7 +27,6 @@ constexpr uint64_t kShardTokens = 262144;                  // a shard is closed 
 constexpr int kPieces = 2;                                 // piece buffers in flight
 constexpr int kPaired[] = {31, 35, 39, 43, 47};            // the target layers a drafter layer is paired with
 constexpr int kNPaired = (int) (sizeof kPaired / sizeof kPaired[0]);
-constexpr size_t kReadBytes = 1u << 20;                    // the documents file is read this much at a time
 // --exp dfly2_export_check=N: every Nth document's window rows are also read by the prompt path, and the two compared
 constexpr int64_t kCheckContext[] = {2051, 8192, 32768};   // rows are summed by cells of context: up to each, and above
 constexpr int kNCheckContext = (int) (sizeof kCheckContext / sizeof kCheckContext[0]) + 1;
@@ -137,59 +137,6 @@ struct DocDigest {
             }
         return sum.value();
     }
-};
-
-/// The documents file, a line at a time: a document may be longer than any fixed buffer.
-class DocsFile {
-public:
-    DocsFile() = default;
-    DocsFile(const DocsFile&) = delete;
-    DocsFile& operator=(const DocsFile&) = delete;
-    ~DocsFile() {
-        if (f_ != nullptr) std::fclose(f_);
-    }
-    bool open(const std::string& path) {
-        f_ = basalt::platform::open_file_utf8(path, "rb");
-        buf_.resize(kReadBytes);
-        return f_ != nullptr;
-    }
-    /// The next line without its end; false at the end of the file, or when a read failed (`failed`).
-    bool next(std::string& line) {
-        line.clear();
-        for (;;) {
-            if (at_ == got_) {
-                if (f_ == nullptr || done_) break;
-                got_ = std::fread(buf_.data(), 1, buf_.size(), f_);
-                at_ = 0;
-                if (got_ < buf_.size()) {
-                    done_ = true;
-                    failed_ = std::ferror(f_) != 0;
-                }
-                if (got_ == 0) break;
-            }
-            const char* from = buf_.data() + at_;
-            const char* nl = (const char*) std::memchr(from, '\n', got_ - at_);
-            if (nl == nullptr) {   // the line goes on in the next read
-                line.append(from, got_ - at_);
-                at_ = got_;
-                continue;
-            }
-            line.append(from, (size_t) (nl - from));
-            at_ += (size_t) (nl - from) + 1;
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            return true;
-        }
-        // the last line may end without a newline
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        return !failed_ && !line.empty();
-    }
-    bool failed() const { return failed_; }
-
-private:
-    std::FILE* f_ = nullptr;
-    std::vector<char> buf_;
-    size_t at_ = 0, got_ = 0;
-    bool done_ = false, failed_ = false;
 };
 
 /// One run of the export: the engine's parts it reads with, the writer, and the document being read.
@@ -704,11 +651,16 @@ int dfly2_export(Context& context) {
                           "'s cache does not hold (--kv fp16, no --kv-resident, no elastic KV)");
     }
     const basalt::core::ModelFile::Section* meta = context.model_file->find("meta");
-    uint64_t docs_bytes = 0;
+    uint64_t docs_bytes = 0, doc_lines = 0;
     DocsFile docs;
     if (meta == nullptr) return refuse("needs the model file's meta section");
     if (!basalt::platform::file_size(o.dfly2_docs, docs_bytes) || !docs.open(o.dfly2_docs))
         return refuse("cannot read --dfly2-docs " + o.dfly2_docs);
+    // every line is a document before the first one is computed: a bad line costs no shard
+    if (!documents_check(o.dfly2_docs, n_vocab, doc_lines, err)) {
+        basalt::log::error("basalt generate", "--dfly2-export: %s", err.c_str());
+        return 2;
+    }
 
     Export x{context, o, g, ss, (cudaStream_t) *context.main_cs};
     x.windows = windows;
@@ -797,6 +749,15 @@ int dfly2_export(Context& context) {
     x.limits.shard_tokens = kShardTokens;
     if (!x.queue.open(o.dfly2_export, header, x.limits, ShardQueue::Memory{&take_pinned, &give_pinned}, err)) return failed(err);
     const uint64_t skip = x.queue.sequences_done();
+    // a failure between two documents closes the shard first, so the documents before it are kept
+    const auto failed_between = [&](const std::string& why) {
+        std::string ignored;
+        x.queue.close(ignored);
+        return failed(why);
+    };
+    if (doc_lines < skip)
+        return failed_between(o.dfly2_docs + " has " + std::to_string(doc_lines) + " documents, the directory's shards hold " +
+                              std::to_string(skip));
     // every Nth document's window rows are read by both paths and compared
     const int64_t check_every = windows ? (int64_t) basalt::core::exp_flag("dfly2_export_check") : 0;
     if (check_every > 0 && !x.check_init(err)) return failed(err);
@@ -813,13 +774,9 @@ int dfly2_export(Context& context) {
     while (docs.next(line_text)) {
         const uint64_t at = line++;
         if (at < skip) continue;   // written by an earlier run
-        if (line_text.find('\0') != std::string::npos || !cli::parse_i64_list(line_text.c_str(), doc, parse_err))
-            return failed(o.dfly2_docs + " line " + std::to_string(at + 1) + ": " +
-                          (parse_err.empty() ? "not a list of token ids" : parse_err));
-        for (const int64_t id : doc)
-            if (id >= n_vocab)
-                return failed(o.dfly2_docs + " line " + std::to_string(at + 1) + ": token " + std::to_string(id) +
-                              " is not in the vocabulary of " + std::to_string(n_vocab));
+        // the file was checked whole at the start: a line that fails now was changed since
+        if (!document_parse(line_text, n_vocab, doc, parse_err))
+            return failed_between(o.dfly2_docs + " line " + std::to_string(at + 1) + " changed during the run: " + parse_err);
         if ((int64_t) doc.size() > o.max_context) {
             doc.resize((size_t) o.max_context);
             ++truncated;
@@ -858,10 +815,10 @@ int dfly2_export(Context& context) {
         ++documents;
         tokens += (int64_t) doc.size();
     }
-    if (docs.failed()) return failed("reading " + o.dfly2_docs + " failed");
-    if (line < skip)
-        return failed(o.dfly2_docs + " has " + std::to_string(line) + " documents, the directory's shards hold " +
-                      std::to_string(skip));
+    if (docs.failed()) return failed_between("reading " + o.dfly2_docs + " failed");
+    if (line != doc_lines)
+        return failed_between(o.dfly2_docs + " changed during the run: " + std::to_string(line) + " documents, " +
+                              std::to_string(doc_lines) + " at the start");
     const int64_t rows_prompt = x.rows_prompt, rows_window = x.rows_window;
     const double ms_prompt = x.ms_prompt, ms_window = x.ms_window;
 
@@ -896,7 +853,7 @@ int dfly2_export(Context& context) {
             return false;
         }
         ++line_again;
-        if (!cli::parse_i64_list(line_text.c_str(), doc, e)) return false;
+        if (!document_parse(line_text, n_vocab, doc, e)) return false;
         if ((int64_t) doc.size() > o.max_context) doc.resize((size_t) o.max_context);
         ids.resize(doc.size());
         for (size_t i = 0; i < doc.size(); ++i) ids[i] = (int32_t) doc[i];

@@ -151,6 +151,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
   src/models/qwen4exp/load/dfly2_shard_queue.cpp
+  src/models/qwen4exp/load/dfly2_docs.cpp
   src/models/qwen4exp/load/dfly2_export.cpp
   src/models/qwen4exp/load/model.cpp
   src/models/qwen4exp/load/layer_plan.cpp
@@ -209,9 +210,10 @@ if(BUILD_TESTING)
   target_include_directories(qwen4exp_dfly2_flags_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_dfly2_flags_test PRIVATE model warnings)
   basalt_cpu_test(NAME qwen4exp_dfly2_flags_test COMMAND qwen4exp_dfly2_flags_test)
-  # the teacher export's writer: pieces in, shards out, a restart and the settings file (host only)
+  # the teacher export's writer: pieces in, shards out, a restart, the settings file and the documents file (host only)
   add_executable(qwen4exp_dfly2_shard_queue_test tests/models/qwen4exp/load/dfly2_shard_queue_test.cpp
-                 src/models/qwen4exp/load/dfly2_shard_queue.cpp)
+                 src/models/qwen4exp/load/dfly2_shard_queue.cpp src/models/qwen4exp/load/dfly2_docs.cpp
+                 src/program/cli/tokens.cpp)
   target_include_directories(qwen4exp_dfly2_shard_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(qwen4exp_dfly2_shard_queue_test PRIVATE engine_session model_file platform warnings)
   basalt_embed_manifest(qwen4exp_dfly2_shard_queue_test)

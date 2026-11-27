@@ -2,7 +2,9 @@
 // page-major comes back cell-major through the shard reader, a piece may start and end inside a cache page, a
 // selection belongs to the piece that holds the row before its anchor, the pieces are the only buffers, shards roll
 // and a restart counts them, the settings file refuses a changed setting, a selection has the form of the index's
-// rule, and the shards read back against what was handed over. Host only, no model.
+// rule, the shards read back against what was handed over, and the documents file is checked whole. Host only, no
+// model.
+#include "models/qwen4exp/load/dfly2_docs.hpp"
 #include "models/qwen4exp/load/dfly2_shard_queue.hpp"
 
 #include <atomic>
@@ -18,10 +20,13 @@
 
 namespace fs = std::filesystem;
 using namespace basalt::dfly2;
+using basalt::models::qwen4exp::generate::DocsFile;
 using basalt::models::qwen4exp::generate::ReadBack;
 using basalt::models::qwen4exp::generate::SequenceSink;
 using basalt::models::qwen4exp::generate::SequenceSource;
 using basalt::models::qwen4exp::generate::ShardQueue;
+using basalt::models::qwen4exp::generate::document_parse;
+using basalt::models::qwen4exp::generate::documents_check;
 using basalt::models::qwen4exp::generate::manifest_check;
 using basalt::models::qwen4exp::generate::selection_form;
 using basalt::models::qwen4exp::generate::shards_read_back;
@@ -519,6 +524,45 @@ int main() {
         }
         refused(!shards_read_back(bent, h, kIndexBlock, 2, expected, nullptr, back, err) &&
                 err.find("sequence 0") != std::string::npos, "a selection the reader refuses", err);
+    }
+
+    std::printf("8. the documents file\n");
+    {
+        const std::string dir8 = d.sub("docs");
+        fs::create_directories(dir8);
+        const auto write = [&](const std::string& name, const std::string& text) {
+            std::ofstream(dir8 + "/" + name, std::ios::binary) << text;
+            return dir8 + "/" + name;
+        };
+        uint64_t lines = 0;
+        check(documents_check(write("good.txt", "1 2 3\n4,5\r\n6"), 10, lines, err) && lines == 3,
+              "spaces, commas, a CRLF line and a last line without its end: three documents", err);
+        // a line longer than one read of the file
+        std::string longer;
+        for (int i = 0; i < 300000; ++i) longer += "7 ";
+        check(documents_check(write("long.txt", "1\n" + longer + "\n2\n"), 10, lines, err) && lines == 3,
+              "a line longer than one read", err);
+        DocsFile f;
+        std::string line;
+        std::vector<int64_t> doc;
+        check(f.open(dir8 + "/long.txt") && f.next(line) && line == "1" && f.next(line) &&
+                  document_parse(line, 10, doc, err) && doc.size() == 300000 && f.next(line) && line == "2" &&
+                  !f.next(line) && !f.failed(),
+              "read a line at a time, the long one whole", err);
+        refused(!documents_check(write("blank.txt", "1 2\n\n3\n"), 10, lines, err) && err.find("line 2") != std::string::npos,
+                "an empty line, by its number", err);
+        refused(!documents_check(write("tail.txt", "1 2\n3\n\n"), 10, lines, err) && err.find("line 3") != std::string::npos,
+                "a blank last line", err);
+        refused(!documents_check(write("vocab.txt", "1 2\n3 10\n"), 10, lines, err) && err.find("line 2") != std::string::npos &&
+                    err.find("10") != std::string::npos,
+                "an id outside the vocabulary", err);
+        refused(!documents_check(write("text.txt", "1 2\nhello\n"), 10, lines, err) && err.find("line 2") != std::string::npos,
+                "a line that is not token ids", err);
+        refused(!documents_check(write("nul.txt", std::string("1 2\n3\0 4\n", 9)), 10, lines, err) &&
+                    err.find("line 2") != std::string::npos,
+                "a NUL inside a line", err);
+        refused(!documents_check(dir8 + "/missing.txt", 10, lines, err), "a file that is not there", err);
+        check(documents_check(write("empty.txt", ""), 10, lines, err) && lines == 0, "an empty file holds no document", err);
     }
 
     if (g_fail) {

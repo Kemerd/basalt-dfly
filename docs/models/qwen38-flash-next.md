@@ -65,8 +65,8 @@ and prose least.
 model computes for each document of `FILE` into `DIR`, as the shards a DFly2 drafter is trained on
 ([training](../dfly2-training.md#teacher-shards)). No drafter runs and the expert tiers stay as loaded.
 
-- **Input:** one document a line, as token ids separated by spaces or commas. An empty line or an id outside the vocabulary
-  ends the run with the line's number. A document longer than `--max-context` is cut to it and counted.
+- **Input:** one document a line, as token ids separated by spaces or commas. The whole file is read first: an empty line or
+  an id outside the vocabulary is refused with the line's number before anything is computed. A document longer than `--max-context` is cut to it and counted.
 - **Two kinds of row:** a document's last `--dfly2-window-rows N` rows (default 512; 0: none) are read through verify windows
   of 8, as generated rows are when serving, and the rows before them by the batched prompt path (`--prefill`, default auto).
   With `n` rows the windows start at row `n - min(N, n - 1)`.
