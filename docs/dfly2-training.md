@@ -4,10 +4,9 @@
 selects the cells each row reads (Qwen3.8-Flash-Next, architecture `qwen4exp`). It is a C++ program on LibTorch in
 `tools/dfly2-train/`, built apart from the engine.
 
-**Status.** The trainer, its file formats and its CPU tests are in the tree. The engine's teacher export
-([`--dfly2-export`](models/qwen38-flash-next.md#teacher-export)) writes the shards the trainer reads; it has not been
-run on a GPU, so there is no shard of a real model to train on: the tests train on a small synthetic target. The
-trainer has not been run on a GPU.
+**Status.** The trainer, its file formats and its tests are in the tree. It has trained a drafter on the GPU from
+the engine's teacher export ([`--dfly2-export`](models/qwen38-flash-next.md#teacher-export)) of a real pack:
+[a first run](#a-first-run). No trained drafter has run in the engine yet.
 
 ## What is trained
 
@@ -76,7 +75,7 @@ the paired layers come from the pack's metadata.
 | `--layers A,B,...` | the target layers to pair with; default: the last `--draft-layers` layers that have the sparse attention |
 | `--draft-layers N` | drafter layers (5) |
 | `--block N` | rows of a block: the anchor and `N - 1` drafts (8) |
-| `--mask-id N` | the mask token (248077). It must be an id the tokenizer never produces; check it against the tokenizer |
+| `--mask-id N` | the mask token (248077, an unused pad token of Flash-Next's tokenizer). It must be an id the tokenizer never produces |
 | `--rms-eps X` | eps of the drafter's own norms (1e-5) |
 | `--seed N` | seed of the random initialisation (42) |
 
@@ -201,10 +200,36 @@ them. Which blocks is drawn per epoch from the seed. `eval --kv-int8-share 1` me
 Per token a shard holds the hidden row and two cells per paired layer: 15,360 bytes for Flash-Next with FP16 hidden
 rows and five layers, plus about 41 KiB per anchor of selections.
 
+## A first run
+
+Qwen3.8-Flash-Next (`Qwen3.8-FN-Uncensored-NVFP4-DQ6_K`) on an RTX 5090 at a 546 W power limit, LibTorch 2.15.0 (cu134,
+which carries sm_120 code):
+
+- **Corpus.** 348 source files (C++, Python, Markdown), 1.45M tokens, each cut to 8,192 tokens; 16 other files
+  (60k tokens) held out.
+- **Export.** `--max-context 16384 --dfly2-window-rows 1536`, so 36% of the rows came through verify windows. 23.8 GiB
+  of shards, 17,631 bytes a token: 15,360 a row plus 41,020 an anchor, so about 20.5 KB a window row and 16.0 KB a
+  prompt-path row. 91 minutes of GPU in six restarts: windows at 115 to 118 rows/s, the prompt path at 2,900 to 3,500
+  rows/s. Its check found 5.4 to 7.3% of the selected cells differing past 2,051 cells of context, so the run trained on
+  window anchors only.
+- **Training.** `--prefix-weight 0 --kv-int8-share 0.5 --blocks-per-step 2048 --steps 360`, the rest defaults:
+  65.5k blocks an epoch, 325 blocks/s, 18.0 GiB of device memory, 37 minutes for 11.3 epochs. The progress line's loss
+  went from 11.66 (step 10) to 0.50.
+- **Held out** (3,019 blocks), drafts per block as defined under [`eval`](#eval):
+
+| Step | Epochs | Loss | KL | Serving chain, greedy | Teacher-forced, sampling |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 14.24 | 12.61 | 0.00 | 0.00 |
+| 90 | 2.8 | 3.61 | 2.23 | 1.19 | 0.92 |
+| 180 | 5.6 | 2.77 | 1.41 | 1.99 | 1.75 |
+| 270 | 8.4 | 2.83 | 1.28 | 2.18 | 1.96 |
+| 360 | 11.3 | 2.98 | 1.25 | 2.20 | 2.01 |
+
+The same drafter scores 5.45 on its training shards: the run is short of data. Past about six epochs the held-out
+numbers barely move and the confidence term grows, which raises the loss. Read as from an INT8 cache
+(`--kv-int8-share 1`), the held-out loss moves by under 0.01 and each accepted length by under 0.004.
+
 ## Not verified
 
-- Nothing has run on a GPU: speed, device memory and BF16 on CUDA are untested. BF16 weights are tested on the CPU.
-- No shard of a real model exists yet, and the real pack's metadata and tensor types have only been read from the
-  converter's code.
-- The default mask token 248077 has not been checked against the tokenizer.
+- A trained drafter has not run in the engine, so no served acceptance or speed exists.
 - The interrupt path is tested through the library's stop callback, not by sending a signal to the program.
