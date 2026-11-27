@@ -250,8 +250,8 @@ static void test_regions() {
     d.append("int g();");
     CHECK(same(d.dump(), ":: namespace\n  n\n  g()\nn namespace\n  f()\n"));
     std::string out;
-    d.append(" int x = n::");
-    CHECK(d.propose(64, out).name == 2 && out == "f(");
+    d.append(" int x = n::f");
+    CHECK(d.propose(64, out).name == 1 && out == "(");
     d.boundary();
     CHECK(d.propose(64, out).size() == 0 && out.empty());   // the text before a boundary is not looked back over
     d.reset();
@@ -273,9 +273,12 @@ static void test_names() {
     CHECK(next(src + "Connection::zzz").empty() && next(src + "Connection::sendx").empty());
     CHECK(next(src + "Unknown::a").empty() && next(src + "std::").empty() && next(src + "::app").empty());
     CHECK(next(src + "Connection:").empty() && next(src + "Connection").empty() && next(src + "Connection::1").empty());
-    // a namespace's name ends in `::`; qualifiers are followed inwards
-    CHECK(next("namespace app::net { int f(); }\nint x = ap") .empty());
-    CHECK(next(src + "} int x = app::") == "net::" && next(src + "} int x = ::app::n") == "et::");
+    // a namespace is open: nothing until a name is started; its name ends in `::`, but not where it is declared
+    CHECK(next("namespace app::net { int f(); }\nint x = ap").empty());
+    CHECK(next(src + "} int x = app::").empty() && next(src + "} int x = app::net::").empty());
+    CHECK(next(src + "} int x = app::n") == "et::" && next(src + "} int x = ::app::n") == "et::");
+    CHECK(next(src + "} namespace app::n") == "et" && next(src + "} using namespace app::n") == "et");
+    // qualifiers are followed inwards
     CHECK(next(src + "} int x = app::net::Mode::r") == "eading" && next(src + "} int x = app::net::ch") == "ecksum(");
     CHECK(next(src + "} int x = app::Mode::r").empty());              // no such scope in app
     // enumerators, of a scoped enum and of an unscoped one in both places
@@ -335,9 +338,9 @@ static void test_signatures() {
     const std::string wrapped = "struct W {\n    void long_name(\n        int first,\n        int second = 2) const;\n};\n";
     CHECK(next(wrapped + "void W::long_name(") == "\n    int first,\n    int second) const");
     CHECK(next(wrapped + "  void W::long_n") == "ame(\n      int first,\n      int second) const");
-    // a namespace's own function is declared again by its definition; a class's is not looked for unqualified
-    CHECK(next(src + "int checksum(") == "const uint8_t* data, size_t size)");
-    CHECK(next(src + "int checksum(const uint8_t* data") == ", size_t size)");
+    // an unqualified name is not taken for a declaration made again: it may as well be a new overload
+    CHECK(next(src + "int checksum(").empty() && next(src + "int checksum(const uint8_t* data").empty());
+    CHECK(next(src + "int app::net::checksum(const uint8_t* data") == ", size_t size)");
     CHECK(next("struct T { void f(int a); void f(").empty());
     // only at declaration level: not in an initializer, a body or a call's arguments
     CHECK(next(src + "auto p = Connection::conn") == "ect(" && next(src + "auto p = Connection::connect(").empty());
@@ -410,7 +413,8 @@ static void test_robust() {
             } else {
                 d.append(pieces[next_random(state) % (sizeof pieces / sizeof pieces[0])]);
             }
-            CHECK(d.propose(64, out).size() == out.size() && out.size() <= 64);
+            const ScopeDrafter::Proposal p = d.propose(64, out);
+            CHECK(p.size() == out.size() && out.size() <= 64);
         }
         CHECK(!d.dump().empty());
     }

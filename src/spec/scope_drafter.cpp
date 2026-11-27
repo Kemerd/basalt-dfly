@@ -134,6 +134,8 @@ void strip_defaults(const std::string& in, std::string& out) {
 
 }  // namespace
 
+ScopeDrafter::ScopeDrafter() : ScopeDrafter(Limits()) {}
+
 ScopeDrafter::ScopeDrafter(const Limits& limits) : limits_(limits) { reset(); }
 
 void ScopeDrafter::reset() {
@@ -619,7 +621,7 @@ void ScopeDrafter::set_name(std::string_view w) {
     if ((tilde ? s.prev2 : s.prev) == kScopeOp) {
         // the name before the `::` is a qualifier of this one
         if (s.name_len > 0) {
-            if (s.chain_n < kMaxQualifiers && s.chain_len + s.name_len <= sizeof chain_) {
+            if (s.chain_n < kMaxQualifiers && (size_t) s.chain_len + s.name_len <= sizeof chain_) {
                 std::memcpy(chain_ + s.chain_len, name_, s.name_len);
                 chain_seg_[s.chain_n++] = s.name_len;
                 s.chain_len = (uint16_t) (s.chain_len + s.name_len);
@@ -819,8 +821,9 @@ void ScopeDrafter::start_params() {
     cap_over_ = false;
     fn_col_ = std::min(col_, (uint32_t) UINT16_MAX);
     fn_indent_ = std::min(indent_, (uint32_t) UINT16_MAX);
-    const Frame& f = top();
-    fn_scope_ = s.qualified ? resolve_chain(f.scope) : f.kind == Kind::ns ? f.scope : kNone;
+    // only a qualified name is a declaration made again: an unqualified one repeats its declaration word for word,
+    // name and all, and is a new overload as often
+    fn_scope_ = s.qualified ? resolve_chain(top().scope) : kNone;
     s.fn_entry = fn_scope_ != kNone ? find(fn_scope_, fn_name()) : kNone;
 }
 
@@ -1117,6 +1120,8 @@ ScopeDrafter::Proposal ScopeDrafter::propose(size_t max_bytes, std::string& out)
     if (!tail_name(typed, quals, n, global)) return p;
     const uint32_t scope = resolve(quals, n, global, f.scope);
     if (scope == kNone) return p;
+    // a namespace is open, other files declare into it: its names are offered only once one is started
+    if (scopes_[scope].kind == Kind::ns && typed.empty()) return p;
     // the names of the scope that start as typed: what they all go on with
     const char* first = nullptr;
     size_t common = 0;
@@ -1157,7 +1162,9 @@ ScopeDrafter::Proposal ScopeDrafter::propose(size_t max_bytes, std::string& out)
                                  max_bytes - out.size(), sig);
                 out += sig;
             }
-        } else if (en.child < scopes_.size() && scopes_[en.child].kind == Kind::ns) {
+        } else if (en.child < scopes_.size() && scopes_[en.child].kind == Kind::ns &&
+                   !(level && (s.head == Head::ns || s.head == Head::skip))) {
+            // (a namespace's own head and a using-directive end at the name)
             out += "::";
             name_bytes = out.size();
         }

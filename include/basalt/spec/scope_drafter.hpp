@@ -55,7 +55,8 @@ public:
         size_t size() const { return (size_t) name + signature; }
     };
 
-    explicit ScopeDrafter(const Limits& limits = Limits());
+    ScopeDrafter();
+    explicit ScopeDrafter(const Limits& limits);
 
     /// Forgets the text and the index.
     void reset();
@@ -70,10 +71,12 @@ public:
     ///   - after `Scope::` and the start of a name, what the names of that scope starting so have in common; one
     ///     name left is finished, a function's with `(` and a namespace's with `::`. `Scope` is looked up from the
     ///     scope the text is in outwards, then as the one scope of that name anywhere; two of them give nothing.
-    ///   - inside the parameter list of a function being declared again (`Scope::name(` at declaration level, or a
-    ///     namespace's own function), the rest of the declared list without default arguments, `)` and the
-    ///     qualifiers a definition repeats (const, volatile, a reference qualifier, noexcept, a trailing return
-    ///     type), with continuation lines moved to the new column. Overloads give what they have in common.
+    ///     A class or an enum lists all its names, so they are offered right after its `::`; a namespace is open
+    ///     to other files, so its names are offered only once one is started.
+    ///   - inside the parameter list of a function being declared again (`Scope::name(` at declaration level), the
+    ///     rest of the declared list without default arguments, `)` and the qualifiers a definition repeats (const,
+    ///     volatile, a reference qualifier, noexcept, a trailing return type), with continuation lines moved to
+    ///     the new column. Overloads give what they have in common.
     ///   - at declaration level the two join: the rest of the name, `(`, the list.
     /// Nothing inside a comment, a literal or a preprocessor line. The index is not changed.
     Proposal propose(size_t max_bytes, std::string& out) const;
