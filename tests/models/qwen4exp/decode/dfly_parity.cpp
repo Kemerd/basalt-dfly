@@ -5,11 +5,14 @@
 // the dequantised Q8_0 weights with the q8_1 rounding of their inputs and stores a block's own K/V as the cache stores a
 // cell. Checked: the rows after the final norm, the corrected rows and the confidence logits; that a shorter block gives the
 // same leading rows; that two sequences queued back to back each get their own result; fp16 and int8 pools; a context of
-// the widest selection. Argument: the draft layers (default 2; the real drafter has 5). GPU, synthetic, no model.
+// the widest selection; the pools a session of the target hands a sequence and the sessions refused; a round's calls (a
+// window without the source row, a slot's rows inside a window, the counters); the bytes the plan charges.
+// Argument: the draft layers (default 2; the real drafter has 5). GPU, synthetic, no model.
 #include "basalt/core/device_copy.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/qwen4exp/decode/dfly.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
@@ -26,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <random>
@@ -434,11 +438,34 @@ struct Block {
     std::vector<int32_t> ids;
 };
 
+// A session of the target whose paired layers' caches are the setup's: only the K/V state the drafter reads is set.
+struct Session {
+    std::vector<core::QsaState> states;
+    core::SessionState ss;
+    Session(const Setup& st, const std::vector<Cache>& caches, bool q8) {
+        const core::ModelGeometry g;
+        states.resize((size_t) g.n_qsa_layers());
+        for (int i = 0; i < st.d.layers; ++i) {
+            const Cache& c = caches[(size_t) i];
+            core::QsaState& q = states[(size_t) (st.d.target_layers[(size_t) i] / g.qsa_interval)];
+            q.page_table = c.d_table;
+            q.kv_int8 = q8;
+            if (q8) { q.k_q = (int8_t*) c.d_k; q.v_q = (int8_t*) c.d_v; q.k_scale = (uint16_t*) c.d_ks; q.v_scale = (uint16_t*) c.d_vs; }
+            else { q.k_pool = (uint16_t*) c.d_k; q.v_pool = (uint16_t*) c.d_v; }
+        }
+        ss.qsa_states = states.data();
+        ss.layer_lo = 0;
+        ss.layer_hi = g.n_layers;
+        ss.qsa_ord0 = 0;
+        ss.qsa_alloc = g.n_qsa_layers();
+    }
+};
+
 // One drafter of `R` rows over pools of the form, bound to the setup's buffers.
 struct Rig {
     core::DflyDrafter drafter;
     std::vector<bk::QsaAttnPools> pools;
-    int seq_a = -1, seq_b = -1;
+    int seq_a = -1, seq_b = -1, win_rows = 0;
     bool make(Setup& st, const std::vector<Cache>& caches, bool q8, int R) {
         std::string err;
         core::LoadPlan plan;
@@ -460,25 +487,39 @@ struct Rig {
                                       stream, false);
         };
         std::vector<const int32_t*> sel(st.d_sel.begin(), st.d_sel.end());
-        if (!drafter.bind(t, st.d_head_rows, sel.data(), st.cap, err)) {
+        if (!drafter.bind(t, st.d_head_rows, sel.data(), st.cap, st.win_rows, err)) {
             std::fprintf(stderr, "dfly_parity: bind: %s\n", err.c_str());
             return false;
         }
-        for (const Cache& c : caches) {
-            bk::QsaAttnPools p;
-            p.page_table = c.d_table;
-            if (q8) { p.k_q = (const int8_t*) c.d_k; p.v_q = (const int8_t*) c.d_v; p.k_scale = (const uint16_t*) c.d_ks; p.v_scale = (const uint16_t*) c.d_vs; }
-            else { p.k_pool = (const uint16_t*) c.d_k; p.v_pool = (const uint16_t*) c.d_v; }
-            pools.push_back(p);
+        // the load took what plan_bytes says, and binding the target's calls as given takes nothing more
+        if (drafter.vram_bytes() != core::DflyDrafter::plan_bytes(st.d, R, q8)) {
+            std::fprintf(stderr, "dfly_parity: the drafter holds %llu bytes, its plan says %llu\n",
+                         (unsigned long long) drafter.vram_bytes(), (unsigned long long) core::DflyDrafter::plan_bytes(st.d, R, q8));
+            return false;
         }
-        seq_a = drafter.add_sequence(err);
-        seq_b = drafter.add_sequence(err);
+        // the pools as a session of the target holds them
+        Session ses(st, caches, q8);
+        pools.resize((size_t) st.d.layers);
+        if (!core::dfly_session_pools(ses.ss, core::ModelGeometry{}, st.d, q8, pools.data(), err)) {
+            std::fprintf(stderr, "dfly_parity: the session's pools: %s\n", err.c_str());
+            return false;
+        }
+        win_rows = st.win_rows;
+        seq_a = drafter.add_sequence(pools.data(), err);
+        seq_b = drafter.add_sequence(pools.data(), err);
         return seq_a >= 0 && seq_b >= 0;
+    }
+    // a block whose source row is `row` of the setup's window: the window began `row` + 1 positions before the anchor
+    bool queue(int seq, int32_t anchor, int row, int64_t pos, std::string& err) {
+        bool queued = false;
+        if (!drafter.draft(seq, anchor, pos, pos - 1 - row, 0, win_rows, queued, err)) return false;
+        if (!queued) err = "the window does not hold the block's source row";
+        return queued;
     }
     // the device rows are the last block's, so they are read for a block queued alone
     bool run(int seq, int32_t anchor, int row, int64_t pos, Block& out) {
         std::string err;
-        if (!drafter.launch(seq, anchor, row, pos, pools.data(), err) || !drafter.wait(err)) {
+        if (!queue(seq, anchor, row, pos, err) || !drafter.wait(err)) {
             std::fprintf(stderr, "dfly_parity: block: %s\n", err.c_str());
             return false;
         }
@@ -501,10 +542,86 @@ void check(bool cond, const char* what) {
     ++g_fail;
 }
 
+// A session's pools are its paired layers' caches as stored, and a session the drafter cannot read is refused.
+void check_session(const Setup& st, const std::vector<Cache>& caches, bool q8) {
+    const core::ModelGeometry g;
+    std::string err;
+    std::vector<bk::QsaAttnPools> pools((size_t) st.d.layers);
+    Session ses(st, caches, q8);
+    bool same = core::dfly_session_pools(ses.ss, g, st.d, q8, pools.data(), err);
+    for (int i = 0; same && i < st.d.layers; ++i) {
+        const Cache& c = caches[(size_t) i];
+        const bk::QsaAttnPools& p = pools[(size_t) i];
+        same = p.page_table == c.d_table && p.k_q4 == nullptr && p.v_q4 == nullptr &&
+               (q8 ? p.k_q == (const int8_t*) c.d_k && p.v_q == (const int8_t*) c.d_v && p.k_scale == (const uint16_t*) c.d_ks &&
+                         p.v_scale == (const uint16_t*) c.d_vs && p.k_pool == nullptr && p.v_pool == nullptr
+                   : p.k_pool == (const uint16_t*) c.d_k && p.v_pool == (const uint16_t*) c.d_v && p.k_q == nullptr && p.v_q == nullptr);
+    }
+    check(same, "a session's pools are its paired layers' caches");
+    // each state the gather cannot read, on the last paired layer
+    const size_t last = (size_t) (st.d.target_layers.back() / g.qsa_interval);
+    auto refused = [&](const char* what, const std::function<void(Session&)>& edit, bool ask_q8) {
+        Session s2(st, caches, q8);
+        edit(s2);
+        std::string e;
+        if (core::dfly_session_pools(s2.ss, g, st.d, ask_q8, pools.data(), e) || e.empty()) {
+            std::fprintf(stderr, "dfly_parity: FAILED a session with %s was taken\n", what);
+            ++g_fail;
+        }
+    };
+    refused("streamed K/V", [&](Session& s) { s.states[last].kv_mode = 1; }, q8);
+    refused("Q4_0 K/V", [&](Session& s) { s.states[last].kv_q4 = true; }, q8);
+    refused("K8V4 K/V", [&](Session& s) { s.states[last].kv_hybrid = true; }, q8);
+    refused("no page table", [&](Session& s) { s.states[last].page_table = nullptr; }, q8);
+    refused("the other K/V form", [](Session&) {}, !q8);
+    refused("a layer range that ends before a paired layer", [&](Session& s) { s.ss.layer_hi = st.d.target_layers.back(); }, q8);
+    refused("no state for a paired layer", [&](Session& s) { s.ss.qsa_alloc = (int64_t) last; }, q8);
+    refused("no states", [](Session& s) { s.ss.qsa_states = nullptr; }, q8);
+}
+
+// A round's calls: a window that lacks the source row queues nothing, a slot's rows inside a wider window name the same
+// row, a sequence drafts once a round, and the counters follow.
+void check_rounds(Rig& rig, int32_t anchor, int row, int64_t pos, const Block& want) {
+    core::DflyDrafter& d = rig.drafter;
+    std::string err;
+    const int64_t rounds0 = d.rounds, skipped0 = d.skipped;
+    bool queued = true;
+    // the window ended a row early, or began after the source row: no block, and no wait is owed
+    bool ok = d.draft(rig.seq_a, anchor, pos, pos - 1 - row, 0, row, queued, err) && !queued;
+    queued = true;
+    ok = ok && d.draft(rig.seq_a, anchor, pos, pos, 0, rig.win_rows, queued, err) && !queued && d.wait(err);
+    check(ok && d.skipped == skipped0 + 2 && d.rounds == rounds0, "a window without the source row queues no block");
+    // rows outside the bound window, and an unknown sequence, are errors
+    err.clear();
+    check(!d.draft(rig.seq_a, anchor, pos, pos - 1 - row, 1, rig.win_rows, queued, err) && !err.empty(), "rows past the bound window are refused");
+    err.clear();
+    check(!d.draft(99, anchor, pos, pos - 1 - row, 0, rig.win_rows, queued, err) && !err.empty(), "an unknown sequence is refused");
+    // a slot's two rows from the window's row `row - 1`: the block reads the same row of the window
+    err.clear();
+    ok = d.draft(rig.seq_a, anchor, pos, pos - 2, row - 1, 2, queued, err) && queued;
+    // the sequence's record is queued: a second block of it waits for the round's end
+    std::string again;
+    bool q2 = false;
+    const bool twice = d.draft(rig.seq_a, anchor, pos, pos - 2, row - 1, 2, q2, again);
+    ok = ok && d.wait(err);
+    std::vector<int32_t> ids((size_t) d.drafts());
+    std::vector<float> conf(ids.size());
+    d.read(rig.seq_a, ids.data(), conf.data());
+    check(ok && ids == want.ids && std::equal(want.craw.begin(), want.craw.end(), d.raw_conf(rig.seq_a)),
+          "a slot's rows inside a window name the same source row");
+    check(!twice && !again.empty(), "a sequence drafts once a round");
+    check(d.rounds == rounds0 + 1 && d.ms_draft > 0.0, "a round that drafted is counted and timed");
+    // the confidence is the logit's sigmoid, a stated chance
+    bool chance = true;
+    for (float c : conf) chance = chance && c > 0.0f && c < 1.0f;
+    check(chance, "each draft's confidence is a chance");
+}
+
 void run_form(Setup& st, bool q8) {
     const char* form = q8 ? "int8" : "fp16";
     std::vector<Cache> caches;
     for (int l = 0; l < st.d.layers; ++l) caches.push_back(make_cache(st, q8));
+    check_session(st, caches, q8);
     // a short context, where the selection is every cell, and one of the widest selection
     for (const int64_t pos : {(int64_t) 300, (int64_t) 3000}) {
         const int nctx = (int) bk::qsa_selection_width(pos, bk::qsa_real_shapes());
@@ -520,6 +637,7 @@ void run_form(Setup& st, bool q8) {
         std::printf("dfly_parity: %s, %d context cells, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g\n", form,
                     nctx, R, ez, eh, ec);
         check(ez < kTol && eh < kTol && ec < kTol, "the block against the reference");
+        check_rounds(full, anchor, row, pos, a);
         // ---- a shorter block gives the same leading rows
         for (const int r2 : {2, 5}) {
             Rig part;
@@ -536,9 +654,8 @@ void run_form(Setup& st, bool q8) {
             const int32_t anchor_b = 911;
             const int row_b = 2;
             if (!full.run(full.seq_b, anchor_b, row_b, pos - 7, alone_b)) { ++g_fail; return; }
-            const bool queued = full.drafter.launch(full.seq_a, anchor, row, pos, full.pools.data(), err) &&
-                                full.drafter.launch(full.seq_b, anchor_b, row_b, pos - 7, full.pools.data(), err) &&
-                                full.drafter.wait(err);
+            const bool queued = full.queue(full.seq_a, anchor, row, pos, err) &&
+                                full.queue(full.seq_b, anchor_b, row_b, pos - 7, err) && full.drafter.wait(err);
             std::vector<int32_t> ia((size_t) full.drafter.drafts()), ib(ia.size());
             std::vector<float> ca(ia.size()), cb(ia.size());
             full.drafter.read(full.seq_a, ia.data(), ca.data());
@@ -554,7 +671,7 @@ void run_form(Setup& st, bool q8) {
             const int reps = 20;
             cudaEventRecord(e0, nullptr);
             for (int i = 0; i < reps && queued; ++i)
-                if (!full.drafter.launch(full.seq_a, anchor, row, pos, full.pools.data(), err) || !full.drafter.wait(err)) break;
+                if (!full.queue(full.seq_a, anchor, row, pos, err) || !full.drafter.wait(err)) break;
             cudaEventRecord(e1, nullptr);
             cudaEventSynchronize(e1);
             float ms = 0;
