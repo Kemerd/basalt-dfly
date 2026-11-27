@@ -762,6 +762,13 @@ int dfly2_export(Context& context) {
     settings["prefill_cpu_share"] = text;
     settings["expert_cache_slots"] = std::to_string(context.xcache->slots());
     settings["kv"] = "fp16";
+    // what else decides which experts compute a row, and so its rounding
+    settings["fixed_experts"] = o.diag_fixed_experts ? "1" : "0";
+    std::snprintf(text, sizeof text, "%g", o.pcie_frac);
+    settings["pcie_frac"] = text;
+    std::snprintf(text, sizeof text, "%g", (double) o.route.prior);
+    settings["route_prior"] = text;
+    settings["route_tail_skip"] = std::to_string(o.route.tail_skip);
     std::snprintf(text, sizeof text, "%.17g", rope.freq_base);
     settings["rope_base"] = text;
     const auto failed = [](const std::string& why) {
@@ -853,19 +860,29 @@ int dfly2_export(Context& context) {
 
     // ---- the first document again, from the state the last one left: when both readings give the same rows, cells
     // and selections, the reset between documents leaves nothing behind
+    bool first_again = true;
     if (documents > 0) {
         x.digesting = true;
         x.digest.reset();
         if (!x.read_document(first_doc, first_line, windows ? o.dfly2_window_rows : 0, false, err))
             return failed("reading the first document again: " + err);
-        if (x.digest.value() == first_digest)
+        if (x.digest.value() == first_digest) {
             basalt::log::info("basalt generate", "--dfly2-export: the first document read again after the last gave the "
                                  "same rows, cells and selections");
-        else
+        } else if (o.diag_fixed_experts) {
+            // every expert row runs the same way: only state the reset left behind can change a row
+            first_again = false;
+            basalt::log::error("basalt generate", "--dfly2-export: the first document (line %llu) read again after the "
+                                  "last gave other rows, cells or selections with the experts fixed: the reset between "
+                                  "documents leaves state behind",
+                               (unsigned long long) (first_line + 1));
+        } else {
             basalt::log::warn("basalt generate", "--dfly2-export: the first document (line %llu) read again after the last "
                                  "gave other rows, cells or selections: a document's result depends on the ones read "
-                                 "before it (the session's reset, or the expert tiers)",
+                                 "before it (the session's reset, or where the experts ran; --diag-fixed-experts tells "
+                                 "them apart)",
                          (unsigned long long) (first_line + 1));
+        }
     }
     if (!x.queue.close(err)) return failed(err);
 
@@ -917,7 +934,7 @@ int dfly2_export(Context& context) {
                      documents > 0 && first_same ? "; this run's first document is as computed" : "");
         whole = back.off_form == 0 && first_same;
     }
-    const bool checked = (check_every <= 0 || x.check_report()) && whole;
+    const bool checked = (check_every <= 0 || x.check_report()) && whole && first_again;
     basalt::log::info("basalt generate", "--dfly2-export: %lld documents, %lld tokens (%lld documents cut to %lld tokens); "
                          "%lld prompt-path rows at %.0f rows/s, %lld window rows at %.1f rows/s; the lent cache slots "
                          "refilled %lld times in %.0f ms",

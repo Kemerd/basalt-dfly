@@ -119,6 +119,7 @@ private:
 };
 
 /// The export's settings file in `dir`: written when absent, else compared key by key; false names the key that differs.
+/// A directory that holds a closed shard but no settings file is refused.
 bool manifest_check(const std::string& dir, const std::map<std::string, std::string>& settings, std::string& err);
 
 /// Whether `ids` (`count` cells) can be what the target's index selects for a row that reads among `n_kv` cells,

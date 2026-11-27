@@ -75,15 +75,20 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   the cells those five layers selected for the row before it (up to 2,051 a layer). Every anchor leaves room for a block of 8.
 - **Files:** `shard-NNNNN.dfly2`, each closed at a document's end once it holds 262,144 tokens and named `.part` until it is
   whole. `export.json` holds the run's settings: the pack, the documents file, the window rows, the context, the prompt chunk,
-  the CPU share, the expert cache's slots and the rotation's base.
+  the CPU share, the expert cache's slots, the PCIe share, the routing flags, `--diag-fixed-experts` and the rotation's base.
+  A directory with shards and no `export.json` is refused.
 - **Restart:** the same command continues after the documents of the closed shards. A setting that differs from `export.json`
   is refused with its name and the stored value; when `--prefill auto` settles on another chunk or the expert cache on
   another size (both follow the free VRAM), pass the stored ones as `--prefill N` and `--expert-cache N`.
 - **Check:** at its end the run reads its first document once more and reports whether the rows, cells and selections are
-  the same as the first time. It then reads every closed shard back through the shard reader: each sequence's tokens
+  the same as the first time: an error with `--diag-fixed-experts`, where only state left by the reset between documents can
+  change them, a warning without it. It then reads every closed shard back through the shard reader: each sequence's tokens
   against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
   4, the lowest cells of at most one more block, and the unfinished last block), and the first document's arrays against
   what was computed. A difference is an error line and exit code 1; the shards stay.
+- **Placement:** the windows run their experts where the load placed them, with or without `--diag-fixed-experts` (which
+  fixes only the prompt path's: all on the GPU, no CPU share). Two runs give the same bytes when they also pass the same
+  `--prefill N` and `--expert-cache N`.
 - **Cache format:** `--kv fp16`, the one-shot default. A shard holds FP16 cells, which no other format keeps; an INT8
   cache's codes are a function of those values, 64 at a time, so the trainer can form them from a shard.
 - **Refused:** `--serve`, `--kv` other than `fp16`, `--kv-resident`, `--prefill 0`, a control vector, a rope scaling and

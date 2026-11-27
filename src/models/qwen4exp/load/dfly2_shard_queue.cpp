@@ -378,7 +378,11 @@ bool manifest_check(const std::string& dir, const std::map<std::string, std::str
     const std::string path = dir + "/" + kManifest;
     uint64_t bytes = 0;
     if (!platform::file_size(path, bytes)) {
-        // absent: this run's settings become the directory's
+        // absent: this run's settings become the directory's, unless shards were written under other ones
+        if (platform::file_size(dir + "/" + ShardQueue::shard_name(0), bytes)) {
+            err = dir + " holds shards but no " + kManifest + ": their settings are unknown";
+            return false;
+        }
         if (!platform::make_dirs(dir)) { err = "cannot create " + dir; return false; }
         std::string text = "{\n";
         size_t written = 0;

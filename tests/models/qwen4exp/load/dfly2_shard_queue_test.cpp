@@ -389,6 +389,11 @@ int main() {
         check(!manifest_check(dir5, {}, err) && !manifest_check("", settings, err), "no settings or no directory");
         std::ofstream(dir5 + "/export.json") << "not json";
         refused(!manifest_check(dir5, settings, err), "a file that is not the settings is refused", err);
+        const std::string orphan = d.sub("orphan");
+        fs::create_directories(orphan);
+        std::ofstream(orphan + "/" + ShardQueue::shard_name(0)) << "a shard";
+        refused(!manifest_check(orphan, settings, err) && !fs::exists(orphan + "/export.json"),
+                "shards without a settings file are refused, and none is written", err);
     }
 
     std::printf("6. a selection's form\n");
