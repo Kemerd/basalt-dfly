@@ -31,6 +31,11 @@ constexpr int kNPaired = (int) (sizeof kPaired / sizeof kPaired[0]);
 constexpr int64_t kCheckContext[] = {2051, 8192, 32768};   // rows are summed by cells of context: up to each, and above
 constexpr int kNCheckContext = (int) (sizeof kCheckContext / sizeof kCheckContext[0]) + 1;
 constexpr int64_t kCheckGather = 2048;                     // cells the check gathers from the cache at a time
+// where both paths read every cell, the head rows' mean cosine below this is a wrong row, not rounding
+constexpr double kCheckCosine = 0.999;
+// prefix anchors stand for window anchors past 2,051 cells when no layer differs in more of its selected cells than
+// this and the head rows' mean cosine is at least kCheckCosine
+constexpr double kGateDiffer = 0.01;
 
 /// The index of `layer` in the paired layers, or -1.
 int paired_index(int64_t layer) {
@@ -322,19 +327,34 @@ struct Export {
         ++check_documents;
     }
 
-    /// Logs the check's sums. False when the two paths selected other cells where every cell is selected, or a
-    /// piece's cells were not the cache's.
+    /// Logs the check's sums and whether prefix anchors pass the gate past 2,051 cells. False when, where every
+    /// cell is selected, the two paths selected other cells or their head rows' mean cosine is under kCheckCosine,
+    /// or when a piece's cells were not the cache's.
     bool check_report() const {
-        bool ok = check_runs_differ == 0;
+        bool ok = check_runs_differ == 0, gate = true;
+        int64_t gate_rows = 0;
         for (int b = 0; b < kNCheckContext; ++b) {
             const CheckSums& c = sums[b];
             if (c.rows == 0) continue;
+            const double cos_mean = c.cos_sum / (double) c.rows;
+            if (b == 0 && !(cos_mean >= kCheckCosine)) {
+                ok = false;
+                basalt::log::error("basalt generate", "--dfly2-export check: where both paths read every cell, the head "
+                                      "rows' mean cosine %.6f is under %.3f: a head row is not the one the windows compute",
+                                   cos_mean, kCheckCosine);
+            }
+            if (b > 0) {
+                gate_rows += c.rows;
+                gate = gate && cos_mean >= kCheckCosine;
+                for (int k = 0; k < kNPaired; ++k)
+                    gate = gate && (double) c.differ[k] <= kGateDiffer * (double) c.selected[k];
+            }
             char range[48];
             if (b < kNCheckContext - 1) std::snprintf(range, sizeof range, "up to %lld", (long long) kCheckContext[b]);
             else std::snprintf(range, sizeof range, "above %lld", (long long) kCheckContext[b - 1]);
             basalt::log::info("basalt generate", "--dfly2-export check: %lld rows with %s cells of context, the prompt path "
                                  "against verify windows: head rows' cosine mean %.6f, least %.6f, largest relative error %.3g",
-                         (long long) c.rows, range, c.cos_sum / (double) c.rows, c.cos_min, c.row_err_max);
+                         (long long) c.rows, range, cos_mean, c.cos_min, c.row_err_max);
             for (int k = 0; k < kNPaired; ++k) {
                 basalt::log::info("basalt generate", "--dfly2-export check:   layer %d: %.4f%% of the selected cells differ "
                                      "(%lld of %lld); K relative error mean %.3g, largest %.3g; V mean %.3g, largest %.3g",
@@ -352,9 +372,18 @@ struct Export {
             basalt::log::error("basalt generate", "--dfly2-export check: %lld runs of cells as written differ from the "
                                   "cache's gather of them (%lld pieces)",
                           (long long) check_runs_differ, (long long) check_pieces);
-        if (sums[0].rows > 0 && !ok && check_runs_differ == 0)
-            basalt::log::error("basalt generate", "--dfly2-export check: the two paths selected other cells where a row "
-                                  "selects every cell");
+        for (int k = 0; k < kNPaired; ++k)
+            if (sums[0].differ[k] != 0) {
+                basalt::log::error("basalt generate", "--dfly2-export check: the two paths selected other cells where a "
+                                      "row selects every cell");
+                break;
+            }
+        if (gate_rows > 0)
+            basalt::log::info("basalt generate", "--dfly2-export check: past %lld cells the prompt path's rows %s for "
+                                 "window rows (at most %.0f%% of a layer's selected cells differ, head rows' mean cosine at "
+                                 "least %.3f): prefix anchors %s",
+                              (long long) kCheckContext[0], gate ? "stand" : "do not stand", 100.0 * kGateDiffer,
+                              kCheckCosine, gate ? "may be trained on" : "are best left out of training");
         return ok;
     }
 
