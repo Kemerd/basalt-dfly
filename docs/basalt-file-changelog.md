@@ -28,6 +28,9 @@ download or any re-quantizing.
   from before it refuses such a tensor by name ("the dense kernels read ...").
 - **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
+- **`dfly` on a Flash-Next pack, optional, no version change:** a DFly2 drafter trained for the pack, its tensors BF16
+  and its shape in `meta.dfly2` ([model file](model-file.md#flash-next-dfly2-drafter)). The section and the record keep
+  the names Hy4-flash's drafter has; the record's `format` tells the two apart.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
   `hc8` records and no converter revision, provenance that changed whenever a section was replaced.
 
