@@ -248,6 +248,17 @@ void tap(Model& m, SessionState& st, size_t j, const uint16_t* rows16, int n) {
 
 int g_bad = 0;
 
+// A session's rings zeroed: its arena comes as the device left it, and a context shorter than a ring writes only the
+// cells of its own positions, while every cell is hashed.
+void clear_rings(SessionState& st) {
+    const size_t bytes = (size_t) ring_cells(st) * kKv * kHeadDim * 2;
+    for (size_t l = 0; l < ring_layers(st); ++l) {
+        must(ring_k(st, l) && ring_v(st, l), "a session without a ring");
+        ck(cudaMemset(ring_k(st, l), 0, bytes), "clearing a K ring");
+        ck(cudaMemset(ring_v(st, l), 0, bytes), "clearing a V ring");
+    }
+}
+
 // A session's rings, each layer's K then V: one line a ring.
 void print_rings(const char* name, SessionState& st) {
     ck(cudaStreamSynchronize(st.stream), "sync");
@@ -380,6 +391,8 @@ int main() {
     SessionState a, b;
     must(init_state(*m, a, err), err);
     must(init_state(*m, b, err), err);
+    clear_rings(a);
+    clear_rings(b);
 
     // the first session: a context that wraps its rings; the second: a short one
     Fnv fa, fb;
