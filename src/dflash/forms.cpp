@@ -21,10 +21,10 @@ Forms::~Forms() {
     for (void* p : owned) cudaFree(p);
 }
 
-// The drafter as decode passes run it, on the window gemm: q, o, gate, up and down rounded to NVFP4 planes in place and the
-// convolutions repacked to Q8 planes in place; k and v (NVFP4) and the feature projection (Q8 planes) get copies when a
-// prompt path reads their blocks, and are converted in place otherwise.
-bool decode_forms(BlockDrafter& bd, bool keep_blocks, Forms& forms, std::string& err) {
+// The drafter as decode passes run it, on the window gemm: q, o, gate, up and down as NVFP4 or Q8 planes in place and the
+// convolutions repacked to Q8 planes in place; k and v (as the big products) and the feature projection (Q8 planes) get
+// copies when a prompt path reads their blocks, and are converted in place otherwise.
+bool decode_forms(BlockDrafter& bd, bool fp4, bool keep_blocks, Forms& forms, std::string& err) {
     if (!bd.present) {
         err = "no block drafter to lay out";
         return false;
@@ -65,9 +65,10 @@ bool decode_forms(BlockDrafter& bd, bool keep_blocks, Forms& forms, std::string&
         return true;
     };
     // The drafter's big products (gate, up, down, q, o) in NVFP4 planes, rounded from its Q8_0 at load: the drafts' precision
-    // only (every draft is verified exactly, so the output does not change); about half the bytes a pass reads.
+    // only (every draft is verified exactly, so the output does not change); about half the bytes a pass reads.  Without
+    // `fp4` they stay Q8 planes.
     auto to_fp4 = [&](Linear& l) -> bool {
-        if (!q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
+        if (!fp4 || !q8(l) || !kernels::nvfp4p::fits(l.rows, l.cols)) return in_place(l);
         const size_t n = bytes(l);
         tmp_bytes = std::max(tmp_bytes, n);
         void* sc = nullptr;
@@ -91,7 +92,7 @@ bool decode_forms(BlockDrafter& bd, bool keep_blocks, Forms& forms, std::string&
         if (!keep_blocks) {
             // nothing reads the blocks again: k and v as the big products, so q, k and v stay one call
             ok = ok && to_fp4(D.k) && to_fp4(D.v);
-        } else if (kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
+        } else if (fp4 && kernels::nvfp4p::fits(D.k.rows, D.k.cols) && kernels::nvfp4p::fits(D.v.rows, D.v.cols)) {
             // k and v as NVFP4 copies (prompt chunks read their blocks), so q, k and v stay one call
             for (Linear* l : {&D.k, &D.v}) {
                 void* p = nullptr;

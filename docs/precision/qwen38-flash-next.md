@@ -33,7 +33,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
 | Output head | Q8_0 (NVFP4 pack) or Q6_K (IQ3_S pack) | two-stage in verify, see [head](#two-stage-verify-head) |
 | Drafter (MTP) | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
-| Drafter (block) | its Q8_0 projections rounded to NVFP4 planes at load, feature projection and convolutions Q8_0, selector BF16 | bf16 activations on tensor cores; the head's own kernel over every vocabulary row; proposes only |
+| Drafter (block) | its Q8_0 projections as they are (Q8 planes), selector BF16 | bf16 activations on tensor cores; the head's own kernel over every vocabulary row; proposes only |
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
 

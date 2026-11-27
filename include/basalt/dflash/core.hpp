@@ -89,13 +89,15 @@ struct Forms {
     Forms& operator=(const Forms&) = delete;
 };
 
-/// Lays `bd` (the pack's Q8_0 blocks, device memory still to be read) out for the window gemm: q, o, gate, up and down
-/// rounded to NVFP4 planes in place (the drafts' precision only: every draft is verified exactly), the convolutions
-/// repacked to Q8 planes in place.  `keep_blocks`: k, v and the feature projection keep their blocks for a host whose
-/// prompt path reads them, and get copies (k and v NVFP4, the projection Q8 planes); otherwise they are converted in
-/// place too.  Reserves the memory and sets the new types now; the kernels run in make_forms.  False with `err` when the
-/// memory is short or a projection has a form the window gemm does not read.
-bool decode_forms(BlockDrafter& bd, bool keep_blocks, Forms& forms, std::string& err);
+/// Lays `bd` (the pack's Q8_0 blocks, device memory still to be read) out for the window gemm, the convolutions repacked
+/// to Q8 planes in place.  `fp4`: q, o, gate, up and down rounded to NVFP4 planes in place (the drafts' precision only:
+/// every draft is verified exactly), about half the bytes a pass reads, for a host whose rounds are short; otherwise
+/// they keep the pack's values as Q8 planes in place, for a host whose verify windows cost far more than the pass.
+/// `keep_blocks`: k, v and the feature projection keep their blocks for a host whose prompt path reads them, and get
+/// copies (k and v as the big products, the projection Q8 planes); otherwise they are converted in place too.  Reserves
+/// the memory and sets the new types now; the kernels run in make_forms.  False with `err` when the memory is short or a
+/// projection has a form the window gemm does not read.
+bool decode_forms(BlockDrafter& bd, bool fp4, bool keep_blocks, Forms& forms, std::string& err);
 /// Runs the forms' kernels (the weights have landed) on the current device.
 bool make_forms(Forms& forms, std::string& err);
 
