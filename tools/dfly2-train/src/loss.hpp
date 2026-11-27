@@ -63,9 +63,21 @@ LossTerms chunked_loss(Drafter& drafter, const torch::Tensor& z, const torch::Te
                        const SequenceContext& seq, const torch::Tensor& anchors, const LossConfig& cfg, double scale,
                        torch::Tensor* grad_z);
 
-/// The serving chain's accepted drafts, summed over the blocks: each row's Hidden-Correction reads the token the row
-/// before it drafted (the anchor for row 1), and a block scores the rows before its first draft that is not the
-/// teacher's pick. No gradient.
+/// The drafts of blocks as serving makes them, per drafted row k = 0..block-2 of each block.
+struct ServedChain {
+    torch::Tensor corrected;   ///< [N][rows][hidden] in z's type: the Hidden-Correction of z's row k + 1
+    torch::Tensor confidence;  ///< [N][rows]: the confidence head's logit of the corrected row
+    torch::Tensor drafts;      ///< [N][rows] int64: the head's argmax over the corrected row
+};
+
+/// The serving chain of the blocks whose backbone output is `z` ([N][block][hidden]) and whose anchor tokens are
+/// `anchor_tokens` ([N] int64): each row's Hidden-Correction reads the token the row before it drafted (the anchor for
+/// row 1). No gradient.
+ServedChain served_chain(Drafter& drafter, const torch::Tensor& z, const torch::Tensor& embedding, const torch::Tensor& head,
+                         const torch::Tensor& anchor_tokens);
+
+/// The serving chain's accepted drafts, summed over the blocks: a block scores the rows before its first draft that
+/// is not the teacher's pick. No gradient.
 double served_chain_accept(Drafter& drafter, const torch::Tensor& z, const torch::Tensor& embedding, const torch::Tensor& head,
                            const SequenceContext& seq, const torch::Tensor& anchors, int64_t chunk_blocks);
 

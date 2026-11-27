@@ -1,8 +1,9 @@
-// tools/dfly2-train/src/trainer.cpp - init, train and eval (trainer.hpp).
+// tools/dfly2-train/src/trainer.cpp - init, train, eval and fixture (trainer.hpp).
 #include "trainer.hpp"
 
 #include "checkpoint.hpp"
 #include "data.hpp"
+#include "safetensors.hpp"
 
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -453,6 +454,101 @@ bool evaluate_impl(const EvalOptions& o, EvalResult& result, std::string& err) {
     return true;
 }
 
+/// Blocks a fixture takes from one sequence at most, so its blocks come from several documents.
+constexpr int64_t kFixturePerSequence = 4;
+
+/// The safetensors spelling of a tensor's type; empty for a type a fixture does not write.
+std::string st_dtype_of(const torch::Tensor& t) {
+    switch (t.scalar_type()) {
+        case torch::kFloat32: return "F32";
+        case torch::kFloat16: return "F16";
+        case torch::kInt32: return "I32";
+        case torch::kInt64: return "I64";
+        default: return {};
+    }
+}
+
+bool fixture_impl(const FixtureOptions& o, std::string& err) {
+    if (o.checkpoint.empty() || o.out.empty()) { err = "--checkpoint and --out are needed"; return false; }
+    if (o.count < 1) { err = "--count is not positive"; return false; }
+    DrafterFile file;
+    if (!read_drafter_file(o.checkpoint, file, err)) return false;
+    Session s;
+    if (!open_session(o, file, file.weight_dtype == "BF16" ? torch::kBFloat16 : torch::kFloat32, s, err)) return false;
+    const DrafterShape& sh = file.shape;
+    const int64_t rows = sh.block - 1;
+    torch::NoGradGuard no_grad;
+
+    // every tensor of the file on the CPU and contiguous, held until it is written
+    std::vector<std::pair<std::string, torch::Tensor>> out;
+    auto put = [&](const std::string& name, const torch::Tensor& t) { out.emplace_back(name, t.detach().to(torch::kCPU).contiguous()); };
+    const torch::Tensor mask = s.embedding.select(0, sh.mask_token_id).to(torch::kFloat32);
+    SequenceLoader loader(s.shards, o.seed, 0, 0, 0, 1, o.queue_bytes);
+    LoadedSequence seq;
+    int64_t n = 0;
+    while (n < o.count && loader.next(seq, err)) {
+        // a runtime drafts only after a row: an anchor at row 0 has no source row
+        const torch::Tensor pick = torch::nonzero(seq.anchors.gt(0)).flatten().slice(0, 0, std::min(o.count - n, kFixturePerSequence));
+        const int64_t take = pick.size(0);
+        if (take == 0) continue;
+        LoadedSequence part = seq;
+        part.anchors = seq.anchors.index_select(0, pick);
+        part.selection = seq.selection.index_select(0, pick);
+        part.sel_count = seq.sel_count.index_select(0, pick);
+        const SequenceContext ctx = to_device(seq.ctx, s.device);
+        const BlockBatch batch = make_batch(part, 0, take, s.device);
+        const torch::Tensor z = s.drafter->backbone(s.embedding, ctx, batch, o.attention_blocks);
+        const torch::Tensor tokens = ctx.tokens.index_select(0, batch.anchors);
+        const ServedChain chain = served_chain(s.drafter, z, s.embedding, s.head, tokens);
+        for (int64_t b = 0; b < take; ++b, ++n) {
+            const std::string p = "block." + std::to_string(n) + ".";
+            const int64_t a = part.anchors[b].item<int64_t>();
+            // the token each drafted row reads: the anchor, then the drafts before it
+            const torch::Tensor prev = torch::cat({tokens.slice(0, b, b + 1), chain.drafts[b].slice(0, 0, rows - 1)});
+            put(p + "anchor", tokens.slice(0, b, b + 1).to(torch::kInt32));
+            put(p + "pos", torch::full({1}, a + ctx.pos0, torch::kLong));
+            put(p + "h_s", ctx.hidden[a - 1].to(torch::kFloat32));
+            put(p + "emb_anchor", s.embedding[tokens[b]].to(torch::kFloat32));
+            put(p + "emb_mask", mask);
+            put(p + "emb_prev", s.embedding.index_select(0, prev).to(torch::kFloat32));
+            for (int64_t l = 0; l < sh.n_layers; ++l) {
+                // the cells the layer selected, in the order the shard lists them, and their cached values
+                const torch::Tensor ids = part.selection[b][l].slice(0, 0, part.sel_count[b][l].item<int32_t>());
+                const std::string q = p + "layer." + std::to_string(l) + ".";
+                put(q + "sel", ids);
+                put(q + "k_ctx", seq.ctx.k[(size_t) l].index_select(0, ids.to(torch::kLong)));
+                put(q + "v_ctx", seq.ctx.v[(size_t) l].index_select(0, ids.to(torch::kLong)));
+            }
+            put(p + "z", z[b].to(torch::kFloat32));
+            put(p + "h_corrected", chain.corrected[b].to(torch::kFloat32));
+            put(p + "conf_logit", chain.confidence[b].to(torch::kFloat32));
+            put(p + "draft_ids", chain.drafts[b].to(torch::kInt32));
+        }
+    }
+    if (!err.empty()) return false;
+    if (n == 0) { err = "the shards hold no block after a sequence's first row"; return false; }
+
+    std::vector<StWrite> tensors;
+    for (const auto& [name, t] : out) {
+        StWrite w;
+        w.name = name;
+        w.dtype = st_dtype_of(t);
+        if (w.dtype.empty()) { err = "fixture: " + name + " has a type the file does not take"; return false; }
+        w.shape.assign(t.sizes().begin(), t.sizes().end());
+        w.data = t.data_ptr();
+        w.bytes = (uint64_t) t.nbytes();
+        tensors.push_back(std::move(w));
+    }
+    const std::map<std::string, std::string> meta = {
+        {"format", "dfly2-fixture"}, {"blocks", std::to_string(n)}, {"block", std::to_string(sh.block)},
+        {"layers", std::to_string(sh.n_layers)}, {"hidden", std::to_string(sh.hidden)}, {"step", std::to_string(file.step)},
+        {"weight_dtype", file.weight_dtype}, {"pack_name", file.pack_name}};
+    if (!safetensors_write(o.out, meta, tensors, err)) return false;
+    basalt::log::info(kTag, "%s: %lld blocks of %lld rows, the forward of step %lld in %s", o.out.c_str(), (long long) n, (long long) sh.block,
+                      (long long) file.step, file.weight_dtype.c_str());
+    return true;
+}
+
 /// Runs a command's body; a LibTorch or allocation failure becomes the command's error.
 template <class Body> bool guarded(std::string& err, Body&& body) {
     try {
@@ -475,6 +571,10 @@ bool train(const TrainOptions& o, const std::function<bool()>& stop, TrainResult
 
 bool evaluate(const EvalOptions& o, EvalResult& result, std::string& err) {
     return guarded(err, [&] { return evaluate_impl(o, result, err); });
+}
+
+bool write_fixture(const FixtureOptions& o, std::string& err) {
+    return guarded(err, [&] { return fixture_impl(o, err); });
 }
 
 }  // namespace basalt::dfly2

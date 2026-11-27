@@ -161,6 +161,18 @@ options, and `--max-blocks N` to measure a sample.
 The teacher-forced lines correct each row with the corpus token before it, which serving cannot do; the last line is
 the one to compare with served speed. A verify pass yields one more token than it accepts.
 
+### `fixture`
+
+```
+basalt-dfly2-train fixture --model PACK.basalt --shards DIR --checkpoint FILE --out FIXTURE.safetensors --count 32
+```
+
+Writes blocks of the shards (eval's order, at most four from a sequence, none anchored at a sequence's first row) with
+the drafter's forward over them in the checkpoint's own precision. Per block `i`, under `block.<i>.`: the inputs
+(`anchor`, `pos`, `h_s`, `emb_anchor`, `emb_mask`, `emb_prev`, and per draft layer `layer.<l>.sel`, `k_ctx`, `v_ctx`)
+and the outputs (`z`, `h_corrected`, `conf_logit`, `draft_ids`, each drafted row reading the draft before it): what a
+runtime's block pass is checked against.
+
 ## Teacher shards
 
 A shard is a file named `*.dfly2` holding whole sequences, one document each. The layout, its writer and its reader

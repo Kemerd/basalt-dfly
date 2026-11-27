@@ -1,11 +1,12 @@
 // tools/dfly2-train/tests/train_test.cpp - the trainer end to end on the CPU: a tiny target pack, teacher shards written
 // by the real shard writer, then init, eval, train, an interrupted and resumed run against an uninterrupted one, BF16
-// weights, the refusals, and the program itself when its path is given as the first argument.
+// weights, the refusals, a fixture, and the program itself when its path is given as the first argument.
 //
 // The fixture's corpus is a Markov chain the drafter can learn: a token's teacher row is a fixed vector of the token,
 // and the next token is the teacher's likeliest most of the time.
 #include "checkpoint.hpp"
 #include "data.hpp"
+#include "safetensors.hpp"
 #include "trainer.hpp"
 
 #include "test_util.hpp"
@@ -331,8 +332,64 @@ int main(int argc, char** argv) {
         std::printf("  step loss %.4f -> %.4f, eval loss %.4f\n", rc.first_loss, rc.last_loss, bf_eval.loss);
     }
 
+    std::printf("8. a fixture of the untrained drafter\n");
+    {
+        FixtureOptions fo;
+        fo.model = pack_path;
+        fo.shards = shards;
+        fo.device = "cpu";
+        fo.checkpoint = init_file;
+        fo.out = dir.file("fixture.safetensors");
+        fo.count = 6;
+        check(write_fixture(fo, err), "six blocks are written", err);
+        SafetensorsFile f;
+        check(f.open(fo.out, err), "the file reads back", err);
+        // a tensor of the file as `type`, undefined when it is missing or of another size
+        auto tensor = [&](const std::string& name, torch::Dtype type) -> torch::Tensor {
+            const StTensor* t = f.find(name);
+            if (t == nullptr || t->end - t->begin != t->elements() * (uint64_t) torch::elementSize(type)) return {};
+            return torch::from_blob((void*) f.data(*t), t->shape, type).clone();
+        };
+        const torch::Tensor head = tiny.expect.at("output.weight"), embd = tiny.expect.at("token_embd.weight");
+        const torch::Tensor cw = init.tensors.at("confidence_head.proj.weight"), cb = init.tensors.at("confidence_head.proj.bias");
+        const int64_t H = target.hidden, rows = kBlock - 1;
+        bool shapes = f.metadata().count("blocks") == 1 && f.metadata().at("blocks") == "6", identity = true, chain = true;
+        for (int b = 0; b < 6 && shapes; ++b) {
+            const std::string p = "block." + std::to_string(b) + ".";
+            const torch::Tensor z = tensor(p + "z", torch::kFloat32), hc = tensor(p + "h_corrected", torch::kFloat32),
+                                conf = tensor(p + "conf_logit", torch::kFloat32), ids = tensor(p + "draft_ids", torch::kInt32),
+                                prev = tensor(p + "emb_prev", torch::kFloat32), anchor = tensor(p + "anchor", torch::kInt32),
+                                pos = tensor(p + "pos", torch::kInt64), hs = tensor(p + "h_s", torch::kFloat32);
+            shapes = z.defined() && hc.defined() && conf.defined() && ids.defined() && prev.defined() && anchor.defined() && pos.defined() &&
+                     hs.defined() && z.sizes() == torch::IntArrayRef({kBlock, H}) && hc.sizes() == torch::IntArrayRef({rows, H}) &&
+                     prev.sizes() == torch::IntArrayRef({rows, H}) && ids.size(0) == rows && pos.item<int64_t>() >= 1;
+            for (int64_t l = 0; shapes && l < 2; ++l) {
+                const std::string q = p + "layer." + std::to_string(l) + ".";
+                const torch::Tensor sel = tensor(q + "sel", torch::kInt32), k = tensor(q + "k_ctx", torch::kFloat16), v = tensor(q + "v_ctx", torch::kFloat16);
+                // the cells selected for the row before the anchor, each with its cached key and value
+                shapes = sel.defined() && k.defined() && v.defined() && sel.dim() == 1 && sel.size(0) >= 1 && sel.min().item<int32_t>() >= 0 &&
+                         sel.max().item<int64_t>() < pos.item<int64_t>() && k.sizes() == torch::IntArrayRef({sel.size(0), target.n_head_kv, target.head_dim}) &&
+                         v.sizes() == k.sizes();
+            }
+            if (!shapes) break;
+            // the untrained correction is the identity, so each drafted row is z's next row
+            identity = identity && hc.equal(z.slice(0, 1, kBlock));
+            // each draft is the head's pick over its corrected row, its confidence logit the head's with the bias, and
+            // the row after it reads its embedding
+            const torch::Tensor want_conf = torch::matmul(hc, cw.t()).squeeze(-1) + cb;
+            chain = chain && torch::matmul(hc, head.t()).argmax(-1).to(torch::kInt32).equal(ids) && (want_conf - conf).abs().max().item<double>() < 1e-5 &&
+                    prev[0].equal(embd[anchor[0].item<int64_t>()]) && prev.slice(0, 1, rows).equal(embd.index_select(0, ids.slice(0, 0, rows - 1).to(torch::kLong)));
+        }
+        check(shapes, "every block holds its inputs and outputs in their shapes, after the sequence's first row");
+        check(identity, "the untrained correction leaves z's drafted rows as they are");
+        check(chain, "each draft is the head's argmax, its confidence the head's logit, and the next row reads it");
+        FixtureOptions bad = fo;
+        bad.count = 0;
+        refused(!write_fixture(bad, err), "a fixture of no blocks", err);
+    }
+
     if (argc > 1) {
-        std::printf("8. the program\n");
+        std::printf("9. the program\n");
         const std::string exe = argv[1], out = dir.file("program.txt"), cli_init = dir.file("cli-init.safetensors"), run_d = dir.file("run-d");
         check(run_program(exe, "--help", out) == 0 && slurp(out).find("basalt-dfly2-train init") != std::string::npos, "--help prints the commands");
         check(run_program(exe, "init --model \"" + pack_path + "\" --out \"" + cli_init + "\" --draft-layers 2 --block 4 --mask-id 47", out) == 0, "init", slurp(out));
@@ -346,8 +403,12 @@ int main(int argc, char** argv) {
         check(run_program(exe, "eval" + common + " --checkpoint \"" + drafter_path(run_d, 120) + "\"", out) == 0 && slurp(out).find("serving chain, greedy") != std::string::npos, "eval prints the accepted lengths", slurp(out));
         check(run_program(exe, "train --no-such-flag", out) == 2 && run_program(exe, "train --steps many", out) == 2 && run_program(exe, "bake", out) == 2, "an unknown option, a bad number and an unknown command exit with 2");
         check(run_program(exe, "eval" + common + " --checkpoint \"" + dir.file("missing.safetensors") + "\"", out) == 1, "a missing drafter file exits with 1");
+        const std::string cli_fixture = dir.file("cli-fixture.safetensors");
+        check(run_program(exe, "fixture --model \"" + pack_path + "\" --shards \"" + shards + "\" --device cpu --checkpoint \"" + cli_init + "\" --out \"" + cli_fixture +
+                                   "\" --count 3", out) == 0 && std::filesystem::exists(std::filesystem::path(std::u8string(cli_fixture.begin(), cli_fixture.end()))),
+              "fixture writes its file", slurp(out));
     } else {
-        std::printf("8. the program: skipped, no path to it was given\n");
+        std::printf("9. the program: skipped, no path to it was given\n");
     }
     return dfly2_test::finish("train_test");
     });
