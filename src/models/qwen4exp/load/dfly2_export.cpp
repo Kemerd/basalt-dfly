@@ -2,13 +2,16 @@
 // document of a token file, written as the shards a DFly2 drafter is trained on (basalt/artifact/dfly2_shard.hpp).
 // A document's first rows are read by the batched prompt path and its last ones through verify windows, as a served
 // request's are. The compute thread fills page-locked pieces; the shard queue's thread repacks and writes them.
+#include "basalt/core/diag.hpp"
 #include "basalt/dfly2/anchors.hpp"
 #include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 #include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 #include "dfly2_shard_queue.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace basalt::models::qwen4exp::generate {
@@ -24,6 +27,10 @@ constexpr int kPieces = 2;                                 // piece buffers in f
 constexpr int kPaired[] = {31, 35, 39, 43, 47};            // the target layers a drafter layer is paired with
 constexpr int kNPaired = (int) (sizeof kPaired / sizeof kPaired[0]);
 constexpr size_t kReadBytes = 1u << 20;                    // the documents file is read this much at a time
+// --exp dfly2_export_check=N: every Nth document's window rows are also read by the prompt path, and the two compared
+constexpr int64_t kCheckContext[] = {2051, 8192, 32768};   // rows are summed by cells of context: up to each, and above
+constexpr int kNCheckContext = (int) (sizeof kCheckContext / sizeof kCheckContext[0]) + 1;
+constexpr int64_t kCheckGather = 2048;                     // cells the check gathers from the cache at a time
 
 /// The index of `layer` in the paired layers, or -1.
 int paired_index(int64_t layer) {
@@ -50,6 +57,37 @@ void* take_pinned(size_t bytes) {
     return p;
 }
 void give_pinned(void* p) { cudaFreeHost(p); }
+
+/// What one path computed for a document's last rows, on the host.
+struct TailRows {
+    int64_t row0 = 0, rows = 0;
+    std::vector<uint16_t> hidden;                    ///< [rows][hidden]
+    std::vector<uint16_t> k[kNPaired], v[kNPaired];  ///< per paired layer [rows][n_head_kv][head_dim]
+    std::vector<int32_t> sel[kNPaired];              ///< per paired layer [rows][cap]: every row's selection
+};
+
+/// The check's sums over the rows of one range of context lengths: the prompt path's rows against the windows'.
+struct CheckSums {
+    int64_t rows = 0;
+    double cos_sum = 0, cos_min = 1, row_err_max = 0;           ///< the head's rows
+    int64_t selected[kNPaired] = {}, differ[kNPaired] = {};     ///< selected cells, and those only one path selected
+    double k_err_sum[kNPaired] = {}, k_err_max[kNPaired] = {};  ///< a cell's relative error
+    double v_err_sum[kNPaired] = {}, v_err_max[kNPaired] = {};
+};
+
+/// |a - b| / |b| over `n` fp16 values, and their cosine when `cosine` is given.
+double f16_error(const uint16_t* a, const uint16_t* b, size_t n, double* cosine = nullptr) {
+    double dd = 0, aa = 0, bb = 0, ab = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double x = basalt::kernels::f32_from_f16(a[i]), y = basalt::kernels::f32_from_f16(b[i]);
+        dd += (x - y) * (x - y);
+        aa += x * x;
+        bb += y * y;
+        ab += x * y;
+    }
+    if (cosine != nullptr) *cosine = aa > 0 && bb > 0 ? ab / std::sqrt(aa * bb) : dd > 0 ? 0.0 : 1.0;
+    return bb > 0 ? std::sqrt(dd / bb) : dd > 0 ? 1.0 : 0.0;
+}
 
 /// The documents file, a line at a time: a document may be longer than any fixed buffer.
 class DocsFile {
@@ -140,8 +178,187 @@ struct Export {
     int64_t rows_prompt = 0, rows_window = 0;
     double ms_prompt = 0, ms_window = 0;
 
+    // the check: a document's window rows by both paths, and every piece's cells against the cache's own gather
+    basalt::kernels::QsaShapes shapes;
+    bool checking = false;               ///< the document being read is a checked one
+    TailRows* keep = nullptr;            ///< where the rows being read are kept, when they are
+    TailRows by_prompt, by_window;
+    CheckSums sums[kNCheckContext];
+    int64_t check_documents = 0, check_pieces = 0, check_runs_differ = 0;
+    std::vector<uint16_t> cells_k, cells_v;      ///< a piece's cells of one layer, as the writer repacks them
+    std::vector<uint16_t> gather_k, gather_v;    ///< one gathered run
+    std::vector<int32_t> gather_ids;
+    int32_t* d_gather_ids = nullptr;
+    uint16_t *d_gather_k = nullptr, *d_gather_v = nullptr;
+
     ~Export() {
         if (d_rows16 != nullptr) cudaFree(d_rows16);
+        if (d_gather_ids != nullptr) cudaFree(d_gather_ids);
+        if (d_gather_k != nullptr) cudaFree(d_gather_k);
+        if (d_gather_v != nullptr) cudaFree(d_gather_v);
+    }
+
+    /// The check's buffers: a piece's cells on the host, and one gathered run on the device.
+    bool check_init(std::string& e) {
+        const size_t cell = (size_t) (g.n_head_kv * g.head_dim), run = (size_t) kCheckGather * cell;
+        cells_k.resize((size_t) limits.rows * cell);
+        cells_v.resize((size_t) limits.rows * cell);
+        gather_k.resize(run);
+        gather_v.resize(run);
+        gather_ids.resize((size_t) kCheckGather);
+        if (cudaMalloc((void**) &d_gather_ids, (size_t) kCheckGather * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc((void**) &d_gather_k, run * sizeof(uint16_t)) != cudaSuccess ||
+            cudaMalloc((void**) &d_gather_v, run * sizeof(uint16_t)) != cudaSuccess) {
+            e = cuda_text("the check's gather buffers");
+            return false;
+        }
+        return true;
+    }
+
+    /// Keeps rows [row0, row0 + rows) of the document read next in `to`.
+    void keep_rows(TailRows& to, int64_t row0, int64_t rows) {
+        const size_t cell = (size_t) (g.n_head_kv * g.head_dim);
+        to.row0 = row0;
+        to.rows = rows;
+        to.hidden.resize((size_t) rows * (size_t) N);
+        for (int k = 0; k < kNPaired; ++k) {
+            to.k[k].resize((size_t) rows * cell);
+            to.v[k].resize((size_t) rows * cell);
+            to.sel[k].resize((size_t) rows * (size_t) cap);
+        }
+        keep = &to;
+    }
+
+    /// Copies the kept rows' whole selections of paired layer `k` among the `rows` rows from `row0` that `ids` holds.
+    bool keep_selections(int k, const int32_t* ids, int64_t row0, int64_t rows, std::string& e) {
+        const int64_t lo = std::max(row0, keep->row0), hi = std::min(row0 + rows, keep->row0 + keep->rows);
+        if (lo >= hi) return true;
+        if (cudaMemcpyAsync(keep->sel[k].data() + (size_t) (lo - keep->row0) * (size_t) cap, ids + (lo - row0) * cap,
+                            (size_t) (hi - lo) * (size_t) cap * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+            e = cuda_text("the check's copy of a layer's selections");
+            return false;
+        }
+        return true;
+    }
+
+    /// A filled piece of a checked document: its cells as the writer repacks them against the cache's own gather of
+    /// the same cells, and its kept rows.
+    bool check_piece(const ShardQueue::Piece& p, std::string& e) {
+        const size_t cell = (size_t) (g.n_head_kv * g.head_dim);
+        const int64_t lo = keep != nullptr ? std::max(p.row0, keep->row0) : 0;
+        const int64_t hi = keep != nullptr ? std::min(p.row0 + p.rows, keep->row0 + keep->rows) : 0;
+        for (int k = 0; k < kNPaired; ++k) {
+            const basalt::core::QsaState& st = ss.qsa_states[kPaired[k] / g.qsa_interval];
+            ShardQueue::piece_cells(p, (uint32_t) k, (uint64_t) page, (uint64_t) g.n_head_kv, (uint64_t) g.head_dim,
+                                    cells_k.data(), cells_v.data());
+            for (int64_t r = 0; r < p.rows; r += kCheckGather) {
+                const int64_t run = std::min(kCheckGather, p.rows - r);
+                const size_t bytes = (size_t) run * cell * sizeof(uint16_t);
+                for (int64_t i = 0; i < run; ++i) gather_ids[(size_t) i] = (int32_t) (p.row0 + r + i);
+                if (cudaMemcpyAsync(d_gather_ids, gather_ids.data(), (size_t) run * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                    cs) != cudaSuccess) {
+                    e = cuda_text("the check's cell ids");
+                    return false;
+                }
+                basalt::kernels::kv_gather(st.k_pool, st.v_pool, st.page_table, d_gather_ids, run, shapes, d_gather_k,
+                                           d_gather_v, cs);
+                if (cudaMemcpyAsync(gather_k.data(), d_gather_k, bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                    cudaMemcpyAsync(gather_v.data(), d_gather_v, bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                    cudaStreamSynchronize(cs) != cudaSuccess) {
+                    e = cuda_text("the check's gather of a layer's cells");
+                    return false;
+                }
+                if (std::memcmp(gather_k.data(), cells_k.data() + (size_t) r * cell, bytes) != 0 ||
+                    std::memcmp(gather_v.data(), cells_v.data() + (size_t) r * cell, bytes) != 0)
+                    ++check_runs_differ;
+            }
+            if (lo < hi) {
+                const size_t at = (size_t) (lo - keep->row0) * cell, from = (size_t) (lo - p.row0) * cell;
+                std::memcpy(keep->k[k].data() + at, cells_k.data() + from, (size_t) (hi - lo) * cell * sizeof(uint16_t));
+                std::memcpy(keep->v[k].data() + at, cells_v.data() + from, (size_t) (hi - lo) * cell * sizeof(uint16_t));
+            }
+        }
+        if (lo < hi)
+            std::memcpy(keep->hidden.data() + (size_t) (lo - keep->row0) * (size_t) N,
+                        p.hidden + (size_t) (lo - p.row0) * (size_t) N, (size_t) (hi - lo) * (size_t) N * sizeof(uint16_t));
+        ++check_pieces;
+        return true;
+    }
+
+    /// Adds the prompt path's kept rows against the windows' to the sums of each row's context length.
+    void compare() {
+        const size_t cell = (size_t) (g.n_head_kv * g.head_dim);
+        for (int64_t r = 0; r < by_window.rows; ++r) {
+            const int64_t n_kv = by_window.row0 + r + 1;   // the cells row r reads among
+            int b = 0;
+            while (b < kNCheckContext - 1 && n_kv > kCheckContext[b]) ++b;
+            CheckSums& c = sums[b];
+            ++c.rows;
+            double cosine = 1;
+            const double row_err = f16_error(by_prompt.hidden.data() + (size_t) r * (size_t) N,
+                                             by_window.hidden.data() + (size_t) r * (size_t) N, (size_t) N, &cosine);
+            c.cos_sum += cosine;
+            c.cos_min = std::min(c.cos_min, cosine);
+            c.row_err_max = std::max(c.row_err_max, row_err);
+            const int64_t width = std::min(n_kv, cap);
+            for (int k = 0; k < kNPaired; ++k) {
+                // both lists ascend: a cell of the prompt path's that the window's lacks
+                const int32_t *a = by_prompt.sel[k].data() + (size_t) r * (size_t) cap,
+                              *w = by_window.sel[k].data() + (size_t) r * (size_t) cap;
+                int64_t same = 0;
+                for (int64_t i = 0, j = 0; i < width && j < width;) {
+                    if (a[i] == w[j]) ++same, ++i, ++j;
+                    else if (a[i] < w[j]) ++i;
+                    else ++j;
+                }
+                c.selected[k] += width;
+                c.differ[k] += width - same;
+                const size_t at = (size_t) r * cell;
+                const double k_err = f16_error(by_prompt.k[k].data() + at, by_window.k[k].data() + at, cell);
+                const double v_err = f16_error(by_prompt.v[k].data() + at, by_window.v[k].data() + at, cell);
+                c.k_err_sum[k] += k_err;
+                c.k_err_max[k] = std::max(c.k_err_max[k], k_err);
+                c.v_err_sum[k] += v_err;
+                c.v_err_max[k] = std::max(c.v_err_max[k], v_err);
+            }
+        }
+        ++check_documents;
+    }
+
+    /// Logs the check's sums. False when the two paths selected other cells where every cell is selected, or a
+    /// piece's cells were not the cache's.
+    bool check_report() const {
+        bool ok = check_runs_differ == 0;
+        for (int b = 0; b < kNCheckContext; ++b) {
+            const CheckSums& c = sums[b];
+            if (c.rows == 0) continue;
+            char range[48];
+            if (b < kNCheckContext - 1) std::snprintf(range, sizeof range, "up to %lld", (long long) kCheckContext[b]);
+            else std::snprintf(range, sizeof range, "above %lld", (long long) kCheckContext[b - 1]);
+            basalt::log::info("basalt generate", "--dfly2-export check: %lld rows with %s cells of context, the prompt path "
+                                 "against verify windows: head rows' cosine mean %.6f, least %.6f, largest relative error %.3g",
+                         (long long) c.rows, range, c.cos_sum / (double) c.rows, c.cos_min, c.row_err_max);
+            for (int k = 0; k < kNPaired; ++k) {
+                basalt::log::info("basalt generate", "--dfly2-export check:   layer %d: %.4f%% of the selected cells differ "
+                                     "(%lld of %lld); K relative error mean %.3g, largest %.3g; V mean %.3g, largest %.3g",
+                             kPaired[k], c.selected[k] > 0 ? 100.0 * (double) c.differ[k] / (double) c.selected[k] : 0.0,
+                             (long long) c.differ[k], (long long) c.selected[k], c.k_err_sum[k] / (double) c.rows,
+                             c.k_err_max[k], c.v_err_sum[k] / (double) c.rows, c.v_err_max[k]);
+                if (b == 0 && c.differ[k] != 0) ok = false;
+            }
+        }
+        if (check_runs_differ == 0)
+            basalt::log::info("basalt generate", "--dfly2-export check: %lld documents; the cells of %lld pieces as written "
+                                 "equal the cache's gather of them",
+                         (long long) check_documents, (long long) check_pieces);
+        else
+            basalt::log::error("basalt generate", "--dfly2-export check: %lld runs of cells as written differ from the "
+                                  "cache's gather of them (%lld pieces)",
+                          (long long) check_runs_differ, (long long) check_pieces);
+        if (sums[0].rows > 0 && !ok && check_runs_differ == 0)
+            basalt::log::error("basalt generate", "--dfly2-export check: the two paths selected other cells where a row "
+                                  "selects every cell");
+        return ok;
     }
 
     /// Takes a free piece for rows [row0, row0 + rows) and lists the anchors whose row before lies in them.
@@ -239,6 +456,10 @@ struct Export {
         ShardQueue::Piece* p = cur;
         cur = nullptr;
         if (digesting) digest_piece(*p);
+        if (checking && !check_piece(*p, e)) {
+            queue.give_back(p);
+            return false;
+        }
         if (!writing) {
             queue.give_back(p);
             return true;
@@ -260,6 +481,7 @@ struct Export {
             return false;
         }
         cur_layers |= 1u << k;
+        if (keep != nullptr && !keep_selections(k, ids, p0, T, e)) return false;
         return copy_selections(k, ids, p0, T, e);
     }
 
@@ -307,7 +529,9 @@ struct Export {
                     return false;
                 }
                 for (int k = 0; k < kNPaired; ++k)
-                    if (!copy_selections(k, ver.selection(k), w, T, e)) return false;
+                    if (!copy_selections(k, ver.selection(k), w, T, e) ||
+                        (keep != nullptr && !keep_selections(k, ver.selection(k), w, T, e)))
+                        return false;
                 if (cudaStreamSynchronize(cs) != cudaSuccess) {
                     e = cuda_text("the export's copies of a window");
                     return false;
@@ -354,10 +578,11 @@ struct Export {
         return true;
     }
 
-    /// Reads `doc` (sequence `line` of the export) from an empty sequence; `write` hands its pieces to the writer.
-    bool read_document(const std::vector<int64_t>& doc, uint64_t line, bool write, std::string& e) {
+    /// Reads `doc` (sequence `line` of the export) from an empty sequence, its last `window_rows` rows through verify
+    /// windows; `write` hands its pieces to the writer.
+    bool read_document(const std::vector<int64_t>& doc, uint64_t line, int64_t window_rows, bool write, std::string& e) {
         n = (int64_t) doc.size();
-        m = basalt::dfly2::window_from(n, windows ? o.dfly2_window_rows : 0);
+        m = basalt::dfly2::window_from(n, window_rows);
         // prefix anchors follow a prompt-path row, window anchors a window row; every block is whole
         anchors = basalt::dfly2::sample_anchors(kSeed, line, 1, std::min(m, n - kBlock), kPrefixEvery);
         const std::vector<int32_t> tail = basalt::dfly2::sample_anchors(kSeed, line, m + 1, n - kBlock, kWindowEvery);
@@ -445,6 +670,7 @@ int dfly2_export(Context& context) {
 
     Export x{context, o, g, ss, (cudaStream_t) *context.main_cs};
     x.windows = windows;
+    x.shapes = shapes;
     x.N = g.n_embd;
     x.page = shapes.page_size;
     x.cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, shapes);
@@ -529,6 +755,9 @@ int dfly2_export(Context& context) {
     x.limits.shard_tokens = kShardTokens;
     if (!x.queue.open(o.dfly2_export, header, x.limits, ShardQueue::Memory{&take_pinned, &give_pinned}, err)) return failed(err);
     const uint64_t skip = x.queue.sequences_done();
+    // every Nth document's window rows are read by both paths and compared
+    const int64_t check_every = windows ? (int64_t) basalt::core::exp_flag("dfly2_export_check") : 0;
+    if (check_every > 0 && !x.check_init(err)) return failed(err);
     basalt::log::info("basalt generate", "--dfly2-export: %s, prompt chunks of up to %lld tokens, the last %lld rows of a "
                          "document through verify windows%s",
                  o.dfly2_export.c_str(), (long long) x.chunk_cap, (long long) (windows ? o.dfly2_window_rows : 0),
@@ -553,10 +782,28 @@ int dfly2_export(Context& context) {
             doc.resize((size_t) o.max_context);
             ++truncated;
         }
+        const int64_t window_rows = windows ? o.dfly2_window_rows : 0;
+        const int64_t from = basalt::dfly2::window_from((int64_t) doc.size(), window_rows);
+        x.checking = check_every > 0 && documents % check_every == 0 && from < (int64_t) doc.size();
+        if (x.checking) {
+            // first the whole document by the prompt path, its window rows kept and nothing written or counted
+            const int64_t rows_before = x.rows_prompt;
+            const double ms_before = x.ms_prompt;
+            x.digesting = false;
+            x.keep_rows(x.by_prompt, from, (int64_t) doc.size() - from);
+            if (!x.read_document(doc, at, 0, false, err))
+                return failed("line " + std::to_string(at + 1) + ", read by the prompt path alone: " + err);
+            x.rows_prompt = rows_before;
+            x.ms_prompt = ms_before;
+            x.keep_rows(x.by_window, from, (int64_t) doc.size() - from);
+        }
         // the run's first document is digested: it is read once more at the end
         x.digesting = documents == 0;
         x.digest = 0;
-        if (!x.read_document(doc, at, true, err)) return failed("line " + std::to_string(at + 1) + ": " + err);
+        if (!x.read_document(doc, at, window_rows, true, err)) return failed("line " + std::to_string(at + 1) + ": " + err);
+        if (x.checking) x.compare();
+        x.checking = false;
+        x.keep = nullptr;
         if (documents == 0) {
             first_doc = doc;
             first_line = at;
@@ -581,7 +828,8 @@ int dfly2_export(Context& context) {
     if (documents > 0) {
         x.digesting = true;
         x.digest = 0;
-        if (!x.read_document(first_doc, first_line, false, err)) return failed("reading the first document again: " + err);
+        if (!x.read_document(first_doc, first_line, windows ? o.dfly2_window_rows : 0, false, err))
+            return failed("reading the first document again: " + err);
         if (x.digest == first_digest)
             basalt::log::info("basalt generate", "--dfly2-export: the first document read again after the last gave the "
                                  "same rows, cells and selections");
@@ -592,13 +840,14 @@ int dfly2_export(Context& context) {
                          (unsigned long long) (first_line + 1));
     }
     if (!x.queue.close(err)) return failed(err);
+    const bool checked = check_every <= 0 || x.check_report();
     basalt::log::info("basalt generate", "--dfly2-export: %lld documents, %lld tokens (%lld documents cut to %lld tokens); "
                          "%lld prompt-path rows at %.0f rows/s, %lld window rows at %.1f rows/s; the lent cache slots "
                          "refilled %lld times in %.0f ms",
                  (long long) documents, (long long) tokens, (long long) truncated, (long long) o.max_context,
                  (long long) rows_prompt, rate(rows_prompt, ms_prompt), (long long) rows_window, rate(rows_window, ms_window),
                  (long long) x.refills, x.ms_refill);
-    return 0;
+    return checked ? 0 : 1;
 }
 
 }  // namespace basalt::models::qwen4exp::generate

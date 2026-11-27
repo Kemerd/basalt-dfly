@@ -72,6 +72,10 @@ public:
 
     /// A shard's file name: shard-NNNNN and the format's extension.
     static std::string shard_name(uint64_t index);
+    /// Paired layer `l`'s cells of the piece's own rows as a shard holds them, a cell's heads together
+    /// ([rows][heads][dim]), from the piece's cache pages of `page` cells.
+    static void piece_cells(const Piece& p, uint32_t l, uint64_t page, uint64_t heads, uint64_t dim, uint16_t* k_cells,
+                            uint16_t* v_cells);
 
 private:
     struct Item {

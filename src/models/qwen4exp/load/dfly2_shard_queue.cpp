@@ -296,19 +296,23 @@ bool ShardQueue::write(Item& item, std::string& err) {
     return shard_tokens_ < limits_.shard_tokens || finish_shard(err);
 }
 
-bool ShardQueue::write_piece(const Piece& p, std::string& err) {
-    const uint64_t page = (uint64_t) limits_.page, heads = geometry_.n_head_kv, dim = geometry_.head_dim;
-    if (!writer_.put_hidden((uint64_t) p.row0, (uint64_t) p.rows, p.hidden, err)) return false;
+void ShardQueue::piece_cells(const Piece& p, uint32_t l, uint64_t page, uint64_t heads, uint64_t dim, uint16_t* k_cells,
+                             uint16_t* v_cells) {
     // the cache keeps a page head-major; the shard keeps a cell's heads together, and only the piece's own cells
-    for (uint32_t l = 0; l < geometry_.n_layers; ++l) {
-        for (uint64_t r = 0; r < (uint64_t) p.rows; ++r) {
-            const uint64_t cell = (uint64_t) p.row0 + r, in_page = cell % page, pg = cell / page - (uint64_t) p.page0;
-            for (uint64_t h = 0; h < heads; ++h) {
-                const size_t src = (size_t) (((pg * heads + h) * page + in_page) * dim), dst = (size_t) ((r * heads + h) * dim);
-                std::memcpy(k_cells_.data() + dst, p.k[l] + src, (size_t) dim * sizeof(uint16_t));
-                std::memcpy(v_cells_.data() + dst, p.v[l] + src, (size_t) dim * sizeof(uint16_t));
-            }
+    for (uint64_t r = 0; r < (uint64_t) p.rows; ++r) {
+        const uint64_t cell = (uint64_t) p.row0 + r, in_page = cell % page, pg = cell / page - (uint64_t) p.page0;
+        for (uint64_t h = 0; h < heads; ++h) {
+            const size_t src = (size_t) (((pg * heads + h) * page + in_page) * dim), dst = (size_t) ((r * heads + h) * dim);
+            std::memcpy(k_cells + dst, p.k[l] + src, (size_t) dim * sizeof(uint16_t));
+            std::memcpy(v_cells + dst, p.v[l] + src, (size_t) dim * sizeof(uint16_t));
         }
+    }
+}
+
+bool ShardQueue::write_piece(const Piece& p, std::string& err) {
+    if (!writer_.put_hidden((uint64_t) p.row0, (uint64_t) p.rows, p.hidden, err)) return false;
+    for (uint32_t l = 0; l < geometry_.n_layers; ++l) {
+        piece_cells(p, l, (uint64_t) limits_.page, geometry_.n_head_kv, geometry_.head_dim, k_cells_.data(), v_cells_.data());
         if (!writer_.put_kv(l, (uint64_t) p.row0, (uint64_t) p.rows, k_cells_.data(), v_cells_.data(), err)) return false;
     }
     for (int i = 0; i < p.n_sel; ++i) {
