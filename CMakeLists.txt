@@ -217,6 +217,13 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME dfly2_record_test COMMAND dfly2_record_test)
 endif()
 endif()
+if(BUILD_TESTING)
+  # a teacher export's anchors (include/basalt/dfly2/anchors.hpp): a header, so it builds whatever models are built
+  add_executable(dfly2_anchors_test tests/dfly2/anchors_test.cpp)
+  target_include_directories(dfly2_anchors_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(dfly2_anchors_test PRIVATE warnings)
+  basalt_cpu_test(NAME dfly2_anchors_test COMMAND dfly2_anchors_test)
+endif()
 
 if(BASALT_MODEL_HY4FLASH)
 add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/models/hy4flash/kernels/ops.cu
