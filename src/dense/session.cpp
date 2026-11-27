@@ -139,8 +139,8 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         st.dacc = st.arena.take<float>((size_t) kWindow * g.n_embd);
         st.dids = st.arena.take<int32_t>(kWindow);
         st.dconf = st.arena.take<float>(kWindow);
-        st.dq_ids = st.arena.take<int32_t>((size_t) kWindow * kDraftQ);
-        st.dq_p = st.arena.take<float>((size_t) kWindow * kDraftQ);
+        st.dq_ids = st.arena.take<int32_t>((size_t) kWindow * dflash::kDraftQ);
+        st.dq_p = st.arena.take<float>((size_t) kWindow * dflash::kDraftQ);
         st.win_tok = st.arena.take<int32_t>(kWindow);
         if (!st.win_tok) {
             err = m.o.arch + ": the block drafter's buffers do not fit the session's arena";

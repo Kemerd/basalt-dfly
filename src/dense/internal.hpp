@@ -21,10 +21,12 @@ class CudaEncoder;
 
 namespace basalt::dense {
 
+using dflash::BlockDrafter;
+using model::Linear;
+
 constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 32;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
-constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk

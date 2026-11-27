@@ -10,10 +10,12 @@
 #pragma once
 
 #include "basalt/core/model_file.hpp"
+#include "basalt/dflash/weights.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/model/linear.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -24,60 +26,28 @@ namespace basalt::dense {
 
 enum class Mixer { Gdn, Attention };
 
-/// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40, F8_E4M3 44: one E4M3 code
-/// per value, rows of `cols` bytes) on the device; `scale` an NVFP4 or F8 matrix's fp32 tensor scale (device), null for 1.
-/// An NVFP4 product leaves the scale to the step after it; an F8 product applies it itself.  The head alone may be F8
-/// with a scale per row (`row_scales`, fp32 [rows] on the device, `scale` then null): it runs on the window gemm only.
-struct Linear {
-    int type = -1;
-    const void* w = nullptr;
-    int64_t rows = 0, cols = 0;
-    const float* scale = nullptr;
-    const float* row_scales = nullptr;
-};
-
 struct Layer {
     Mixer kind = Mixer::Gdn;
     const float* attn_norm = nullptr;   ///< the mixer's input norm, offset folded (1 + w)
     const float* ffn_norm = nullptr;    ///< the FFN's
     // gated delta-net: value heads in the order where value head h meets key head h % k_heads
-    Linear qkv, z, out;
+    model::Linear qkv, z, out;
     const uint16_t* w_ab = nullptr;     ///< bf16 [2 v_heads][n_embd]: the alpha rows, then the beta rows
     const float *dt = nullptr, *ssm_a = nullptr, *conv = nullptr, *gamma = nullptr;
     // attention: q gives [query | gate] per head
-    Linear q, k, v, o;
+    model::Linear q, k, v, o;
     const float *q_norm = nullptr, *k_norm = nullptr;
     // FFN
-    Linear gate, up, down;
+    model::Linear gate, up, down;
 };
 
 /// The drafter layer a pack may carry (multi-token prediction): fc(concat(norm_e(embed(next)), norm_h(hidden))),
 /// one attention layer with its FFN, a final norm, the main head.
 struct Mtp {
     bool present = false;
-    Linear fc;
+    model::Linear fc;
     const float *norm_e = nullptr, *norm_h = nullptr, *norm = nullptr;
     Layer layer;
-};
-
-/// A block drafter (DFlash 2): the target's rows at a few layers, projected and normed, are the context (K/V in a
-/// sliding window) of a few non-causal attention layers that read a block [anchor, mask, ...] and give every slot's
-/// candidates at once; a selector walks one path through them.  The head is the target's.
-struct BlockDrafter {
-    struct Layer {
-        const float *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
-        const float *base_a = nullptr, *base_f = nullptr;   // the two convolutions' base kernels [2][2][n_embd]
-        Linear q, k, v, o, gate, up, down, conv_a, conv_f;
-    };
-    bool present = false;
-    int block = 0, mask_id = 0, conv_group = 0, rank = 0, top_k = 0, window = 0;
-    int n_head = 0, n_kv = 0, head_dim = 0;
-    float theta = 0.0f, eps = 1e-6f;
-    std::vector<int> target_layers;          ///< the target layers whose outputs it reads, in order
-    std::vector<Linear> fc;                  ///< per target layer, its block of the feature projection
-    const float *hidden_norm = nullptr, *norm = nullptr;
-    std::vector<Layer> layers;
-    const uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;   // bf16 [rank][n_embd], [vocab][rank] x 2
 };
 
 struct Geometry {
@@ -101,9 +71,9 @@ struct Weights {
     std::vector<Layer> layers;
     const uint16_t* embd = nullptr;     ///< bf16 [n_vocab][n_embd], device-visible (may be mapped host memory)
     const float* out_norm = nullptr;
-    Linear head;
+    model::Linear head;
     Mtp mtp;
-    BlockDrafter dflash;
+    dflash::BlockDrafter dflash;
 };
 
 /// Which drafter a model's sessions run.
@@ -164,10 +134,10 @@ bool warm_prompt_split(Model& m, std::string& err);
 /// Called with the main card current, before any session is made.
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
 /// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
-uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
+uint64_t stage_main_bytes(const Geometry& g, const dflash::BlockDrafter& drafter);
 /// Main-card bytes a prompt split keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
 /// `max_context` cells is too short for one.
-uint64_t prompt_split_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context);
+uint64_t prompt_split_main_bytes(const Geometry& g, const dflash::BlockDrafter& drafter, int64_t max_context);
 /// The cells of each attention layer a session keeps on the card (kv_resident's rule).
 int64_t resident_cells(int64_t max_context, int64_t kv_resident);
 /// Device bytes one session takes (its KV cells on the card, recurrent states and window rows) on a card that holds layers
@@ -181,12 +151,12 @@ uint64_t session_host_bytes(const Geometry& g, int64_t max_context, int kv, int6
 /// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).
 uint64_t shared_bytes(const Geometry& g, int64_t max_context, int kv = 0, int64_t kv_resident = 0);
 /// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
-uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
+uint64_t block_session_bytes(const Geometry& g, const dflash::BlockDrafter& bd);
 /// What a two-card layer split divides for `o` (its sessions, context and drafter): per layer its weights (`layer_weights`)
 /// and every slot's cells and state there; per card what it holds whatever its layers: the main card `main_weights` (head,
 /// norms, drafter), the shared scratch, each slot's rest and the hand-off buffers, the second card its scratch and landing
 /// residuals. The rooms are the caller's.
-model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+model::SplitSpec split_spec(const Geometry& g, const Options& o, const dflash::BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
                             uint64_t main_weights);
 
 }  // namespace basalt::dense
