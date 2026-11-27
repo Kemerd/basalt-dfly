@@ -61,7 +61,7 @@ and prose least.
 
 ## Teacher export
 
-`basalt generate --model PACK.basalt --dfly2-export DIR --dfly2-docs FILE --max-context C` generates nothing: it writes what the
+`bin/basalt --model PACK.basalt --dfly2-export DIR --dfly2-docs FILE --max-context C` generates nothing: it writes what the
 model computes for each document of `FILE` into `DIR`, as the shards a DFly2 drafter is trained on
 ([training](../dfly2-training.md#teacher-shards)). No drafter runs and the expert tiers stay as loaded.
 
@@ -84,6 +84,8 @@ model computes for each document of `FILE` into `DIR`, as the shards a DFly2 dra
   against the documents file, its anchors, the form of every selection (every cell up to 2,051; past that whole blocks of
   4, the lowest cells of at most one more block, and the unfinished last block), and the first document's arrays against
   what was computed. A difference is an error line and exit code 1; the shards stay.
+- **Cache format:** `--kv fp16`, the one-shot default. A shard holds FP16 cells, which no other format keeps; an INT8
+  cache's codes are a function of those values, 64 at a time, so the trainer can form them from a shard.
 - **Refused:** `--serve`, `--kv` other than `fp16`, `--kv-resident`, `--prefill 0`, a control vector, a rope scaling and
   `gpu-mode split`.
 - **Memory:** VRAM as a one-shot run with `--spec 8`. RAM: two page-locked buffers of one prompt chunk's rows and cells each
