@@ -582,7 +582,7 @@ void check(bool cond, const char* what) {
 
 // A round's calls: a window that lacks the source row queues nothing, a slot's rows inside a wider window name the same
 // row, a sequence drafts once a round, and the counters follow.
-void check_rounds(Rig& rig, int32_t anchor, int row, int64_t pos, const Block& want) {
+void check_rounds(const Setup& st, Rig& rig, int32_t anchor, int row, int64_t pos, const Block& want) {
     core::DflyDrafter& d = rig.drafter;
     std::string err;
     const int64_t rounds0 = d.rounds, skipped0 = d.skipped;
@@ -612,10 +612,14 @@ void check_rounds(Rig& rig, int32_t anchor, int row, int64_t pos, const Block& w
           "a slot's rows inside a window name the same source row");
     check(!twice && !again.empty(), "a sequence drafts once a round");
     check(d.rounds == rounds0 + 1 && d.ms_draft > 0.0, "a round that drafted is counted and timed");
-    // the confidence is the logit's sigmoid, a stated chance
+    // the confidence is the sigmoid of the logit and the checkpoint's bias, a stated chance
+    const double bias = (double) st.w.f32.at("confidence_head.proj.bias")[0];
     bool chance = true;
-    for (float c : conf) chance = chance && c > 0.0f && c < 1.0f;
-    check(chance, "each draft's confidence is a chance");
+    for (size_t j = 0; j < conf.size(); ++j) {
+        const double p = 1.0 / (1.0 + std::exp(-((double) d.raw_conf(rig.seq_a)[j] + bias)));
+        chance = chance && conf[j] > 0.0f && conf[j] < 1.0f && std::fabs((double) conf[j] - p) < 1e-5;
+    }
+    check(chance, "each draft's confidence is the chance its logit and the bias state");
 }
 
 void run_form(Setup& st, bool q8) {
@@ -637,7 +641,7 @@ void run_form(Setup& st, bool q8) {
         std::printf("dfly_parity: %s, %d context cells, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g\n", form,
                     nctx, R, ez, eh, ec);
         check(ez < kTol && eh < kTol && ec < kTol, "the block against the reference");
-        check_rounds(full, anchor, row, pos, a);
+        check_rounds(st, full, anchor, row, pos, a);
         // ---- a shorter block gives the same leading rows
         for (const int r2 : {2, 5}) {
             Rig part;
