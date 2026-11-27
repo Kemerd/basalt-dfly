@@ -136,6 +136,11 @@ if(BUILD_TESTING)
   basalt_embed_manifest(qwen4exp_dfly_parity)
   basalt_gpu_test(NAME qwen4exp_dfly_parity COMMAND qwen4exp_dfly_parity)
   set_tests_properties(qwen4exp_dfly_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+  # the block pass of a pack's drafter against the trainer's forward in a fixture (GPU, a pack: a program, not a test)
+  add_executable(qwen4exp_dfly_real tests/models/qwen4exp/decode/dfly_real.cpp)
+  target_include_directories(qwen4exp_dfly_real PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qwen4exp_dfly_real PRIVATE model_qwen4exp_engine models CUDA::cudart)
+  basalt_embed_manifest(qwen4exp_dfly_real)
 endif()
 
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).

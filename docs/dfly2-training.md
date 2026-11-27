@@ -170,8 +170,10 @@ basalt-dfly2-train fixture --model PACK.basalt --shards DIR --checkpoint FILE --
 Writes blocks of the shards (eval's order, at most four from a sequence, none anchored at a sequence's first row) with
 the drafter's forward over them in the checkpoint's own precision. Per block `i`, under `block.<i>.`: the inputs
 (`anchor`, `pos`, `h_s`, `emb_anchor`, `emb_mask`, `emb_prev`, and per draft layer `layer.<l>.sel`, `k_ctx`, `v_ctx`)
-and the outputs (`z`, `h_corrected`, `conf_logit`, `draft_ids`, each drafted row reading the draft before it): what a
-runtime's block pass is checked against.
+and the outputs (`z`, `h_corrected`, `conf_logit`, `draft_ids`, each drafted row reading the draft before it). The
+engine's `qwen4exp_dfly_real PACK FIXTURE` runs the same blocks through its block pass on the pack's drafter (attach
+the same checkpoint first) and reports the error of each output and, per draft position, the share of drafts that
+agree ([building](building.md)).
 
 ## Teacher shards
 
