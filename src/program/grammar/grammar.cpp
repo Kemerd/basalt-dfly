@@ -1401,6 +1401,39 @@ bool GrammarState::allows(std::string_view bytes, int32_t token_id) const {
     return copy.accept(bytes, token_id);
 }
 
+std::string GrammarState::forced(size_t max_bytes) const {
+    std::string out;
+    if (!g_ || !arena_ || !active_) return out;
+    const Arena& a = *arena_;
+    int32_t set = set_id_;
+    Utf8 u = utf8_;
+    while (out.size() < max_bytes) {
+        // an end of the output here, or a token taken by its id, is a continuation no byte spells
+        if (set == 0 || a.set_has_token(set) || (u.n_remain == 0 && a.set_accepts(set))) break;
+        // inside a character only its continuation bytes can follow; at its start, ASCII or a lead byte
+        const int lo = u.n_remain > 0 ? 0x80 : 0x00, hi = u.n_remain > 0 ? 0xBF : 0xF4;
+        int32_t only_set = 0;
+        Utf8 only_u;
+        char only = 0;
+        int allowed = 0;
+        for (int b = lo; b <= hi && allowed < 2; ++b) {
+            const char c = (char) b;
+            int32_t s = set;
+            Utf8 v = u;
+            if (!feed(std::string_view(&c, 1), s, v)) continue;
+            ++allowed;
+            only = c;
+            only_set = s;
+            only_u = v;
+        }
+        if (allowed != 1) break;
+        out.push_back(only);
+        set = only_set;
+        u = only_u;
+    }
+    return out;
+}
+
 void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std::vector<uint8_t>& out) const {
     const size_t n_nodes = v.nodes_.size();
     if (n_nodes <= 1) return;

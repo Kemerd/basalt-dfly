@@ -1,5 +1,6 @@
-// tests/program/grammar_test.cpp - GBNF parse, accept/reject, UTF-8 across tokens, clone/rewind, lazy triggers, and
-// the vocabulary mask against a token-by-token check. Ends with a timing line for allows() and fill_mask().
+// tests/program/grammar_test.cpp - GBNF parse, accept/reject, UTF-8 across tokens, clone/rewind, lazy triggers, the
+// vocabulary mask against a token-by-token check, and the forced continuation against its definition. Ends with a
+// timing line for allows() and fill_mask().
 #include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/grammar.hpp"
 #include "basalt/program/grammar/schema.hpp"
@@ -483,6 +484,169 @@ static void test_partial_utf8() {
     CHECK(!nc3.allows("\xC3") && nc3.allows("\xC2"));
 }
 
+// The state after `text`, fed in one piece.
+static GrammarState after(const std::shared_ptr<const Grammar>& g, const std::string& text) {
+    GrammarState s(g);
+    CHECK(s.accept(text));
+    return s;
+}
+
+// Two states stand at the same place: the same flags and the same live stacks.
+static bool same_state(const GrammarState& a, const GrammarState& b) {
+    if (a.active() != b.active() || a.accepting() != b.accepting() || a.dead() != b.dead()) return false;
+    const auto x = a.stack_elements(), y = b.stack_elements();
+    if (x.size() != y.size()) return false;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i].size() != y[i].size()) return false;
+        for (size_t k = 0; k < x[i].size(); ++k)
+            if (x[i][k].type != y[i][k].type || x[i][k].value != y[i][k].value) return false;
+    }
+    return true;
+}
+
+// forced() by its definition, through allows() alone: a byte at a time while the output cannot end and exactly one byte
+// is allowed. For grammars without token references.
+static std::string forced_by_allows(GrammarState s, size_t max_bytes) {
+    std::string out;
+    while (out.size() < max_bytes && s.active() && !s.accepting()) {
+        int allowed = 0;
+        char only = 0;
+        for (int b = 0; b < 256; ++b) {
+            const char c = (char) b;
+            if (!s.allows(std::string_view(&c, 1))) continue;
+            ++allowed;
+            only = c;
+        }
+        if (allowed != 1 || !s.accept(std::string_view(&only, 1))) break;
+        out += only;
+    }
+    return out;
+}
+
+// The forced continuation: literal runs, choices, ends, classes, UTF-8, repetitions, lazy triggers and the bound.
+static void test_forced() {
+    // a literal run stops at the class behind it, and goes on once the class is closed
+    auto lit = parse("root ::= \"{\\\"name\\\": \\\"\" [a-z]+ \"\\\"}\"");
+    {
+        GrammarState s(lit);
+        const GrammarState before = s.clone();
+        CHECK(s.forced(64) == "{\"name\": \"");
+        CHECK(same_state(s, before) && s.forced(64) == "{\"name\": \"");   // asking changes nothing
+        CHECK(s.forced(0).empty() && s.forced(1) == "{" && s.forced(7) == "{\"name\"");
+        CHECK(after(lit, "{\"na").forced(64) == "me\": \"");
+        CHECK(after(lit, "{\"name\": \"").forced(64).empty());             // any of [a-z]
+        CHECK(after(lit, "{\"name\": \"ab").forced(64).empty());           // another letter or the quote
+        CHECK(after(lit, "{\"name\": \"ab\"").forced(64) == "}");
+        CHECK(after(lit, "{\"name\": \"ab\"}").forced(64).empty());        // complete
+        CHECK(GrammarState().forced(64).empty());                          // no grammar
+    }
+    // alternatives that share a prefix force the prefix; the run stops at the byte that tells them apart
+    auto alt = parse("root ::= \"ab\" (\"cd\" | \"ce\" \"f\") \"!\"");
+    CHECK(GrammarState(alt).forced(64) == "abc");
+    CHECK(after(alt, "abcd").forced(64) == "!" && after(alt, "abce").forced(64) == "f!");
+    auto same = parse("root ::= \"a\" (\"bc\" | \"b\" \"c\") \"d\"");     // two derivations of one text
+    CHECK(GrammarState(same).forced(64) == "abcd");
+    // where the output may end nothing is forced, even with one way to go on
+    auto tail = parse("root ::= \"ab\" \"c\"*");
+    CHECK(GrammarState(tail).forced(64) == "ab" && after(tail, "ab").forced(64).empty() && after(tail, "abc").forced(64).empty());
+    auto opt = parse("root ::= \"a\" \"b\"? \"c\" \"d\"");
+    CHECK(GrammarState(opt).forced(64) == "a" && after(opt, "a").forced(64).empty());
+    CHECK(after(opt, "ab").forced(64) == "cd" && after(opt, "ac").forced(64) == "d");
+    // repetitions: a fixed count is a run, an open one a choice
+    auto rep = parse("root ::= \"a\"{3} \"b\" [0-9]{2,3} \";\"");
+    CHECK(GrammarState(rep).forced(64) == "aaab" && after(rep, "aaab12").forced(64).empty());
+    CHECK(after(rep, "aaab123").forced(64) == ";");
+    // a class of one character is forced, a wider or negated one is not
+    auto cls = parse("root ::= [a] [b-b] \"c\" [de] [^x] .");
+    CHECK(GrammarState(cls).forced(64) == "abc" && after(cls, "abcd").forced(64).empty() && after(cls, "abcdy").forced(64).empty());
+    // multi-byte literals are forced byte by byte, also from inside a character
+    const std::string wide = "\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x98\x80";
+    auto utf = parse("root ::= \"" + wide + "\" [a-z]");
+    {
+        GrammarState s(utf);
+        CHECK(s.forced(64) == wide && s.forced(4) == wide.substr(0, 4));
+        CHECK(s.accept("\xC3") && s.forced(64) == wide.substr(1));
+        CHECK(s.accept("\xA9\xE4\xB8") && s.forced(64) == wide.substr(4));
+        const GrammarState before = s.clone();
+        CHECK(s.forced(64) == wide.substr(4) && same_state(s, before) && s.accept("\xAD") && s.forced(2) == "\xF0\x9F");
+    }
+    // characters that share their first bytes force those bytes alone
+    auto lead = parse("root ::= [\xC3\xA9\xC3\xA8] \"x\" [\xE4\xB8\xAD\xE4\xB8\xAE] [\xC3\xA9z]");
+    {
+        GrammarState s(lead);
+        CHECK(s.forced(64) == "\xC3");
+        CHECK(s.accept("\xC3") && s.forced(64).empty());
+        CHECK(s.accept("\xA8") && s.forced(64) == "x\xE4\xB8");
+        CHECK(s.accept("x\xE4") && s.forced(64) == "\xB8");
+        CHECK(s.accept("\xB8\xAE") && s.forced(64).empty());              // a lead byte or `z`
+    }
+    // a grammar that forces without end is cut at the bound
+    auto loop = parse("root ::= \"ab\" root");
+    CHECK(GrammarState(loop).forced(7) == "abababa" && after(loop, "a").forced(4) == "baba");
+    // a token reference is taken by id: no byte is forced there
+    auto ref = parse("root ::= \"a\" <[300]> \"bc\"");
+    {
+        GrammarState s(ref);
+        CHECK(s.forced(64) == "a" && s.accept("a") && s.forced(64).empty());
+        CHECK(s.accept("", 300) && s.forced(64) == "bc");
+    }
+    // a lazy grammar forces nothing before its trigger, and nothing again once its sentence is complete
+    auto call = parse("root ::= \"<c>\" \"ok:\" [a-z]+ \"</c>\"");
+    {
+        Triggers tr;
+        tr.words = {"<c>"};
+        GrammarState s(call, tr);
+        CHECK(!s.active() && s.forced(64).empty());
+        CHECK(s.accept("free text <") && s.forced(64).empty() && !s.active());
+        CHECK(s.accept("c>") && s.active() && s.forced(64) == "ok:");
+        const GrammarState before = s.clone();
+        CHECK(s.forced(2) == "ok" && same_state(s, before));
+        CHECK(s.accept("ok:xy<") && s.forced(64) == "/c>");
+        CHECK(s.accept("/c>") && !s.active() && s.forced(64).empty());
+        GrammarState held(call, tr);                                      // asking mid-trigger keeps the text seen so far
+        CHECK(held.accept("<c") && held.forced(64).empty() && held.accept(">") && held.active() && held.forced(64) == "ok:");
+    }
+    // a JSON schema: the optional space after each mark ends the run, so the keys are forced and the marks are not
+    std::string err;
+    auto schema = Grammar::parse(json_schema_to_gbnf(R"({"type":"object","properties":{"name":{"type":"string"},)"
+                                                     R"("count":{"type":"integer"}},"required":["name","count"],)"
+                                                     R"("additionalProperties":false})", err), err);
+    CHECK(schema);
+    if (schema) {
+        CHECK(GrammarState(schema).forced(64) == "{");
+        CHECK(after(schema, "{").forced(64).empty());                     // a space or the key's quote
+        CHECK(after(schema, "{\"").forced(64) == "name\"");
+        CHECK(after(schema, "{\"name\"").forced(64).empty() && after(schema, "{\"name\":").forced(64).empty());
+        CHECK(after(schema, "{\"name\": \"x\", \"").forced(64) == "count\"");
+        CHECK(after(schema, "{\"name\": \"x\", \"count\": 7").forced(64).empty());
+        // every prefix of a sentence: the same answer as the definition gives through allows()
+        const std::string text = "{\"name\": \"a\\n\xC3\xA9\",\n  \"count\": -12}";
+        CHECK(full(schema, text));
+        GrammarState s(schema);
+        for (size_t i = 0; i <= text.size(); ++i) {
+            const GrammarState before = s.clone();
+            const std::string f = s.forced(16);
+            CHECK(f == forced_by_allows(s.clone(), 16));
+            CHECK(same_state(s, before) && s.allows(f));
+            if (i < text.size()) CHECK(s.accept(std::string_view(&text[i], 1)));
+        }
+    }
+    // a tool call: the layout between the values is one run
+    auto tools = Grammar::parse(tool_call_gbnf(R"([{"name":"f","parameters":{"properties":{"text":{"type":"string"}},"required":["text"]}}])", {}, err), err);
+    CHECK(tools);
+    if (tools) {
+        CHECK(GrammarState(tools).forced(128) == "<tool_call>\n<function=f>\n<parameter=text>\n");
+        CHECK(after(tools, "<tool_call>\n<function=f>\n<parameter=text>\nhi").forced(128).empty());
+        const std::string text = "<tool_call>\n<function=f>\n<parameter=text>\nhi <b>\n</parameter>\n</function>\n</tool_call>";
+        CHECK(full(tools, text));
+        GrammarState s(tools);
+        for (size_t i = 0; i <= text.size(); ++i) {
+            CHECK(s.forced(24) == forced_by_allows(s.clone(), 24));
+            if (i < text.size()) CHECK(s.accept(std::string_view(&text[i], 1)));
+        }
+    }
+}
+
 static double now_us() {
     using namespace std::chrono;
     return (double) duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1000.0;
@@ -599,6 +763,7 @@ int main() {
     test_token_refs();
     test_patterns();
     test_partial_utf8();
+    test_forced();
     if (std::getenv("BASALT_GRAMMAR_BENCH")) bench();
     if (g_fail) { std::printf("grammar_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_test: ok\n");

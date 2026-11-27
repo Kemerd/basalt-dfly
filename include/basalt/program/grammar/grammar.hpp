@@ -153,6 +153,12 @@ public:
     ///  false always walks the vocabulary.
     void fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool use_cache = true) const;
 
+    /// The bytes the grammar forces next: the longest string, at most `max_bytes` long, that every continuation of
+    /// the output starts with. It ends where a second byte is allowed, where the output may end, or where a token
+    /// reference may match, so it may stop inside a UTF-8 sequence whose first bytes alone are forced. Empty while
+    /// inactive or dead. The state is not changed. A grammar can force without end: `max_bytes` is what stops it.
+    std::string forced(size_t max_bytes) const;
+
     /// A copy to rewind to: the arena of interned stacks is shared, so this is cheap.
     GrammarState clone() const { return *this; }
     /// Back to the start (inactive again if there are triggers).
