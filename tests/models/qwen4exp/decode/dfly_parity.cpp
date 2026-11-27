@@ -1,14 +1,16 @@
 // tests/models/qwen4exp/decode/dfly_parity.cpp - the DFly2 block pass against a CPU double reference of its equations.
 //
 // Seeded weights of the real widths (BF16 in a temporary file, rounded as the loader rounds them), seeded cache cells,
-// selections and head rows handed to bind as plain buffers, and a synthetic head and embedding table. The reference reads
-// the dequantised Q8_0 weights with the q8_1 rounding of their inputs and stores a block's own K/V as the cache stores a
-// cell. Checked: the rows after the final norm, the corrected rows and the confidence logits; that a shorter block gives the
-// same leading rows; that two sequences queued back to back each get their own result; fp16 and int8 pools; a context of
-// the widest selection; a round's calls (a window without the source row, a slot's rows inside a window, the counters);
-// the bytes the plan charges. Then the drafter bound to a native head and embedding table read from a model file, for a
-// head of each type with the two-stage argmax: the bytes the bind takes, the block against the same reference, and each
-// pick against the argmax of the whole head's exact logits.
+// selections and head rows handed to bind as plain buffers, and a synthetic head and embedding table. The reference
+// reads the dequantised Q8_0 weights with the q8_1 rounding of their inputs and stores a block's own K/V as the cache
+// stores a cell. Checked: the rows after the final norm, the corrected rows and the confidence logits, each against the
+// reference's own spread under the roundings q8_1 leaves open (with seeded weights a code that lands across a rounding
+// edge moves the rows by about a percent a layer, so the double reference is no closer than that to an exact pass);
+// that a shorter block gives the same leading rows; that two sequences queued back to back each get their own result;
+// fp16 and int8 pools; a context of the widest selection; a round's calls (a window without the source row, a slot's
+// rows inside a window, the counters); the bytes the plan charges. Then the drafter bound to a native head and
+// embedding table read from a model file, for a head of each type with the two-stage argmax: the bytes the bind takes,
+// the block against the same reference, and each pick against the argmax of the whole head's exact logits.
 // Arguments: the draft layers (default 2; the real drafter has 5) and the vocabulary's rows (default 4096; the target's
 // 248320 takes several GiB of RAM and VRAM). GPU, synthetic, no model.
 #include "basalt/core/device_copy.hpp"
@@ -106,9 +108,13 @@ struct Weights {
     std::map<std::string, std::vector<uint64_t>> shape;
 };
 
+// The roundings an exact q8_1 product may take, which the reference's spread runs through: the codes taken with the
+// scale after its fp16 rounding, the codes by a reciprocal instead of a quotient, the product kept in fp32.
+enum Rounding : int { kRoundPlain = 0, kRoundHalfScale = 1, kRoundReciprocal = 2, kRoundF32 = 4 };
+
 // W x as the engine's product makes it: x in q8_1 blocks (d = amax / 127 kept as fp16, q = round(x / d)), an integer dot
-// per block, scaled by both blocks' fp16 d
-std::vector<double> mvq(const Weights& w, const std::string& name, const std::vector<double>& x) {
+// per block, scaled by both blocks' fp16 d; `rnd` picks the other roundings
+std::vector<double> mvq(const Weights& w, const std::string& name, const std::vector<double>& x, int rnd = kRoundPlain) {
     const std::vector<uint64_t>& sh = w.shape.at(name);
     const uint64_t rows = sh[0], cols = sh[1], nb = cols / 32;
     const std::vector<uint8_t>& blocks = w.q8.at(name);
@@ -117,8 +123,11 @@ std::vector<double> mvq(const Weights& w, const std::string& name, const std::ve
     for (uint64_t b = 0; b < nb; ++b) {
         float amax = 0.f;
         for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs((float) x[b * 32 + i]));
-        const float d = amax / 127.f;
-        for (int i = 0; i < 32; ++i) qx[b * 32 + i] = amax == 0.f ? 0 : (int) std::round((float) x[b * 32 + i] / d);
+        const float d = (rnd & kRoundHalfScale) ? bk::f32_from_f16(bk::f16_from_f32(amax / 127.f)) : amax / 127.f;
+        for (int i = 0; i < 32; ++i) {
+            const float xi = (float) x[b * 32 + i];
+            qx[b * 32 + i] = amax == 0.f ? 0 : (int) std::round((rnd & kRoundReciprocal) ? xi * (1.0f / d) : xi / d);
+        }
         dx[b] = bk::f32_from_f16(bk::f16_from_f32(d));
     }
     std::vector<double> y(rows);
@@ -132,7 +141,7 @@ std::vector<double> mvq(const Weights& w, const std::string& name, const std::ve
             for (int i = 0; i < 32; ++i) dot += (int) (int8_t) blk[2 + i] * qx[b * 32 + i];
             s += (double) bk::f32_from_f16(dh) * dx[b] * dot;
         }
-        y[r] = s;
+        y[r] = (rnd & kRoundF32) ? (double) (float) s : s;
     }
     return y;
 }
@@ -344,10 +353,12 @@ struct Ref {
     std::vector<double> z, hp, craw;   // [R][N], [R - 1][N], [R - 1]
 };
 
-// The block of R rows by the contract's equations, the drafts' tokens taken from `ids` (the engine's picks).
+// The block of R rows by the contract's equations, the drafts' tokens taken from `ids` (the engine's picks), every
+// product with the rounding `rnd`.
 Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R, int32_t anchor, int row, int64_t pos,
-              const std::vector<int32_t>& ids) {
+              const std::vector<int32_t>& ids, int rnd = kRoundPlain) {
     const core::DflyDims& d = st.d;
+    auto mv = [&](const std::string& name, const std::vector<double>& x) { return mvq(st.w, name, x, rnd); };
     const bk::QsaShapes s = bk::qsa_real_shapes();
     const size_t N = (size_t) d.n_embd, NH = (size_t) d.n_head, NKV = (size_t) d.n_head_kv, HD = (size_t) d.head_dim;
     const int nctx = (int) bk::qsa_selection_width(pos, s);
@@ -362,7 +373,7 @@ Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R,
         std::vector<double> cat = rms(e.data(), N, f("mtp_fusion.enorm.weight"), d.rms_eps);
         const std::vector<double> hn = rms(h.data(), N, f("mtp_fusion.hnorm.weight"), d.rms_eps);
         cat.insert(cat.end(), hn.begin(), hn.end());
-        const std::vector<double> fused = mvq(st.w, "mtp_fusion.eh_proj.weight", cat);
+        const std::vector<double> fused = mv("mtp_fusion.eh_proj.weight", cat);
         x[0].resize(N);
         for (size_t i = 0; i < N; ++i) x[0][i] = (double) (float) e[i] + (double) f("mtp_fusion.gate")[i] * fused[i];
         for (int r = 1; r < R; ++r) x[(size_t) r] = emb(d.mask_id);
@@ -373,9 +384,9 @@ Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R,
         std::vector<std::vector<double>> q((size_t) R), gate((size_t) R), kown((size_t) R), vown((size_t) R);
         for (int r = 0; r < R; ++r) {
             const std::vector<double> y = rms(x[(size_t) r].data(), N, f(p + "input_layernorm.weight"), d.rms_eps);
-            const std::vector<double> qf = mvq(st.w, p + "self_attn.q_proj.weight", y);
-            kown[(size_t) r] = mvq(st.w, p + "self_attn.k_proj.weight", y);
-            vown[(size_t) r] = mvq(st.w, p + "self_attn.v_proj.weight", y);
+            const std::vector<double> qf = mv(p + "self_attn.q_proj.weight", y);
+            kown[(size_t) r] = mv(p + "self_attn.k_proj.weight", y);
+            vown[(size_t) r] = mv(p + "self_attn.v_proj.weight", y);
             q[(size_t) r].resize(NH * HD);
             gate[(size_t) r].resize(NH * HD);
             for (size_t h = 0; h < NH; ++h) {
@@ -425,13 +436,13 @@ Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R,
                 }
                 for (size_t e = 0; e < HD; ++e) attn[h * HD + e] *= 1.0 / (1.0 + std::exp(-gate[(size_t) r][h * HD + e]));
             }
-            const std::vector<double> o = mvq(st.w, p + "self_attn.o_proj.weight", attn);
+            const std::vector<double> o = mv(p + "self_attn.o_proj.weight", attn);
             for (size_t i = 0; i < N; ++i) x[(size_t) r][i] += o[i];
             const std::vector<double> u = rms(x[(size_t) r].data(), N, f(p + "post_attention_layernorm.weight"), d.rms_eps);
-            const std::vector<double> gg = mvq(st.w, p + "mlp.gate_proj.weight", u), uu = mvq(st.w, p + "mlp.up_proj.weight", u);
+            const std::vector<double> gg = mv(p + "mlp.gate_proj.weight", u), uu = mv(p + "mlp.up_proj.weight", u);
             std::vector<double> hh(gg.size());
             for (size_t i = 0; i < gg.size(); ++i) hh[i] = gg[i] / (1.0 + std::exp(-gg[i])) * uu[i];
-            const std::vector<double> dn = mvq(st.w, p + "mlp.down_proj.weight", hh);
+            const std::vector<double> dn = mv(p + "mlp.down_proj.weight", hh);
             for (size_t i = 0; i < N; ++i) x[(size_t) r][i] += dn[i];
         }
     }
@@ -446,11 +457,11 @@ Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R,
         std::vector<double> cat = rms(z, N, f("hidden_correction.hidden_norm.weight"), d.rms_eps);
         const std::vector<double> en = rms(pe.data(), N, f("hidden_correction.embed_norm.weight"), d.rms_eps);
         cat.insert(cat.end(), en.begin(), en.end());
-        const std::vector<double> gg = mvq(st.w, "hidden_correction.gate_proj.weight", cat),
-                                  uu = mvq(st.w, "hidden_correction.up_proj.weight", cat);
+        const std::vector<double> gg = mv("hidden_correction.gate_proj.weight", cat),
+                                  uu = mv("hidden_correction.up_proj.weight", cat);
         std::vector<double> hh(gg.size());
         for (size_t i = 0; i < gg.size(); ++i) hh[i] = gg[i] / (1.0 + std::exp(-gg[i])) * uu[i];
-        const std::vector<double> dn = mvq(st.w, "hidden_correction.down_proj.weight", hh);
+        const std::vector<double> dn = mv("hidden_correction.down_proj.weight", hh);
         double raw = 0;
         for (size_t i = 0; i < N; ++i) {
             ref.hp.push_back(z[i] + dn[i]);
@@ -462,7 +473,7 @@ Ref reference(const Setup& st, const std::vector<Cache>& caches, bool q8, int R,
 }
 
 // the largest difference over the reference's largest magnitude
-double rel_err(const std::vector<float>& got, const std::vector<double>& want) {
+template <class T> double rel_err(const std::vector<T>& got, const std::vector<double>& want) {
     double scale = 0, e = 0;
     for (size_t i = 0; i < want.size(); ++i) {
         scale = std::max(scale, std::fabs(want[i]));
@@ -572,7 +583,26 @@ struct Rig {
     }
 };
 
-constexpr double kTol = 2e-2;   // the rounding of fp32 against double ahead of each q8_1 and cache rounding
+constexpr double kTol = 2e-2;     // the floor: the rounding of fp32 against double ahead of each q8_1 and cache rounding
+constexpr double kSpread = 2.0;   // how far past the reference's own spread a pass may lie (seen: up to 1.55 times)
+
+// The reference's own spread: the largest move of its rows, corrected rows and confidence logits under each mix of the
+// roundings q8_1 leaves open (a pass's distance is one more draw of the same edges), and the bound each error is held to.
+struct Spread {
+    double z = 0, hp = 0, craw = 0;
+    double bound(double s) const { return std::max(kTol, kSpread * s); }
+};
+Spread spread_of(const Setup& st, const std::vector<Cache>& caches, bool q8, int R, int32_t anchor, int row, int64_t pos,
+                 const std::vector<int32_t>& ids, const Ref& ref) {
+    Spread sp;
+    for (int rnd = 1; rnd <= (kRoundHalfScale | kRoundReciprocal | kRoundF32); ++rnd) {
+        const Ref other = reference(st, caches, q8, R, anchor, row, pos, ids, rnd);
+        sp.z = std::max(sp.z, rel_err(other.z, ref.z));
+        sp.hp = std::max(sp.hp, rel_err(other.hp, ref.hp));
+        sp.craw = std::max(sp.craw, rel_err(other.craw, ref.craw));
+    }
+    return sp;
+}
 
 void check(bool cond, const char* what) {
     if (cond) return;
@@ -637,10 +667,11 @@ void run_form(Setup& st, bool q8) {
         Block a;
         if (!full.make(st, caches, q8, R) || !full.run(full.seq_a, anchor, row, pos, a)) { ++g_fail; return; }
         const Ref ref = reference(st, caches, q8, R, anchor, row, pos, a.ids);
+        const Spread sp = spread_of(st, caches, q8, R, anchor, row, pos, a.ids, ref);
         const double ez = rel_err(a.z, ref.z), eh = rel_err(a.hp, ref.hp), ec = rel_err(a.craw, ref.craw);
-        std::printf("dfly_parity: %s, %d context cells, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g\n", form,
-                    nctx, R, ez, eh, ec);
-        check(ez < kTol && eh < kTol && ec < kTol, "the block against the reference");
+        std::printf("dfly_parity: %s, %d context cells, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g (the "
+                    "reference's own spread %.3g, %.3g, %.3g)\n", form, nctx, R, ez, eh, ec, sp.z, sp.hp, sp.craw);
+        check(ez < sp.bound(sp.z) && eh < sp.bound(sp.hp) && ec < sp.bound(sp.craw), "the block against the reference");
         check_rounds(st, full, anchor, row, pos, a);
         // ---- a shorter block gives the same leading rows
         for (const int r2 : {2, 5}) {
@@ -819,10 +850,12 @@ void run_native(Setup& st, int type) {
         check(in_vocab, "every draft is a token of the vocabulary");
         if (in_vocab) {
             const Ref ref = reference(st, caches, false, R, anchor, row, pos, a.ids);
+            const Spread sp = spread_of(st, caches, false, R, anchor, row, pos, a.ids, ref);
             const double ez = rel_err(a.z, ref.z), eh = rel_err(a.hp, ref.hp), ec = rel_err(a.craw, ref.craw);
-            std::printf("dfly_parity: native head type %d, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g\n", type,
-                        st.vocab, ez, eh, ec);
-            check(ez < kTol && eh < kTol && ec < kTol, "the block through the native head and table against the reference");
+            std::printf("dfly_parity: native head type %d, %d rows: rel err z %.3g, corrected %.3g, confidence logit %.3g (the "
+                        "reference's own spread %.3g, %.3g, %.3g)\n", type, st.vocab, ez, eh, ec, sp.z, sp.hp, sp.craw);
+            check(ez < sp.bound(sp.z) && eh < sp.bound(sp.hp) && ec < sp.bound(sp.craw),
+                  "the block through the native head and table against the reference");
         }
         // ---- each pick against the whole head: the exact logits of its corrected row over every row of the head
         float* d_logits = nullptr;
