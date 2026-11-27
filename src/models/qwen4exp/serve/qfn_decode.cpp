@@ -421,7 +421,15 @@ inline bool QfnRequest::draft_block(bool will_draft, After& after_launch) {
     if (!block.window_rows(kept_rows, p, runtime_.err)) return false;
     // a quality gate forces every window: nothing would read the drafts
     if (!will_draft || ppl != nullptr) return block.settle(runtime_.err);   // the rows are read before the next window writes them
-    if (!block.draft_launch(outv[(size_t) kept_rows - 1], p + kept_rows, runtime_.err)) return false;
+    const int32_t anchor = outv[(size_t) kept_rows - 1];
+    if (!block.draft_launch(anchor, p + kept_rows, runtime_.err)) return false;
+    // the next window's first row is the anchor: its PLE rows are read while the block runs, and the window collects them
+    basalt::core::SessionState& ss = runtime_.ss;
+    if (ss.ple.ready() && ss.ple.table != nullptr) {
+        uint32_t rows16[basalt::kernels::PLE_N_HEADS];
+        basalt::kernels::ngram_rows(&anchor, ss.ple_prev, 1, ss.ple.consts, rows16);
+        ss.ple.table->prefetch_rows(rows16);
+    }
     after_launch();
     const int most = std::min({runtime_.S_mtp - 1, (int) drafts.size(), (int) dprob.size()});
     return block.draft_read(drafts.data(), dprob.data(), most, n_block, runtime_.err);
